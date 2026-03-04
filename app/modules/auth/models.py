@@ -1,20 +1,26 @@
 """
-Auth module — SQLAlchemy ORM models.
-
-TODO: Implement User model with the following fields:
-    - email (unique, indexed)
-    - hashed_password
-    - first_name, last_name
-    - role (string: STUDENT, REGISTRAR_OFFICER, ADMIN)
-        → import from app/shared/enums/ once implemented
-    - is_active (boolean)
-
-Inherits from Base (provides id (UUID), created_at, updated_at automatically).
+Auth module — User model.
 """
 
-from app.database.base import Base
+from sqlalchemy import Boolean, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database.base import SoftDeleteBase
+from app.shared.enums import UserRole
 
 
-# class User(Base):
-#     __tablename__ = "users"
-#     ...
+class User(SoftDeleteBase):
+    """
+    Represents applicants, registrar officers, and admins.
+    Uses SoftDeleteBase (core domain entity — never hard-deleted).
+    """
+    __tablename__ = "users"
+
+    email: Mapped[str] = mapped_column(
+        String(255), unique=True, index=True, nullable=False
+    )
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    first_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    role: Mapped[UserRole] = mapped_column(nullable=False, default=UserRole.STUDENT)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

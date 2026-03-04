@@ -1,24 +1,27 @@
 """
 SQLAlchemy declarative base and common model mixins.
 
-All ORM models across modules inherit from `Base`.
-Uses UUID primary keys for distributed safety, cleaner logs, and public API safety.
+Two base classes:
+    - ``Base``           → For immutable ledgers (audit logs, status history).
+                           Provides id (UUID), created_at, updated_at.
+    - ``SoftDeleteBase`` → For core domain entities (applications, programs, documents).
+                           Adds is_deleted flag for soft deletion.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
-from sqlalchemy import DateTime, func
+from sqlalchemy import Boolean, DateTime, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     """
-    Base class for all SQLAlchemy models.
-
-    Provides automatic `id` (UUID), `created_at`, and `updated_at` columns.
+    Abstract base for ALL models.
+    Provides UUID primary key and timezone-aware UTC timestamps.
     """
+    __abstract__ = True
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -35,5 +38,19 @@ class Base(DeclarativeBase):
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class SoftDeleteBase(Base):
+    """
+    Abstract base for core domain entities that support soft deletion.
+    Adds ``is_deleted`` flag; repositories must filter is_deleted=False on reads.
+    """
+    __abstract__ = True
+
+    is_deleted: Mapped[bool] = mapped_column(
+        Boolean(),
+        default=False,
         nullable=False,
     )

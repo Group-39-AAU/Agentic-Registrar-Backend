@@ -20,8 +20,24 @@ TODO: Implement:
 """
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+
+# ── Model Registry ─────────────────────────────────────────────
+# REQUIRED: SQLAlchemy needs every model class imported and registered
+# in Base.metadata before any FK resolution happens at runtime.
+# Without these, you get: NoReferencedTableError on the first request.
+from app.modules.auth.models import User                          # noqa: F401
+from app.modules.programs.models import AcademicProgram           # noqa: F401
+from app.shared.audit.models import SystemAuditLog                # noqa: F401
+from app.modules.undergraduate.models import (                    # noqa: F401
+    UndergraduateApplication, ApplicationDocument,
+    ApplicationStatusHistory, RegistrarDecision,
+)
+from app.ai.models import AIEvaluation, AIExecutionTrace           # noqa: F401
+
+from app.modules.undergraduate.router import router as undergraduate_router
 
 
 def create_app() -> FastAPI:
@@ -35,9 +51,18 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
     )
 
-    # TODO: Add CORS middleware
-    # TODO: Register exception handlers
-    # TODO: Mount module routers under settings.API_V1_PREFIX
+    # ── CORS ──
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ── Module Routers ──
+    app.include_router(undergraduate_router, prefix=settings.API_V1_PREFIX)
+    # TODO: app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
 
     @app.get("/health", tags=["System"])
     async def health_check():
