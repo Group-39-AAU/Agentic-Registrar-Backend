@@ -12,15 +12,37 @@ class ApplicationStatus(str, Enum):
     """Undergraduate admission lifecycle states."""
     DRAFT = "DRAFT"
     SUBMITTED = "SUBMITTED"
+    PAYMENT_PENDING = "PAYMENT_PENDING"
+    PAYMENT_VERIFIED = "PAYMENT_VERIFIED"
     UNDER_VERIFICATION = "UNDER_VERIFICATION"
     AI_PRE_SCREENING = "AI_PRE_SCREENING"
     PENDING_REVIEW = "PENDING_REVIEW"
     DECIDED = "DECIDED"
 
 
+class SponsorshipType(str, Enum):
+    """Student funding source."""
+    GOVERNMENT = "GOVERNMENT"
+    SELF_SPONSORED = "SELF_SPONSORED"
+
+
+class StreamType(str, Enum):
+    """Academic stream for 12th-grade students."""
+    NATURAL = "NATURAL"
+    SOCIAL = "SOCIAL"
+
+
+class PaymentStatus(str, Enum):
+    """Application payment lifecycle."""
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
 class DocumentType(str, Enum):
     """Types of documents an applicant may submit."""
     TRANSCRIPT = "TRANSCRIPT"
+    GRADE_12_CERTIFICATE = "GRADE_12_CERTIFICATE"
     ID_CARD = "ID_CARD"
     CERTIFICATE = "CERTIFICATE"
     RECOMMENDATION_LETTER = "RECOMMENDATION_LETTER"

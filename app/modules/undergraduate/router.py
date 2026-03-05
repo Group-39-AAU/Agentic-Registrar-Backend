@@ -2,7 +2,7 @@
 Undergraduate Admission module — FastAPI router.
 
 Maps domain exceptions to HTTP responses.
-Uses temporary auth stubs until the auth module is fully implemented.
+Uses JWT auth via get_current_user dependency.
 """
 
 import uuid
@@ -10,7 +10,9 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dependencies import get_current_user
 from app.database.session import get_db
+from app.modules.auth.models import User
 from app.modules.undergraduate.exceptions import (
     DuplicateApplicationError,
     EntityNotFoundError,
@@ -29,20 +31,14 @@ from app.modules.undergraduate.schemas import (
     DocumentCreate,
     DocumentResponse,
     DocumentVerify,
+    PaymentCallbackRequest,
+    PaymentInitiateResponse,
     StatusHistoryResponse,
 )
 from app.modules.undergraduate.service import ApplicationService, DecisionService
-from app.shared.enums import UserRole
+from app.shared.enums import ApplicationStatus, UserRole
 
 router = APIRouter(prefix="/undergraduate", tags=["Undergraduate Admission"])
-
-
-# ── Temporary Auth Stubs ─────────────────────────────────────
-# These will be replaced by real auth dependencies (core/dependencies.py)
-# once the auth module is fully implemented.
-
-TEMP_STUDENT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
-TEMP_OFFICER_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
 
 
 # ── Exception → HTTP mapping ─────────────────────────────────
@@ -70,12 +66,13 @@ def _handle_domain_error(e: Exception) -> None:
 @router.post("/applications", response_model=ApplicationResponse, status_code=201)
 async def submit_application(
     data: ApplicationCreate,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Student submits a new undergraduate application."""
     svc = ApplicationService(db)
     try:
-        app = await svc.submit_application(data, actor_id=TEMP_STUDENT_ID)
+        app = await svc.submit_application(data, actor_id=current_user.id)
     except (DuplicateApplicationError, EntityNotFoundError) as e:
         _handle_domain_error(e)
     return app
@@ -85,6 +82,7 @@ async def submit_application(
 async def list_applications(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List all applications (registrar/admin view)."""
@@ -95,17 +93,19 @@ async def list_applications(
 
 @router.get("/applications/me", response_model=list[ApplicationResponse])
 async def list_my_applications(
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List the current student's applications."""
     svc = ApplicationService(db)
-    return await svc.list_my_applications(TEMP_STUDENT_ID)
+    return await svc.list_my_applications(current_user.id)
 
 
 @router.get("/applications/review-queue", response_model=list[ApplicationResponse])
 async def review_queue(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Get applications waiting for registrar review."""
@@ -116,6 +116,7 @@ async def review_queue(
 @router.get("/applications/{application_id}", response_model=ApplicationResponse)
 async def get_application(
     application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Get a specific application by ID."""
@@ -130,6 +131,7 @@ async def get_application(
 async def change_application_status(
     application_id: uuid.UUID,
     data: ApplicationStatusUpdate,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Transition an application's status (registrar/system)."""
@@ -137,10 +139,62 @@ async def change_application_status(
     try:
         return await svc.change_status(
             application_id, data,
-            actor_id=TEMP_OFFICER_ID,
-            actor_role=UserRole.REGISTRAR_OFFICER,
+            actor_id=current_user.id,
+            actor_role=current_user.role,
         )
     except (EntityNotFoundError, InvalidStateTransitionError) as e:
+        _handle_domain_error(e)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Payment Endpoints (Simulated)
+# ══════════════════════════════════════════════════════════════
+
+
+@router.post(
+    "/applications/{application_id}/payment/initiate",
+    response_model=PaymentInitiateResponse,
+)
+async def initiate_payment(
+    application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generate a simulated payment link for a self-sponsored application.
+    Government-sponsored applications do not require payment.
+    """
+    svc = ApplicationService(db)
+    try:
+        app = await svc.initiate_payment(application_id, actor_id=current_user.id)
+    except (EntityNotFoundError, InvalidStateTransitionError, MissingPrerequisiteError) as e:
+        _handle_domain_error(e)
+
+    return PaymentInitiateResponse(
+        application_id=app.id,
+        payment_reference=app.payment_reference,
+        payment_url=f"https://pay.registrar.example.com/checkout/{app.payment_reference}",
+    )
+
+
+@router.post(
+    "/applications/{application_id}/payment/callback",
+    response_model=ApplicationResponse,
+)
+async def payment_callback(
+    application_id: uuid.UUID,
+    data: PaymentCallbackRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Simulated payment gateway callback.
+    In production this would be called by the payment provider.
+    For now it's a manual trigger to simulate payment completion.
+    """
+    svc = ApplicationService(db)
+    try:
+        return await svc.complete_payment(application_id, data.payment_reference)
+    except (EntityNotFoundError, InvalidStateTransitionError, MissingPrerequisiteError) as e:
         _handle_domain_error(e)
 
 
@@ -152,12 +206,13 @@ async def change_application_status(
 @router.post("/documents", response_model=DocumentResponse, status_code=201)
 async def add_document(
     data: DocumentCreate,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Attach a document to an application."""
     svc = ApplicationService(db)
     try:
-        return await svc.add_document(data, actor_id=TEMP_STUDENT_ID)
+        return await svc.add_document(data, actor_id=current_user.id)
     except EntityNotFoundError as e:
         _handle_domain_error(e)
 
@@ -166,6 +221,7 @@ async def add_document(
 async def verify_document(
     document_id: uuid.UUID,
     data: DocumentVerify,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Officer verifies or rejects a submitted document."""
@@ -173,8 +229,8 @@ async def verify_document(
     try:
         return await svc.verify_document(
             document_id, data,
-            actor_id=TEMP_OFFICER_ID,
-            actor_role=UserRole.REGISTRAR_OFFICER,
+            actor_id=current_user.id,
+            actor_role=current_user.role,
         )
     except EntityNotFoundError as e:
         _handle_domain_error(e)
@@ -191,6 +247,7 @@ async def verify_document(
 )
 async def get_status_history(
     application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Get the full status transition history for an application."""
@@ -211,6 +268,7 @@ async def get_status_history(
 async def record_decision(
     application_id: uuid.UUID,
     data: DecisionCreate,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Registrar officer records a final decision."""
@@ -218,8 +276,8 @@ async def record_decision(
     try:
         return await svc.record_decision(
             application_id, data,
-            actor_id=TEMP_OFFICER_ID,
-            actor_role=UserRole.REGISTRAR_OFFICER,
+            actor_id=current_user.id,
+            actor_role=current_user.role,
         )
     except (
         EntityNotFoundError,
@@ -235,6 +293,7 @@ async def record_decision(
 )
 async def get_decision(
     application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Get the decision for an application (if one exists)."""
@@ -243,3 +302,114 @@ async def get_decision(
     if decision is None:
         raise HTTPException(404, "No decision recorded for this application")
     return decision
+
+
+# ══════════════════════════════════════════════════════════════
+#  Intake Agent Endpoint
+# ══════════════════════════════════════════════════════════════
+
+
+@router.post(
+    "/applications/{application_id}/validate",
+    response_model=ApplicationResponse,
+    tags=["AI Agents"],
+)
+async def validate_application(
+    application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trigger the Intake Validation Agent on an application.
+
+    The agent checks:
+    1. Profile completeness (sponsorship, stream, program choices)
+    2. Required documents uploaded (GRADE_12_CERTIFICATE, ID_CARD)
+    3. Payment verified
+
+    If all pass → transitions to UNDER_VERIFICATION.
+    If any fail → writes an AIEvaluation with FLAG_FOR_REVIEW.
+    """
+    from app.ai.agents.intake_agent import AGENT_VERSION, run_intake_validation
+    from app.ai.models import AIEvaluation, AIExecutionTrace
+
+    svc = ApplicationService(db)
+
+    try:
+        application = await svc.get_application(application_id)
+    except EntityNotFoundError as e:
+        _handle_domain_error(e)
+
+    # Collect document types currently uploaded
+    doc_types = [doc.document_type.value for doc in application.documents]
+
+    # Run the LangGraph agent
+    result = await run_intake_validation(
+        application_id=application.id,
+        sponsorship_type=application.sponsorship_type.value,
+        stream=application.stream.value,
+        program_choice_1_id=application.program_choice_1_id,
+        program_choice_2_id=application.program_choice_2_id,
+        program_choice_3_id=application.program_choice_3_id,
+        payment_status=application.payment_status.value,
+        current_status=application.current_status.value,
+        document_types_uploaded=doc_types,
+    )
+
+    # Determine the recommendation
+    from app.shared.enums import DecisionType as DT
+    overall_result = result["overall_result"]
+    checks_passed = result["checks_passed"]
+    checks_failed = result["checks_failed"]
+    traces_list = result["traces"]
+
+    if overall_result == "PASS":
+        recommended = DT.RECOMMEND_ADMIT
+        confidence = 1.0
+    else:
+        recommended = DT.FLAG_FOR_REVIEW
+        confidence = 0.0
+
+    # Write AIEvaluation
+    evaluation = AIEvaluation(
+        application_id=application.id,
+        agent_version=AGENT_VERSION,
+        recommended_decision=recommended,
+        confidence_score=confidence,
+        is_overridden=False,
+        summary_reasoning=(
+            f"Intake validation: {overall_result}. "
+            f"Passed: {checks_passed}. Failed: {checks_failed}."
+        ),
+    )
+    db.add(evaluation)
+    await db.flush()
+
+    # Write AIExecutionTrace for each step
+    for trace in traces_list:
+        trace_entry = AIExecutionTrace(
+            evaluation_id=evaluation.id,
+            step_name=trace["step_name"],
+            reasoning_log=trace["reasoning_log"],
+        )
+        db.add(trace_entry)
+
+    # If all checks passed, transition to UNDER_VERIFICATION
+    if overall_result == "PASS":
+        try:
+            from app.modules.undergraduate.schemas import ApplicationStatusUpdate
+            await svc.change_status(
+                application.id,
+                ApplicationStatusUpdate(
+                    new_status=ApplicationStatus.UNDER_VERIFICATION,
+                    trigger_reason="Intake Agent: all completeness checks passed",
+                ),
+                actor_id=current_user.id,
+                actor_role=UserRole.AGENT,
+            )
+        except InvalidStateTransitionError as e:
+            _handle_domain_error(e)
+
+    await db.commit()
+    await db.refresh(application)
+    return application

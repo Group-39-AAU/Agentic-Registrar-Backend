@@ -19,7 +19,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteBase
 from app.shared.enums import (
-    ApplicationStatus, DecisionType, DocumentType, VerificationStatus,
+    ApplicationStatus, DecisionType, DocumentType,
+    PaymentStatus, SponsorshipType, StreamType, VerificationStatus,
 )
 
 
@@ -35,9 +36,22 @@ class UndergraduateApplication(SoftDeleteBase):
     applicant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), index=True, nullable=False
     )
-    program_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("academic_programs.id"), nullable=False
+
+    # ── Sponsorship & Stream ──
+    sponsorship_type: Mapped[SponsorshipType] = mapped_column(nullable=False)
+    stream: Mapped[StreamType] = mapped_column(nullable=False)
+
+    # ── Program choices (self-sponsored only, nullable for government) ──
+    program_choice_1_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("academic_programs.id"), nullable=True
     )
+    program_choice_2_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("academic_programs.id"), nullable=True
+    )
+    program_choice_3_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("academic_programs.id"), nullable=True
+    )
+
     admission_term: Mapped[str] = mapped_column(
         String(50), index=True, nullable=False
     )
@@ -47,6 +61,15 @@ class UndergraduateApplication(SoftDeleteBase):
     final_decision: Mapped[Optional[str]] = mapped_column(
         String(50), nullable=True
     )
+
+    # ── Payment ──
+    payment_status: Mapped[PaymentStatus] = mapped_column(
+        nullable=False, default=PaymentStatus.PENDING
+    )
+    payment_reference: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+
     remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     extra_data: Mapped[dict] = mapped_column(
         JSONB, server_default="{}", nullable=False
@@ -54,7 +77,8 @@ class UndergraduateApplication(SoftDeleteBase):
 
     # ── Relationships (lazy="selectin" per architecture blueprint) ──
     documents: Mapped[list["ApplicationDocument"]] = relationship(
-        back_populates="application", lazy="selectin"
+        back_populates="application", lazy="selectin",
+        foreign_keys="ApplicationDocument.application_id",
     )
     status_history: Mapped[list["ApplicationStatusHistory"]] = relationship(
         back_populates="application", lazy="selectin",
@@ -67,8 +91,8 @@ class UndergraduateApplication(SoftDeleteBase):
     # ── Constraints ──
     __table_args__ = (
         UniqueConstraint(
-            "applicant_id", "program_id", "admission_term",
-            name="uq_one_app_per_program_per_term",
+            "applicant_id", "admission_term",
+            name="uq_one_app_per_term",
         ),
     )
 
@@ -98,7 +122,8 @@ class ApplicationDocument(SoftDeleteBase):
 
     # ── Relationships ──
     application: Mapped["UndergraduateApplication"] = relationship(
-        back_populates="documents", lazy="selectin"
+        back_populates="documents", lazy="selectin",
+        foreign_keys=[application_id],
     )
 
 

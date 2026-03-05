@@ -1,8 +1,8 @@
-"""initial_schema
+"""phase2_schema
 
-Revision ID: 9ac952b41395
+Revision ID: 5e3743110c60
 Revises: 
-Create Date: 2026-03-04 14:27:21.657418
+Create Date: 2026-03-05 15:11:31.129239
 """
 from typing import Sequence, Union
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = '9ac952b41395'
+revision: str = '5e3743110c60'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -23,6 +23,9 @@ def upgrade() -> None:
     sa.Column('code', sa.String(length=50), nullable=False),
     sa.Column('name', sa.String(length=255), nullable=False),
     sa.Column('department', sa.String(length=100), nullable=False),
+    sa.Column('stream', sa.Enum('NATURAL', 'SOCIAL', name='streamtype'), nullable=False),
+    sa.Column('cut_off_score', sa.Float(), nullable=True),
+    sa.Column('max_capacity', sa.Integer(), nullable=True),
     sa.Column('is_active', sa.Boolean(), nullable=False),
     sa.Column('is_deleted', sa.Boolean(), nullable=False),
     sa.Column('id', sa.UUID(), nullable=False),
@@ -32,6 +35,7 @@ def upgrade() -> None:
     )
     op.create_index(op.f('ix_academic_programs_code'), 'academic_programs', ['code'], unique=True)
     op.create_index(op.f('ix_academic_programs_department'), 'academic_programs', ['department'], unique=False)
+    op.create_index(op.f('ix_academic_programs_stream'), 'academic_programs', ['stream'], unique=False)
     op.create_table('system_audit_logs',
     sa.Column('actor_id', sa.UUID(), nullable=True),
     sa.Column('actor_role', sa.String(length=50), nullable=False),
@@ -63,10 +67,16 @@ def upgrade() -> None:
     op.create_index(op.f('ix_users_email'), 'users', ['email'], unique=True)
     op.create_table('undergraduate_applications',
     sa.Column('applicant_id', sa.UUID(), nullable=False),
-    sa.Column('program_id', sa.UUID(), nullable=False),
+    sa.Column('sponsorship_type', sa.Enum('GOVERNMENT', 'SELF_SPONSORED', name='sponsorshiptype'), nullable=False),
+    sa.Column('stream', sa.Enum('NATURAL', 'SOCIAL', name='streamtype'), nullable=False),
+    sa.Column('program_choice_1_id', sa.UUID(), nullable=True),
+    sa.Column('program_choice_2_id', sa.UUID(), nullable=True),
+    sa.Column('program_choice_3_id', sa.UUID(), nullable=True),
     sa.Column('admission_term', sa.String(length=50), nullable=False),
-    sa.Column('current_status', sa.Enum('DRAFT', 'SUBMITTED', 'UNDER_VERIFICATION', 'AI_PRE_SCREENING', 'PENDING_REVIEW', 'DECIDED', name='applicationstatus'), nullable=False),
+    sa.Column('current_status', sa.Enum('DRAFT', 'SUBMITTED', 'PAYMENT_PENDING', 'PAYMENT_VERIFIED', 'UNDER_VERIFICATION', 'AI_PRE_SCREENING', 'PENDING_REVIEW', 'DECIDED', name='applicationstatus'), nullable=False),
     sa.Column('final_decision', sa.String(length=50), nullable=True),
+    sa.Column('payment_status', sa.Enum('PENDING', 'COMPLETED', 'FAILED', name='paymentstatus'), nullable=False),
+    sa.Column('payment_reference', sa.String(length=255), nullable=True),
     sa.Column('remarks', sa.Text(), nullable=True),
     sa.Column('extra_data', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
     sa.Column('is_deleted', sa.Boolean(), nullable=False),
@@ -74,9 +84,11 @@ def upgrade() -> None:
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.ForeignKeyConstraint(['applicant_id'], ['users.id'], ),
-    sa.ForeignKeyConstraint(['program_id'], ['academic_programs.id'], ),
+    sa.ForeignKeyConstraint(['program_choice_1_id'], ['academic_programs.id'], ),
+    sa.ForeignKeyConstraint(['program_choice_2_id'], ['academic_programs.id'], ),
+    sa.ForeignKeyConstraint(['program_choice_3_id'], ['academic_programs.id'], ),
     sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('applicant_id', 'program_id', 'admission_term', name='uq_one_app_per_program_per_term')
+    sa.UniqueConstraint('applicant_id', 'admission_term', name='uq_one_app_per_term')
     )
     op.create_index(op.f('ix_undergraduate_applications_admission_term'), 'undergraduate_applications', ['admission_term'], unique=False)
     op.create_index(op.f('ix_undergraduate_applications_applicant_id'), 'undergraduate_applications', ['applicant_id'], unique=False)
@@ -97,7 +109,7 @@ def upgrade() -> None:
     op.create_index(op.f('ix_ai_evaluations_application_id'), 'ai_evaluations', ['application_id'], unique=False)
     op.create_table('application_documents',
     sa.Column('application_id', sa.UUID(), nullable=False),
-    sa.Column('document_type', sa.Enum('TRANSCRIPT', 'ID_CARD', 'CERTIFICATE', 'RECOMMENDATION_LETTER', 'STATEMENT_OF_PURPOSE', name='documenttype'), nullable=False),
+    sa.Column('document_type', sa.Enum('TRANSCRIPT', 'GRADE_12_CERTIFICATE', 'ID_CARD', 'CERTIFICATE', 'RECOMMENDATION_LETTER', 'STATEMENT_OF_PURPOSE', name='documenttype'), nullable=False),
     sa.Column('storage_path', sa.String(length=512), nullable=False),
     sa.Column('verification_status', sa.Enum('PENDING', 'VERIFIED', 'REJECTED', name='verificationstatus'), nullable=False),
     sa.Column('verified_by_id', sa.UUID(), nullable=True),
@@ -113,8 +125,8 @@ def upgrade() -> None:
     op.create_index(op.f('ix_application_documents_verification_status'), 'application_documents', ['verification_status'], unique=False)
     op.create_table('application_status_history',
     sa.Column('application_id', sa.UUID(), nullable=False),
-    sa.Column('previous_status', sa.Enum('DRAFT', 'SUBMITTED', 'UNDER_VERIFICATION', 'AI_PRE_SCREENING', 'PENDING_REVIEW', 'DECIDED', name='applicationstatus'), nullable=True),
-    sa.Column('new_status', sa.Enum('DRAFT', 'SUBMITTED', 'UNDER_VERIFICATION', 'AI_PRE_SCREENING', 'PENDING_REVIEW', 'DECIDED', name='applicationstatus'), nullable=False),
+    sa.Column('previous_status', sa.Enum('DRAFT', 'SUBMITTED', 'PAYMENT_PENDING', 'PAYMENT_VERIFIED', 'UNDER_VERIFICATION', 'AI_PRE_SCREENING', 'PENDING_REVIEW', 'DECIDED', name='applicationstatus'), nullable=True),
+    sa.Column('new_status', sa.Enum('DRAFT', 'SUBMITTED', 'PAYMENT_PENDING', 'PAYMENT_VERIFIED', 'UNDER_VERIFICATION', 'AI_PRE_SCREENING', 'PENDING_REVIEW', 'DECIDED', name='applicationstatus'), nullable=False),
     sa.Column('changed_by_id', sa.UUID(), nullable=True),
     sa.Column('trigger_reason', sa.String(length=255), nullable=True),
     sa.Column('id', sa.UUID(), nullable=False),
@@ -178,6 +190,7 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_system_audit_logs_resource_type'), table_name='system_audit_logs')
     op.drop_index(op.f('ix_system_audit_logs_resource_id'), table_name='system_audit_logs')
     op.drop_table('system_audit_logs')
+    op.drop_index(op.f('ix_academic_programs_stream'), table_name='academic_programs')
     op.drop_index(op.f('ix_academic_programs_department'), table_name='academic_programs')
     op.drop_index(op.f('ix_academic_programs_code'), table_name='academic_programs')
     op.drop_table('academic_programs')

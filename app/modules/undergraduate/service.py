@@ -5,6 +5,7 @@ Services own all business logic:
     - Workflow state transition enforcement.
     - Trilogy of Persistence (status + history + audit log in one transaction).
     - Human-in-the-loop enforcement for final decisions.
+    - Simulated payment handling.
     - Transaction boundary control (commit once).
 """
 
@@ -46,6 +47,8 @@ from app.shared.audit.models import SystemAuditLog
 from app.shared.enums import (
     ApplicationStatus,
     DecisionType,
+    PaymentStatus,
+    SponsorshipType,
     UserRole,
     VerificationStatus,
 )
@@ -57,7 +60,9 @@ logger = get_logger("undergraduate.service")
 
 ALLOWED_TRANSITIONS: dict[ApplicationStatus, set[ApplicationStatus]] = {
     ApplicationStatus.DRAFT: {ApplicationStatus.SUBMITTED},
-    ApplicationStatus.SUBMITTED: {ApplicationStatus.UNDER_VERIFICATION},
+    ApplicationStatus.SUBMITTED: {ApplicationStatus.PAYMENT_PENDING},
+    ApplicationStatus.PAYMENT_PENDING: {ApplicationStatus.PAYMENT_VERIFIED},
+    ApplicationStatus.PAYMENT_VERIFIED: {ApplicationStatus.UNDER_VERIFICATION},
     ApplicationStatus.UNDER_VERIFICATION: {ApplicationStatus.AI_PRE_SCREENING},
     ApplicationStatus.AI_PRE_SCREENING: {ApplicationStatus.PENDING_REVIEW},
     ApplicationStatus.PENDING_REVIEW: {ApplicationStatus.DECIDED},
@@ -91,26 +96,37 @@ class ApplicationService:
         actor_id: uuid.UUID,
     ) -> UndergraduateApplication:
         """
-        Create a new application in DRAFT, then immediately transition to SUBMITTED.
-        Raises DuplicateApplicationError if same program/term already exists.
+        Create a new application in DRAFT, then transition to SUBMITTED.
+        For government-sponsored: auto-set payment to COMPLETED and
+        advance to PAYMENT_VERIFIED (they skip payment).
         """
         application = UndergraduateApplication(
             applicant_id=actor_id,
-            program_id=data.program_id,
+            sponsorship_type=data.sponsorship_type,
+            stream=data.stream,
+            program_choice_1_id=data.program_choice_1_id,
+            program_choice_2_id=data.program_choice_2_id,
+            program_choice_3_id=data.program_choice_3_id,
             admission_term=data.admission_term,
             current_status=ApplicationStatus.DRAFT,
             extra_data=data.extra_data,
         )
+
+        # Government-sponsored: auto-complete payment
+        if data.sponsorship_type == SponsorshipType.GOVERNMENT:
+            application.payment_status = PaymentStatus.COMPLETED
+            application.payment_reference = "GOV_SPONSORED_NO_PAYMENT"
+
         self._app_repo.add(application)
 
         try:
             await self._db.flush()  # get the ID, check unique constraint
         except IntegrityError as e:
             await self._db.rollback()
-            # Only raise DuplicateApplicationError for the specific unique constraint.
-            # FK violations (missing program/user) should surface as real errors.
-            if "uq_one_app_per_program_per_term" in str(e.orig):
-                raise DuplicateApplicationError()
+            if "uq_one_app_per_term" in str(e.orig):
+                raise DuplicateApplicationError(
+                    "You already have an application for this admission term"
+                )
             raise
 
         # Auto-transition DRAFT → SUBMITTED
@@ -120,6 +136,87 @@ class ApplicationService:
             actor_id=actor_id,
             actor_role=UserRole.STUDENT,
             trigger_reason="Application submitted by student",
+        )
+
+        # SUBMITTED → PAYMENT_PENDING
+        await self._transition_status(
+            application=application,
+            new_status=ApplicationStatus.PAYMENT_PENDING,
+            actor_id=actor_id,
+            actor_role=UserRole.STUDENT,
+            trigger_reason="Awaiting payment",
+        )
+
+        # Government-sponsored: auto-advance past payment
+        if data.sponsorship_type == SponsorshipType.GOVERNMENT:
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.PAYMENT_VERIFIED,
+                actor_id=actor_id,
+                actor_role=UserRole.SYSTEM,
+                trigger_reason="Government-sponsored — payment not required",
+            )
+
+        await self._db.commit()
+        await self._db.refresh(application)
+        return application
+
+    # ── Payment Operations ────────────────────────────────────
+
+    async def initiate_payment(
+        self, application_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> UndergraduateApplication:
+        """
+        Generate a simulated payment reference for a self-sponsored application.
+        Application must be in PAYMENT_PENDING status.
+        """
+        application = await self._app_repo.get_by_id(application_id)
+        if application is None:
+            raise EntityNotFoundError("UndergraduateApplication", str(application_id))
+
+        if application.current_status != ApplicationStatus.PAYMENT_PENDING:
+            raise InvalidStateTransitionError(
+                application.current_status.value, "Payment can only be initiated in PAYMENT_PENDING"
+            )
+
+        if application.sponsorship_type == SponsorshipType.GOVERNMENT:
+            raise MissingPrerequisiteError(
+                "Government-sponsored applications do not require payment"
+            )
+
+        # Generate simulated payment reference
+        application.payment_reference = f"PAY-{uuid.uuid4().hex[:12].upper()}"
+        await self._db.commit()
+        await self._db.refresh(application)
+        return application
+
+    async def complete_payment(
+        self, application_id: uuid.UUID, payment_reference: str
+    ) -> UndergraduateApplication:
+        """
+        Simulated payment callback — marks payment as complete and
+        transitions to PAYMENT_VERIFIED.
+        """
+        application = await self._app_repo.get_by_id(application_id)
+        if application is None:
+            raise EntityNotFoundError("UndergraduateApplication", str(application_id))
+
+        if application.current_status != ApplicationStatus.PAYMENT_PENDING:
+            raise InvalidStateTransitionError(
+                application.current_status.value, "Payment callback only valid in PAYMENT_PENDING"
+            )
+
+        if application.payment_reference != payment_reference:
+            raise MissingPrerequisiteError("Payment reference does not match")
+
+        application.payment_status = PaymentStatus.COMPLETED
+
+        await self._transition_status(
+            application=application,
+            new_status=ApplicationStatus.PAYMENT_VERIFIED,
+            actor_id=application.applicant_id,
+            actor_role=UserRole.SYSTEM,
+            trigger_reason="Payment completed successfully",
         )
 
         await self._db.commit()

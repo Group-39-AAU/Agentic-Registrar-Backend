@@ -8,10 +8,11 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.shared.enums import (
-    ApplicationStatus, DecisionType, DocumentType, VerificationStatus,
+    ApplicationStatus, DecisionType, DocumentType,
+    PaymentStatus, SponsorshipType, StreamType, VerificationStatus,
 )
 
 
@@ -21,10 +22,42 @@ from app.shared.enums import (
 
 
 class ApplicationCreate(BaseModel):
-    """Request: student submits a new application."""
-    program_id: uuid.UUID
+    """
+    Request: student submits a new application.
+
+    Business rules:
+    - All students must select a sponsorship_type and stream.
+    - Self-sponsored: must provide exactly 3 program choices.
+    - Government-sponsored: program choices must be null.
+    """
+    sponsorship_type: SponsorshipType
+    stream: StreamType
     admission_term: str = Field(..., min_length=1, max_length=50, examples=["Fall 2026"])
+
+    # Self-sponsored only
+    program_choice_1_id: Optional[uuid.UUID] = None
+    program_choice_2_id: Optional[uuid.UUID] = None
+    program_choice_3_id: Optional[uuid.UUID] = None
+
     extra_data: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_program_choices(self):
+        choices = [self.program_choice_1_id, self.program_choice_2_id, self.program_choice_3_id]
+        if self.sponsorship_type == SponsorshipType.SELF_SPONSORED:
+            if any(c is None for c in choices):
+                raise ValueError(
+                    "Self-sponsored students must provide exactly 3 program choices"
+                )
+            if len(set(choices)) != 3:
+                raise ValueError("All 3 program choices must be different")
+        else:
+            # Government-sponsored: no program choices
+            if any(c is not None for c in choices):
+                raise ValueError(
+                    "Government-sponsored students should not provide program choices"
+                )
+        return self
 
 
 class ApplicationStatusUpdate(BaseModel):
@@ -39,10 +72,16 @@ class ApplicationResponse(BaseModel):
 
     id: uuid.UUID
     applicant_id: uuid.UUID
-    program_id: uuid.UUID
+    sponsorship_type: SponsorshipType
+    stream: StreamType
+    program_choice_1_id: Optional[uuid.UUID] = None
+    program_choice_2_id: Optional[uuid.UUID] = None
+    program_choice_3_id: Optional[uuid.UUID] = None
     admission_term: str
     current_status: ApplicationStatus
     final_decision: Optional[str] = None
+    payment_status: PaymentStatus
+    payment_reference: Optional[str] = None
     remarks: Optional[str] = None
     extra_data: dict[str, Any]
     is_deleted: bool
@@ -129,6 +168,25 @@ class DecisionResponse(BaseModel):
     justification_remarks: str
     override_reason: Optional[str] = None
     created_at: datetime
+
+
+# ══════════════════════════════════════════════════════════════
+#  Payment Schemas
+# ══════════════════════════════════════════════════════════════
+
+
+class PaymentInitiateResponse(BaseModel):
+    """Response: simulated payment link after initiation."""
+    application_id: uuid.UUID
+    payment_reference: str
+    payment_url: str
+    message: str = "Simulated payment link generated"
+
+
+class PaymentCallbackRequest(BaseModel):
+    """Request: simulated payment gateway callback."""
+    payment_reference: str
+    status: PaymentStatus = PaymentStatus.COMPLETED
 
 
 # ══════════════════════════════════════════════════════════════
