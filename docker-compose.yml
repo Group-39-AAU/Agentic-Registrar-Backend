@@ -1,0 +1,149 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentic-registrar-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agentic_registrar}
+      POSTGRES_USER: ${POSTGRES_USER:-agentic_registrar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: agentic-registrar-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentic-registrar}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-changeme-minio}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  identity-service:
+    build:
+      context: ./services/identity-service
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-agentic_registrar}
+      POSTGRES_USER: ${POSTGRES_USER:-agentic_registrar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      JWT_SECRET: ${JWT_SECRET:-change_me_in_production}
+    depends_on:
+      - postgres
+    ports:
+      - "${IDENTITY_SERVICE_PORT:-8001}:8000"
+
+  undergrad-admission-service:
+    build:
+      context: ./services/undergrad-admission-service
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-agentic_registrar}
+      POSTGRES_USER: ${POSTGRES_USER:-agentic_registrar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    depends_on:
+      - postgres
+    ports:
+      - "${UNDERGRAD_ADMISSION_SERVICE_PORT:-8002}:8000"
+
+  graduate-admission-service:
+    build:
+      context: ./services/graduate-admission-service
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-agentic_registrar}
+      POSTGRES_USER: ${POSTGRES_USER:-agentic_registrar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    depends_on:
+      - postgres
+    ports:
+      - "${GRADUATE_ADMISSION_SERVICE_PORT:-8003}:8000"
+
+  course-management-service:
+    build:
+      context: ./services/course-management-service
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-agentic_registrar}
+      POSTGRES_USER: ${POSTGRES_USER:-agentic_registrar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    depends_on:
+      - postgres
+    ports:
+      - "${COURSE_MANAGEMENT_SERVICE_PORT:-8004}:8000"
+
+  document-service:
+    build:
+      context: ./services/document-service
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-agentic_registrar}
+      POSTGRES_USER: ${POSTGRES_USER:-agentic_registrar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentic-registrar}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-changeme-minio}
+      MINIO_BUCKET_DOCUMENTS: ${MINIO_BUCKET_DOCUMENTS:-agentic-registrar-documents}
+    depends_on:
+      - postgres
+      - minio
+    ports:
+      - "${DOCUMENT_SERVICE_PORT:-8005}:8000"
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+    depends_on:
+      - postgres
+    ports:
+      - "${NOTIFICATION_SERVICE_PORT:-8006}:8000"
+
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      IDENTITY_SERVICE_URL: http://identity-service:8000
+      UNDERGRAD_ADMISSION_SERVICE_URL: http://undergrad-admission-service:8000
+      GRADUATE_ADMISSION_SERVICE_URL: http://graduate-admission-service:8000
+      COURSE_MANAGEMENT_SERVICE_URL: http://course-management-service:8000
+      DOCUMENT_SERVICE_URL: http://document-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+    depends_on:
+      - identity-service
+      - undergrad-admission-service
+      - graduate-admission-service
+      - course-management-service
+      - document-service
+      - notification-service
+    ports:
+      - "${API_GATEWAY_PORT:-8000}:8000"
+
+volumes:
+  postgres_data:
+  minio_data:
+
