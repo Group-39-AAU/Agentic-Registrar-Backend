@@ -41,6 +41,9 @@ class UndergraduateApplication(SoftDeleteBase):
     sponsorship_type: Mapped[SponsorshipType] = mapped_column(nullable=False)
     stream: Mapped[StreamType] = mapped_column(nullable=False)
 
+    # ── Grade 12 admission number (used to query MoE database) ──
+    admission_number: Mapped[str] = mapped_column(String(50), nullable=False)
+
     # ── Program choices (self-sponsored only, nullable for government) ──
     program_choice_1_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("academic_programs.id"), nullable=True

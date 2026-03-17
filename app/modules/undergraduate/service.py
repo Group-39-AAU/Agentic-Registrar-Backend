@@ -104,6 +104,7 @@ class ApplicationService:
             applicant_id=actor_id,
             sponsorship_type=data.sponsorship_type,
             stream=data.stream,
+            admission_number=data.admission_number,
             program_choice_1_id=data.program_choice_1_id,
             program_choice_2_id=data.program_choice_2_id,
             program_choice_3_id=data.program_choice_3_id,

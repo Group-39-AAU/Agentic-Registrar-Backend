@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     ALGORITHM: str = "HS256"
 
+    # ── AI / Gemini ──────────────────────────────────────
+    GEMINI_API_KEY: str = ""
+
     # ── Logging ──────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

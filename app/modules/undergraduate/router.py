@@ -340,20 +340,17 @@ async def validate_application(
     except EntityNotFoundError as e:
         _handle_domain_error(e)
 
-    # Collect document types currently uploaded
-    doc_types = [doc.document_type.value for doc in application.documents]
-
     # Run the LangGraph agent
     result = await run_intake_validation(
         application_id=application.id,
         sponsorship_type=application.sponsorship_type.value,
         stream=application.stream.value,
+        admission_number=application.admission_number,
         program_choice_1_id=application.program_choice_1_id,
         program_choice_2_id=application.program_choice_2_id,
         program_choice_3_id=application.program_choice_3_id,
         payment_status=application.payment_status.value,
         current_status=application.current_status.value,
-        document_types_uploaded=doc_types,
     )
 
     # Determine the recommendation
@@ -409,6 +406,161 @@ async def validate_application(
             )
         except InvalidStateTransitionError as e:
             _handle_domain_error(e)
+
+    await db.commit()
+    await db.refresh(application)
+    return application
+
+
+# ══════════════════════════════════════════════════════════════
+#  Credential Verification Endpoint (Direct MoE Lookup)
+# ══════════════════════════════════════════════════════════════
+
+
+@router.post(
+    "/applications/{application_id}/verify-credentials",
+    response_model=ApplicationResponse,
+    tags=["AI Agents"],
+)
+async def verify_credentials(
+    application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Verify academic credentials by looking up the student's admission number
+    in the Ministry of Education (MoE) database.
+
+    Cross-checks:
+    1. Admission number exists in MoE database
+    2. Student name (from User profile) matches MoE record
+
+    If both match → PASS → status advances to AI_PRE_SCREENING.
+    If not found or name mismatch → FLAG → status advances to FLAGGED_FOR_REVIEW.
+    """
+    from sqlalchemy import select
+
+    from app.ai.models import AIEvaluation, AIExecutionTrace
+    from app.modules.auth.models import User as UserModel
+    from app.modules.moe.models import MoeStudentRecord
+
+    AGENT_VERSION = "credential-verification-v2.0"
+
+    svc = ApplicationService(db)
+
+    try:
+        application = await svc.get_application(application_id)
+    except EntityNotFoundError as e:
+        _handle_domain_error(e)
+
+    admission_number = application.admission_number
+    if not admission_number:
+        raise HTTPException(400, "Application has no admission number")
+
+    # Get the student's name from the User profile
+    user_result = await db.execute(
+        select(UserModel).where(UserModel.id == application.applicant_id)
+    )
+    applicant = user_result.scalar_one_or_none()
+    if applicant is None:
+        raise HTTPException(404, "Applicant user not found")
+
+    student_name = f"{applicant.first_name} {applicant.last_name}".strip().upper()
+
+    # Query MoE database
+    moe_result = await db.execute(
+        select(MoeStudentRecord).where(
+            MoeStudentRecord.admission_number == admission_number
+        )
+    )
+    moe_record = moe_result.scalar_one_or_none()
+
+    # Cross-check logic
+    issues = []
+    traces = []
+
+    if moe_record is None:
+        issues.append(f"No MoE record found for admission number: {admission_number}")
+        traces.append({
+            "step_name": "moe_lookup",
+            "reasoning_log": f"FAIL: No record found for admission_number={admission_number}",
+        })
+    else:
+        traces.append({
+            "step_name": "moe_lookup",
+            "reasoning_log": f"OK: Found MoE record for {admission_number}: {moe_record.full_name}",
+        })
+
+        # Name cross-check
+        moe_name = moe_record.full_name.strip().upper()
+        if student_name in moe_name or moe_name in student_name:
+            traces.append({
+                "step_name": "name_cross_check",
+                "reasoning_log": f"OK: Student name '{student_name}' matches MoE name '{moe_name}'",
+            })
+        else:
+            issues.append(
+                f"Name mismatch: application has '{student_name}' but MoE has '{moe_name}'"
+            )
+            traces.append({
+                "step_name": "name_cross_check",
+                "reasoning_log": f"FAIL: '{student_name}' does not match '{moe_name}'",
+            })
+
+    # Determine result
+    from app.shared.enums import DecisionType as DT
+
+    if not issues:
+        overall_result = "PASS"
+        confidence = 1.0
+        recommended = DT.RECOMMEND_ADMIT
+        summary = f"Credentials verified: admission number {admission_number} matches MoE record."
+    else:
+        overall_result = "FLAG"
+        confidence = 0.0
+        recommended = DT.FLAG_FOR_REVIEW
+        summary = f"Credential issues: {'; '.join(issues)}"
+
+    # Write AIEvaluation
+    evaluation = AIEvaluation(
+        application_id=application.id,
+        agent_version=AGENT_VERSION,
+        recommended_decision=recommended,
+        confidence_score=confidence,
+        is_overridden=False,
+        summary_reasoning=summary,
+    )
+    db.add(evaluation)
+    await db.flush()
+
+    # Write AIExecutionTrace for each step
+    for trace in traces:
+        trace_entry = AIExecutionTrace(
+            evaluation_id=evaluation.id,
+            step_name=trace["step_name"],
+            reasoning_log=trace["reasoning_log"],
+        )
+        db.add(trace_entry)
+
+    # Transition application status
+    try:
+        from app.modules.undergraduate.schemas import ApplicationStatusUpdate as StatusUpd
+
+        if overall_result == "PASS":
+            new_status = ApplicationStatus.AI_PRE_SCREENING
+            reason = f"Credential Verification: PASS — {summary}"
+        else:
+            new_status = ApplicationStatus.FLAGGED_FOR_REVIEW
+            reason = f"Credential Verification: FLAGGED — {summary}"
+
+        await svc.change_status(
+            application.id,
+            StatusUpd(new_status=new_status, trigger_reason=reason),
+            actor_id=current_user.id,
+            actor_role=UserRole.AGENT,
+        )
+    except InvalidStateTransitionError as e:
+        _handle_domain_error(e)
 
     await db.commit()
     await db.refresh(application)

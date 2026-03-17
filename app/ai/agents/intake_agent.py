@@ -33,10 +33,6 @@ logger = get_logger("ai.intake_agent")
 
 AGENT_VERSION = "intake-agent-v1.0"
 
-# Required document types for all applicants
-REQUIRED_DOCUMENTS = {DocumentType.GRADE_12_CERTIFICATE, DocumentType.ID_CARD}
-
-
 # ── Agent State ──────────────────────────────────────────────
 
 @dataclass
@@ -45,12 +41,12 @@ class IntakeState:
     application_id: uuid.UUID = field(default_factory=uuid.uuid4)
     sponsorship_type: str = ""
     stream: str = ""
+    admission_number: str = ""
     program_choice_1_id: Any = None
     program_choice_2_id: Any = None
     program_choice_3_id: Any = None
     payment_status: str = ""
     current_status: str = ""
-    document_types_uploaded: list[str] = field(default_factory=list)
 
     # Populated by agent nodes
     checks_passed: list[str] = field(default_factory=list)
@@ -91,6 +87,13 @@ def check_profile_complete(state: IntakeState) -> IntakeState:
     else:
         reasoning_lines.append("OK: government-sponsored — program choices not required")
 
+    # Admission number
+    if not state.admission_number:
+        reasoning_lines.append("FAIL: admission_number is missing")
+        passed = False
+    else:
+        reasoning_lines.append(f"OK: admission_number = {state.admission_number}")
+
     result = "PASS" if passed else "FAIL"
     if passed:
         state.checks_passed.append("profile_completeness")
@@ -107,33 +110,8 @@ def check_profile_complete(state: IntakeState) -> IntakeState:
     return state
 
 
-def check_documents_uploaded(state: IntakeState) -> IntakeState:
-    """Node 2: Verify required document types are uploaded."""
-    reasoning_lines = []
-    uploaded_set = set(state.document_types_uploaded)
-    missing = REQUIRED_DOCUMENTS - uploaded_set
-
-    if not missing:
-        reasoning_lines.append(f"OK: all required documents present: {[d.value for d in REQUIRED_DOCUMENTS]}")
-        state.checks_passed.append("documents_uploaded")
-    else:
-        reasoning_lines.append(f"FAIL: missing required documents: {[d.value for d in missing]}")
-        reasoning_lines.append(f"  uploaded: {state.document_types_uploaded}")
-        state.checks_failed.append("documents_uploaded")
-
-    result = "PASS" if not missing else "FAIL"
-    state.traces.append({
-        "step_name": "check_documents_uploaded",
-        "reasoning_log": "\n".join(reasoning_lines),
-        "result": result,
-    })
-
-    logger.info("Document check: %s for application %s", result, state.application_id)
-    return state
-
-
 def check_payment_verified(state: IntakeState) -> IntakeState:
-    """Node 3: Confirm payment has been completed."""
+    """Node 2: Confirm payment has been completed."""
     reasoning_lines = []
 
     if state.payment_status == PaymentStatus.COMPLETED.value:
@@ -156,7 +134,7 @@ def check_payment_verified(state: IntakeState) -> IntakeState:
 
 
 def decide(state: IntakeState) -> IntakeState:
-    """Node 4: Final decision — pass or flag for review."""
+    """Node 3: Final decision — pass or flag for review."""
     if not state.checks_failed:
         state.overall_result = "PASS"
         reasoning = (
@@ -193,18 +171,16 @@ def build_intake_graph() -> StateGraph:
     """
     Construct the LangGraph StateGraph for the Intake Validation Agent.
 
-    Flow: check_profile → check_documents → check_payment → decide → END
+    Flow: check_profile → check_payment → decide → END
     """
     graph = StateGraph(IntakeState)
 
     graph.add_node("check_profile_complete", check_profile_complete)
-    graph.add_node("check_documents_uploaded", check_documents_uploaded)
     graph.add_node("check_payment_verified", check_payment_verified)
     graph.add_node("decide", decide)
 
     graph.set_entry_point("check_profile_complete")
-    graph.add_edge("check_profile_complete", "check_documents_uploaded")
-    graph.add_edge("check_documents_uploaded", "check_payment_verified")
+    graph.add_edge("check_profile_complete", "check_payment_verified")
     graph.add_edge("check_payment_verified", "decide")
     graph.add_edge("decide", END)
 
@@ -217,12 +193,12 @@ async def run_intake_validation(
     application_id: uuid.UUID,
     sponsorship_type: str,
     stream: str,
+    admission_number: str,
     program_choice_1_id: Any,
     program_choice_2_id: Any,
     program_choice_3_id: Any,
     payment_status: str,
     current_status: str,
-    document_types_uploaded: list[str],
 ) -> IntakeState:
     """
     Run the full intake validation pipeline. Returns the final IntakeState
@@ -232,12 +208,12 @@ async def run_intake_validation(
         application_id=application_id,
         sponsorship_type=sponsorship_type,
         stream=stream,
+        admission_number=admission_number,
         program_choice_1_id=program_choice_1_id,
         program_choice_2_id=program_choice_2_id,
         program_choice_3_id=program_choice_3_id,
         payment_status=payment_status,
         current_status=current_status,
-        document_types_uploaded=document_types_uploaded,
     )
 
     compiled_graph = build_intake_graph()

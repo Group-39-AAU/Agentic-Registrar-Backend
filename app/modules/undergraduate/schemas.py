@@ -32,6 +32,7 @@ class ApplicationCreate(BaseModel):
     """
     sponsorship_type: SponsorshipType
     stream: StreamType
+    admission_number: str = Field(..., min_length=1, max_length=50, examples=["2955397"])
     admission_term: str = Field(..., min_length=1, max_length=50, examples=["Fall 2026"])
 
     # Self-sponsored only
@@ -74,6 +75,7 @@ class ApplicationResponse(BaseModel):
     applicant_id: uuid.UUID
     sponsorship_type: SponsorshipType
     stream: StreamType
+    admission_number: str
     program_choice_1_id: Optional[uuid.UUID] = None
     program_choice_2_id: Optional[uuid.UUID] = None
     program_choice_3_id: Optional[uuid.UUID] = None
