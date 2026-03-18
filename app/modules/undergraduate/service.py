@@ -63,8 +63,10 @@ ALLOWED_TRANSITIONS: dict[ApplicationStatus, set[ApplicationStatus]] = {
     ApplicationStatus.SUBMITTED: {ApplicationStatus.PAYMENT_PENDING},
     ApplicationStatus.PAYMENT_PENDING: {ApplicationStatus.PAYMENT_VERIFIED},
     ApplicationStatus.PAYMENT_VERIFIED: {ApplicationStatus.UNDER_VERIFICATION},
-    ApplicationStatus.UNDER_VERIFICATION: {ApplicationStatus.AI_PRE_SCREENING},
-    ApplicationStatus.AI_PRE_SCREENING: {ApplicationStatus.PENDING_REVIEW},
+    ApplicationStatus.UNDER_VERIFICATION: {ApplicationStatus.AI_PRE_SCREENING, ApplicationStatus.FLAGGED_FOR_REVIEW},
+    ApplicationStatus.AI_PRE_SCREENING: {ApplicationStatus.UAT_PENDING, ApplicationStatus.FLAGGED_FOR_REVIEW},
+    ApplicationStatus.UAT_PENDING: {ApplicationStatus.UAT_COMPLETED},
+    ApplicationStatus.UAT_COMPLETED: {ApplicationStatus.PENDING_REVIEW},
     ApplicationStatus.PENDING_REVIEW: {ApplicationStatus.DECIDED},
     ApplicationStatus.DECIDED: set(),  # Terminal state
 }

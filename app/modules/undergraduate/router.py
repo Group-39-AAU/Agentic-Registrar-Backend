@@ -559,6 +559,38 @@ async def verify_credentials(
             actor_id=current_user.id,
             actor_role=UserRole.AGENT,
         )
+
+        # If PASS: auto-transition to UAT_PENDING and generate UAT record
+        if overall_result == "PASS":
+            import random
+            from datetime import datetime
+
+            from app.modules.testing_center.models import UATRecord
+
+            # Transition AI_PRE_SCREENING → UAT_PENDING
+            await svc.change_status(
+                application.id,
+                StatusUpd(
+                    new_status=ApplicationStatus.UAT_PENDING,
+                    trigger_reason="Credentials verified — UAT scheduling initiated",
+                ),
+                actor_id=current_user.id,
+                actor_role=UserRole.SYSTEM,
+            )
+
+            # Generate unique UAT ID
+            year = datetime.now().year
+            random_digits = random.randint(100000, 999999)
+            uat_id = f"UAT-{year}-{random_digits}"
+
+            # Create UAT record
+            uat_record = UATRecord(
+                uat_id=uat_id,
+                application_id=application.id,
+                student_name=student_name,
+            )
+            db.add(uat_record)
+
     except InvalidStateTransitionError as e:
         _handle_domain_error(e)
 
