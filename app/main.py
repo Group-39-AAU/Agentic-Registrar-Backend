@@ -20,12 +20,14 @@ from app.modules.undergraduate.models import (                    # noqa: F401
 from app.ai.models import AIEvaluation, AIExecutionTrace           # noqa: F401
 from app.modules.moe.models import MoeStudentRecord                # noqa: F401
 from app.modules.testing_center.models import UATRecord            # noqa: F401
+from app.modules.ranking.models import StreamQuota, RankingResult  # noqa: F401
 
 from app.modules.auth.router import router as auth_router
 from app.modules.programs.router import router as programs_router
 from app.modules.undergraduate.router import router as undergraduate_router
 from app.modules.moe.router import router as moe_router
 from app.modules.testing_center.router import router as testing_center_router
+from app.modules.ranking.router import router as ranking_router
 
 
 def create_app() -> FastAPI:
@@ -54,6 +56,7 @@ def create_app() -> FastAPI:
     app.include_router(undergraduate_router, prefix=settings.API_V1_PREFIX)
     app.include_router(moe_router, prefix=settings.API_V1_PREFIX)
     app.include_router(testing_center_router, prefix=settings.API_V1_PREFIX)
+    app.include_router(ranking_router, prefix=settings.API_V1_PREFIX)
 
     @app.get("/health", tags=["System"])
     async def health_check():
