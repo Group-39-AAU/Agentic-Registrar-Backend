@@ -68,7 +68,8 @@ ALLOWED_TRANSITIONS: dict[ApplicationStatus, set[ApplicationStatus]] = {
     ApplicationStatus.UAT_PENDING: {ApplicationStatus.UAT_COMPLETED},
     ApplicationStatus.UAT_COMPLETED: {ApplicationStatus.PENDING_REVIEW},
     ApplicationStatus.PENDING_REVIEW: {ApplicationStatus.DECIDED},
-    ApplicationStatus.DECIDED: set(),  # Terminal state
+    ApplicationStatus.DECIDED: {ApplicationStatus.ENROLLED},
+    ApplicationStatus.ENROLLED: set(),  # Terminal state
 }
 
 

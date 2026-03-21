@@ -21,6 +21,7 @@ class ApplicationStatus(str, Enum):
     FLAGGED_FOR_REVIEW = "FLAGGED_FOR_REVIEW"
     PENDING_REVIEW = "PENDING_REVIEW"
     DECIDED = "DECIDED"
+    ENROLLED = "ENROLLED"
 
 
 class SponsorshipType(str, Enum):
