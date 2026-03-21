@@ -89,3 +89,70 @@ class StreamQuotaResponse(BaseModel):
 class StreamQuotaUpdate(BaseModel):
     """Request to update stream quota."""
     max_capacity: int
+
+
+# ── Officer Review ──
+
+class StudentReviewCard(BaseModel):
+    """Everything an officer needs to make an admission decision."""
+    application_id: uuid.UUID
+    student_name: str
+    admission_number: str
+    sponsorship_type: str
+    stream: str
+
+    # Scores
+    grade12_score: float
+    uat_score: float
+    final_score: float
+    rank_position: int
+
+    # Placement
+    assigned_program_name: Optional[str] = None
+    assigned_program_code: Optional[str] = None
+    assigned_stream: Optional[str] = None
+    is_assigned: bool
+    assignment_detail: Optional[str] = None
+
+    # Preferences (self-sponsored)
+    program_choice_1: Optional[str] = None
+    program_choice_2: Optional[str] = None
+    program_choice_3: Optional[str] = None
+
+    # AI recommendation
+    ai_recommended_decision: Optional[str] = None
+    ai_confidence: Optional[float] = None
+
+    # Status
+    current_status: str
+    has_decision: bool
+
+
+class StudentReviewListResponse(BaseModel):
+    """Paginated list of students for officer review."""
+    items: list[StudentReviewCard]
+    total: int
+    page: int
+    page_size: int
+
+
+# ── Batch Decision ──
+
+class BatchDecisionItem(BaseModel):
+    """One decision in a batch."""
+    application_id: uuid.UUID
+    human_decision: str  # ADMIT or REJECT
+    justification_remarks: str
+
+
+class BatchDecisionRequest(BaseModel):
+    """Request: officer submits multiple decisions at once."""
+    decisions: list[BatchDecisionItem]
+
+
+class BatchDecisionResponse(BaseModel):
+    """Response after processing a batch of decisions."""
+    processed: int
+    failed: int
+    results: list[dict]
+
