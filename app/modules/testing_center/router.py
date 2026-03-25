@@ -15,8 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.session import get_db
 from app.modules.testing_center.models import UATRecord
 from app.modules.testing_center.schemas import UATCallbackResponse, UATRecordResponse
-from app.modules.undergraduate.service import ApplicationService
-from app.shared.enums import ApplicationStatus, UserRole
+from app.shared.events import UATCompletedEvent, publish
 
 router = APIRouter(prefix="/testing-center", tags=["Testing Center (UAT)"])
 
@@ -34,7 +33,7 @@ async def uat_callback(
 
     Looks up the UAT record by its ID, generates a random score
     (weighted towards good scores 60-100), marks it complete,
-    and transitions the application to UAT_COMPLETED.
+    and publishes a UATCompletedEvent for the application module to handle.
     """
     # Find the UAT record
     result = await db.execute(
@@ -49,30 +48,25 @@ async def uat_callback(
         raise HTTPException(400, f"UAT {uat_id} has already been completed with score {uat_record.score}")
 
     # Generate a weighted random score (mostly good: 60–100)
-    # Use a triangular distribution weighted toward higher scores
     score = round(random.triangular(60, 100, 85), 1)
 
     # Update the UAT record
     uat_record.score = score
     uat_record.is_completed = True
 
-    # Transition application: UAT_PENDING → UAT_COMPLETED
-    svc = ApplicationService(db)
-    from app.modules.undergraduate.schemas import ApplicationStatusUpdate as StatusUpd
-
+    # Publish event — undergraduate module handles its own status transition
     try:
-        app_entity = await svc.get_application(uat_record.application_id)
-        await svc.change_status(
-            uat_record.application_id,
-            StatusUpd(
-                new_status=ApplicationStatus.UAT_COMPLETED,
-                trigger_reason=f"UAT completed — score: {score}/100",
+        await publish(
+            UATCompletedEvent(
+                application_id=uat_record.application_id,
+                applicant_id=uat_record.application_id,  # Will be resolved by handler
+                uat_id=uat_id,
+                score=score,
             ),
-            actor_id=app_entity.applicant_id,  # Use applicant's ID as actor to satisfy FK constraints
-            actor_role=UserRole.SYSTEM,
+            db=db,
         )
     except Exception as e:
-        raise HTTPException(400, f"Failed to update application status: {str(e)}")
+        raise HTTPException(400, f"Failed to process UAT completion: {str(e)}")
 
     await db.commit()
 
@@ -81,6 +75,8 @@ async def uat_callback(
         score=score,
         message=f"UAT completed successfully. Score: {score}/100",
     )
+
+
 
 
 @router.get(

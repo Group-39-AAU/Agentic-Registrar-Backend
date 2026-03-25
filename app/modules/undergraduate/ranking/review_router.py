@@ -17,8 +17,8 @@ from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.moe.models import MoeStudentRecord
 from app.modules.programs.models import AcademicProgram
-from app.modules.ranking.models import RankingResult
-from app.modules.ranking.schemas import (
+from app.modules.undergraduate.ranking.models import RankingResult
+from app.modules.undergraduate.ranking.schemas import (
     BatchDecisionRequest,
     BatchDecisionResponse,
     StudentReviewCard,
@@ -43,7 +43,7 @@ from app.shared.enums import (
     UserRole,
 )
 
-router = APIRouter(prefix="/review", tags=["Officer Review"])
+router = APIRouter(prefix="/undergraduate/review", tags=["Undergraduate Officer Review"])
 
 
 # ── Helper ───────────────────────────────────────────────────

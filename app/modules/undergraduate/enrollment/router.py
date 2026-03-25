@@ -15,14 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependencies import get_current_user
 from app.database.session import get_db
 from app.modules.auth.models import User
-from app.modules.enrollment.models import Enrollment
-from app.modules.enrollment.schemas import (
+from app.modules.undergraduate.enrollment.models import Enrollment
+from app.modules.undergraduate.enrollment.schemas import (
     EnrollmentListResponse,
     EnrollmentResponse,
     EnrollmentRunResponse,
 )
 from app.modules.programs.models import AcademicProgram
-from app.modules.ranking.models import RankingResult
+from app.modules.undergraduate.ranking.models import RankingResult
 from app.modules.undergraduate.models import (
     RegistrarDecision,
     UndergraduateApplication,
@@ -35,7 +35,7 @@ from app.shared.enums import (
     UserRole,
 )
 
-router = APIRouter(prefix="/enrollment", tags=["Enrollment & Onboarding"])
+router = APIRouter(prefix="/undergraduate/enrollment", tags=["Undergraduate Enrollment & Onboarding"])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -116,7 +116,7 @@ async def run_enrollment(
     year_suffix = datetime.now().strftime("%y")  # "26"
 
     # ── 6. Build admitted student data and run agent ──
-    from app.ai.agents.enrollment_agent import (
+    from app.modules.undergraduate.agents.enrollment_agent import (
         AdmittedStudent,
         build_enrollment_graph,
     )

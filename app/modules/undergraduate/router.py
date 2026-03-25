@@ -330,7 +330,7 @@ async def validate_application(
     If all pass → transitions to UNDER_VERIFICATION.
     If any fail → writes an AIEvaluation with FLAG_FOR_REVIEW.
     """
-    from app.ai.agents.intake_agent import AGENT_VERSION, run_intake_validation
+    from app.modules.undergraduate.agents.intake_agent import AGENT_VERSION, run_intake_validation
     from app.ai.models import AIEvaluation, AIExecutionTrace
 
     svc = ApplicationService(db)

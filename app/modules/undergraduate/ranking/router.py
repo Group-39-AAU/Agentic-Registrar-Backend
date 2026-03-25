@@ -16,8 +16,8 @@ from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.moe.models import MoeStudentRecord
 from app.modules.programs.models import AcademicProgram
-from app.modules.ranking.models import RankingResult, StreamQuota
-from app.modules.ranking.schemas import (
+from app.modules.undergraduate.ranking.models import RankingResult, StreamQuota
+from app.modules.undergraduate.ranking.schemas import (
     ProgramCutoffResponse,
     RankingResultResponse,
     RankingRunResponse,
@@ -31,7 +31,7 @@ from app.modules.undergraduate.models import UndergraduateApplication
 from app.modules.undergraduate.service import ApplicationService
 from app.shared.enums import ApplicationStatus, StreamType, UserRole
 
-router = APIRouter(prefix="/ranking", tags=["Eligibility & Ranking"])
+router = APIRouter(prefix="/undergraduate/ranking", tags=["Undergraduate Eligibility & Ranking"])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -114,7 +114,7 @@ async def run_ranking(
             stream_quotas[st.value] = 2500  # Default
 
     # ── 6. Build applicant data ──
-    from app.ai.agents.ranking_agent import ApplicantData, AGENT_VERSION, RankingState, build_ranking_graph
+    from app.modules.undergraduate.agents.ranking_agent import ApplicantData, AGENT_VERSION, RankingState, build_ranking_graph
 
     applicant_list = []
     skipped = []

@@ -23,7 +23,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
 from app.modules.programs.models import AcademicProgram
 from app.modules.moe.models import MoeStudentRecord
-from app.modules.ranking.models import StreamQuota
+from app.modules.undergraduate.ranking.models import StreamQuota
 from app.modules.auth.models import User
 from app.core.security import hash_password
 from app.shared.enums import StreamType, UserRole
