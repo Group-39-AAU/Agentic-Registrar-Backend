@@ -12,10 +12,12 @@ Services own all business logic:
 import uuid
 from typing import Optional, Sequence
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger, write_audit_log
+from app.modules.programs.models import AcademicProgram
 from app.modules.undergraduate.exceptions import (
     DuplicateApplicationError,
     EntityNotFoundError,
@@ -38,11 +40,14 @@ from app.modules.undergraduate.repository import (
 )
 from app.modules.undergraduate.schemas import (
     ApplicationCreate,
+    ApplicationResponse,
     ApplicationStatusUpdate,
     DecisionCreate,
     DocumentCreate,
     DocumentVerify,
+    ProgramChoiceSummary,
 )
+from app.modules.testing_center.models import UATRecord
 from app.shared.audit.models import SystemAuditLog
 from app.shared.enums import (
     ApplicationStatus,
@@ -266,20 +271,117 @@ class ApplicationService:
             raise EntityNotFoundError("UndergraduateApplication", str(application_id))
         return application
 
+    async def to_application_response(
+        self, application: UndergraduateApplication
+    ) -> ApplicationResponse:
+        """Map one application ORM row to API response (UAT + program enrichment)."""
+        built = await self._build_application_responses((application,))
+        return built[0]
+
     async def list_applications(
         self, *, limit: int = 50, offset: int = 0
-    ) -> tuple[Sequence[UndergraduateApplication], int]:
-        return await self._app_repo.get_all(limit=limit, offset=offset)
+    ) -> tuple[list[ApplicationResponse], int]:
+        items, total = await self._app_repo.get_all(limit=limit, offset=offset)
+        enriched = await self._build_application_responses(items)
+        return enriched, total
 
     async def list_my_applications(
         self, applicant_id: uuid.UUID
-    ) -> Sequence[UndergraduateApplication]:
-        return await self._app_repo.get_applications_for_applicant(applicant_id)
+    ) -> list[ApplicationResponse]:
+        items = await self._app_repo.get_applications_for_applicant(applicant_id)
+        return await self._build_application_responses(items)
+
+    async def _build_application_responses(
+        self, applications: Sequence[UndergraduateApplication]
+    ) -> list[ApplicationResponse]:
+        """Batch-load UAT ids and program rows for application responses."""
+        if not applications:
+            return []
+
+        app_ids = [a.id for a in applications]
+
+        uat_result = await self._db.execute(
+            select(UATRecord).where(UATRecord.application_id.in_(app_ids))
+        )
+        uat_rows = uat_result.scalars().all()
+        latest_uat: dict[uuid.UUID, UATRecord] = {}
+        for r in uat_rows:
+            existing = latest_uat.get(r.application_id)
+            if existing is None or r.created_at > existing.created_at:
+                latest_uat[r.application_id] = r
+        uat_id_by_app = {aid: rec.uat_id for aid, rec in latest_uat.items()}
+
+        prog_ids: set[uuid.UUID] = set()
+        for a in applications:
+            if a.sponsorship_type == SponsorshipType.SELF_SPONSORED:
+                for pid in (
+                    a.program_choice_1_id,
+                    a.program_choice_2_id,
+                    a.program_choice_3_id,
+                ):
+                    if pid is not None:
+                        prog_ids.add(pid)
+
+        prog_map: dict[uuid.UUID, AcademicProgram] = {}
+        if prog_ids:
+            prog_result = await self._db.execute(
+                select(AcademicProgram).where(
+                    AcademicProgram.id.in_(prog_ids),
+                    AcademicProgram.is_deleted == False,  # noqa: E712
+                )
+            )
+            for p in prog_result.scalars().all():
+                prog_map[p.id] = p
+
+        def choice_summary(pid: Optional[uuid.UUID]) -> Optional[ProgramChoiceSummary]:
+            if pid is None:
+                return None
+            prog = prog_map.get(pid)
+            if prog is None:
+                return None
+            return ProgramChoiceSummary(id=prog.id, code=prog.code, name=prog.name)
+
+        out: list[ApplicationResponse] = []
+        for a in applications:
+            if a.sponsorship_type == SponsorshipType.SELF_SPONSORED:
+                p1 = choice_summary(a.program_choice_1_id)
+                p2 = choice_summary(a.program_choice_2_id)
+                p3 = choice_summary(a.program_choice_3_id)
+            else:
+                p1 = p2 = p3 = None
+
+            out.append(
+                ApplicationResponse(
+                    id=a.id,
+                    applicant_id=a.applicant_id,
+                    sponsorship_type=a.sponsorship_type,
+                    stream=a.stream,
+                    admission_number=a.admission_number,
+                    program_choice_1=p1,
+                    program_choice_2=p2,
+                    program_choice_3=p3,
+                    admission_term=a.admission_term,
+                    current_status=a.current_status,
+                    final_decision=a.final_decision,
+                    payment_status=a.payment_status,
+                    payment_reference=a.payment_reference,
+                    remarks=a.remarks,
+                    extra_data=a.extra_data,
+                    is_deleted=a.is_deleted,
+                    created_at=a.created_at,
+                    updated_at=a.updated_at,
+                    uat_id=uat_id_by_app.get(a.id),
+                )
+            )
+        return out
 
     async def get_review_queue(
         self, *, limit: int = 50, offset: int = 0
-    ) -> Sequence[UndergraduateApplication]:
-        return await self._app_repo.get_pending_review_queue(limit=limit, offset=offset)
+    ) -> list[ApplicationResponse]:
+        items = await self._app_repo.get_pending_review_queue(
+            limit=limit, offset=offset
+        )
+        return await self._build_application_responses(items)
 
     # ── Document Operations ───────────────────────────────────
 

@@ -67,8 +67,22 @@ class ApplicationStatusUpdate(BaseModel):
     trigger_reason: Optional[str] = None
 
 
+class ProgramChoiceSummary(BaseModel):
+    """Program fields exposed on application responses (from academic_programs)."""
+    id: uuid.UUID
+    code: str
+    name: str
+
+
 class ApplicationResponse(BaseModel):
-    """Response: full application details."""
+    """
+    Response: full application details for all undergraduate application endpoints.
+
+    Program choices are objects (not raw FKs). For self-sponsored applicants they are
+    populated from academic_programs; for government-sponsored they are null.
+    uat_id comes from uat_records when a row exists.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -76,9 +90,9 @@ class ApplicationResponse(BaseModel):
     sponsorship_type: SponsorshipType
     stream: StreamType
     admission_number: str
-    program_choice_1_id: Optional[uuid.UUID] = None
-    program_choice_2_id: Optional[uuid.UUID] = None
-    program_choice_3_id: Optional[uuid.UUID] = None
+    program_choice_1: Optional[ProgramChoiceSummary] = None
+    program_choice_2: Optional[ProgramChoiceSummary] = None
+    program_choice_3: Optional[ProgramChoiceSummary] = None
     admission_term: str
     current_status: ApplicationStatus
     final_decision: Optional[str] = None
@@ -89,6 +103,7 @@ class ApplicationResponse(BaseModel):
     is_deleted: bool
     created_at: datetime
     updated_at: datetime
+    uat_id: Optional[str] = None
 
 
 class ApplicationListResponse(BaseModel):

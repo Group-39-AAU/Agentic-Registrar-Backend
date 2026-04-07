@@ -75,7 +75,7 @@ async def submit_application(
         app = await svc.submit_application(data, actor_id=current_user.id)
     except (DuplicateApplicationError, EntityNotFoundError) as e:
         _handle_domain_error(e)
-    return app
+    return await svc.to_application_response(app)
 
 
 @router.get("/applications", response_model=ApplicationListResponse)
@@ -122,9 +122,10 @@ async def get_application(
     """Get a specific application by ID."""
     svc = ApplicationService(db)
     try:
-        return await svc.get_application(application_id)
+        app = await svc.get_application(application_id)
     except EntityNotFoundError as e:
         _handle_domain_error(e)
+    return await svc.to_application_response(app)
 
 
 @router.patch("/applications/{application_id}/status", response_model=ApplicationResponse)
@@ -137,13 +138,14 @@ async def change_application_status(
     """Transition an application's status (registrar/system)."""
     svc = ApplicationService(db)
     try:
-        return await svc.change_status(
+        app = await svc.change_status(
             application_id, data,
             actor_id=current_user.id,
             actor_role=current_user.role,
         )
     except (EntityNotFoundError, InvalidStateTransitionError) as e:
         _handle_domain_error(e)
+    return await svc.to_application_response(app)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -193,9 +195,10 @@ async def payment_callback(
     """
     svc = ApplicationService(db)
     try:
-        return await svc.complete_payment(application_id, data.payment_reference)
+        app = await svc.complete_payment(application_id, data.payment_reference)
     except (EntityNotFoundError, InvalidStateTransitionError, MissingPrerequisiteError) as e:
         _handle_domain_error(e)
+    return await svc.to_application_response(app)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -409,7 +412,7 @@ async def validate_application(
 
     await db.commit()
     await db.refresh(application)
-    return application
+    return await svc.to_application_response(application)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -596,4 +599,4 @@ async def verify_credentials(
 
     await db.commit()
     await db.refresh(application)
-    return application
+    return await svc.to_application_response(application)
