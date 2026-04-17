@@ -23,11 +23,12 @@ from app.modules.undergraduate.ranking.schemas import (
     RankingRunResponse,
     RankingSummaryResponse,
     StreamCutoffResponse,
+    StreamQuotaCreate,
     StreamQuotaResponse,
     StreamQuotaUpdate,
 )
 from app.modules.testing_center.models import UATRecord
-from app.modules.undergraduate.models import UndergraduateApplication
+from app.modules.undergraduate.models import UndergraduateAdmissionTerm, UndergraduateApplication
 from app.modules.undergraduate.service import ApplicationService
 from app.shared.enums import ApplicationStatus, StreamType, UserRole
 
@@ -40,6 +41,7 @@ router = APIRouter(prefix="/undergraduate/ranking", tags=["Undergraduate Eligibi
 
 @router.post("/run", response_model=RankingRunResponse)
 async def run_ranking(
+    admission_term_id: uuid.UUID = Query(..., description="Admission term ID to run ranking for"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -60,6 +62,7 @@ async def run_ranking(
     app_result = await db.execute(
         select(UndergraduateApplication).where(
             UndergraduateApplication.current_status == ApplicationStatus.UAT_COMPLETED,
+            UndergraduateApplication.admission_term_id == admission_term_id,
             UndergraduateApplication.is_deleted == False,  # noqa: E712
         )
     )
@@ -103,7 +106,10 @@ async def run_ranking(
 
     # ── 5. Fetch stream quotas ──
     quota_result = await db.execute(
-        select(StreamQuota).where(StreamQuota.is_deleted == False)  # noqa: E712
+        select(StreamQuota).where(
+            StreamQuota.is_deleted == False,  # noqa: E712
+            StreamQuota.admission_term_id == admission_term_id,
+        )
     )
     quotas = quota_result.scalars().all()
     stream_quotas = {q.stream.value: q.max_capacity for q in quotas}
@@ -371,19 +377,62 @@ async def get_ranking_summary(
 
 @router.get("/stream-quotas", response_model=list[StreamQuotaResponse])
 async def list_stream_quotas(
+    admission_term_id: uuid.UUID = Query(..., description="Admission term ID"),
     db: AsyncSession = Depends(get_db),
 ):
     """List all stream quotas."""
     result = await db.execute(
         select(StreamQuota).where(StreamQuota.is_deleted == False)  # noqa: E712
+        .where(StreamQuota.admission_term_id == admission_term_id)
     )
     return result.scalars().all()
+
+
+@router.post("/stream-quotas", response_model=StreamQuotaResponse, status_code=201)
+async def create_stream_quota(
+    data: StreamQuotaCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a stream quota for a specific admission term (admin only)."""
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(403, "Only officers or admins can create quotas")
+
+    term = (await db.execute(
+        select(UndergraduateAdmissionTerm).where(
+            UndergraduateAdmissionTerm.id == data.admission_term_id,
+            UndergraduateAdmissionTerm.is_deleted == False,  # noqa: E712
+        )
+    )).scalar_one_or_none()
+    if term is None:
+        raise HTTPException(404, "Admission term not found")
+
+    existing = (await db.execute(
+        select(StreamQuota).where(
+            StreamQuota.stream == data.stream,
+            StreamQuota.admission_term_id == data.admission_term_id,
+            StreamQuota.is_deleted == False,  # noqa: E712
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(409, f"Quota already exists for {data.stream.value} in this admission term")
+
+    quota = StreamQuota(
+        stream=data.stream,
+        max_capacity=data.max_capacity,
+        admission_term_id=data.admission_term_id,
+    )
+    db.add(quota)
+    await db.commit()
+    await db.refresh(quota)
+    return quota
 
 
 @router.put("/stream-quotas/{stream}", response_model=StreamQuotaResponse)
 async def update_stream_quota(
     stream: StreamType,
     data: StreamQuotaUpdate,
+    admission_term_id: uuid.UUID = Query(..., description="Admission term ID"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -394,12 +443,13 @@ async def update_stream_quota(
     result = await db.execute(
         select(StreamQuota).where(
             StreamQuota.stream == stream,
+            StreamQuota.admission_term_id == admission_term_id,
             StreamQuota.is_deleted == False,  # noqa: E712
         )
     )
     quota = result.scalar_one_or_none()
     if quota is None:
-        raise HTTPException(404, f"No quota configured for stream: {stream.value}")
+        raise HTTPException(404, f"No quota configured for stream: {stream.value} in this admission term")
 
     quota.max_capacity = data.max_capacity
     await db.commit()

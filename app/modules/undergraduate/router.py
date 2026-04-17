@@ -22,6 +22,8 @@ from app.modules.undergraduate.exceptions import (
 )
 from app.modules.undergraduate.schemas import (
     AIEvaluationResponse,
+    AdmissionTermCreate,
+    AdmissionTermResponse,
     ApplicationCreate,
     ApplicationListResponse,
     ApplicationResponse,
@@ -39,6 +41,28 @@ from app.modules.undergraduate.service import ApplicationService, DecisionServic
 from app.shared.enums import ApplicationStatus, UserRole
 
 router = APIRouter(prefix="/undergraduate", tags=["Undergraduate Admission"])
+
+
+@router.post("/admission-terms", response_model=AdmissionTermResponse, status_code=201)
+async def create_admission_term(
+    data: AdmissionTermCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create an undergraduate admission term."""
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(403, "Only registrar officers or admins can create admission terms")
+    svc = ApplicationService(db)
+    return await svc.create_admission_term(data)
+
+
+@router.get("/admission-terms/open", response_model=list[AdmissionTermResponse])
+async def list_open_admission_terms(
+    db: AsyncSession = Depends(get_db),
+):
+    """List all currently open undergraduate admission terms."""
+    svc = ApplicationService(db)
+    return await svc.list_open_admission_terms()
 
 
 # ── Exception → HTTP mapping ─────────────────────────────────

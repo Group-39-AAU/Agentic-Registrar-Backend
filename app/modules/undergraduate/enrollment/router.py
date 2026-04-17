@@ -130,7 +130,7 @@ async def run_enrollment(
             application_id=app.id,
             applicant_id=app.applicant_id,
             admission_number=app.admission_number,
-            admission_term=app.admission_term,
+            admission_term=app.admission_term.term_name if app.admission_term else "Unknown",
             sponsorship_type=app.sponsorship_type.value,
             stream=app.stream.value,
             assigned_program_id=rr.assigned_program_id if rr else None,

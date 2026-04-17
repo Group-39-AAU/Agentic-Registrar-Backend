@@ -5,7 +5,7 @@ Schemas are grouped by entity and by direction (Create / Update / Response).
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -33,7 +33,7 @@ class ApplicationCreate(BaseModel):
     sponsorship_type: SponsorshipType
     stream: StreamType
     admission_number: str = Field(..., min_length=1, max_length=50, examples=["2955397"])
-    admission_term: str = Field(..., min_length=1, max_length=50, examples=["Fall 2026"])
+    admission_term_id: uuid.UUID
 
     # Self-sponsored only
     program_choice_1_id: Optional[uuid.UUID] = None
@@ -75,6 +75,10 @@ class ProgramChoiceSummary(BaseModel):
 
 
 class ApplicationResponse(BaseModel):
+    class AdmissionTermSummary(BaseModel):
+        id: uuid.UUID
+        term_name: str
+
     """
     Response: full application details for all undergraduate application endpoints.
 
@@ -93,7 +97,7 @@ class ApplicationResponse(BaseModel):
     program_choice_1: Optional[ProgramChoiceSummary] = None
     program_choice_2: Optional[ProgramChoiceSummary] = None
     program_choice_3: Optional[ProgramChoiceSummary] = None
-    admission_term: str
+    admission_term: AdmissionTermSummary
     current_status: ApplicationStatus
     final_decision: Optional[str] = None
     payment_status: PaymentStatus
@@ -110,6 +114,25 @@ class ApplicationListResponse(BaseModel):
     """Response: paginated list of applications."""
     items: list[ApplicationResponse]
     total: int
+
+
+class AdmissionTermCreate(BaseModel):
+    term_name: str = Field(..., min_length=1, max_length=100)
+    start_date: date
+    end_date: date
+    is_open: bool = True
+    description: Optional[str] = None
+
+
+class AdmissionTermResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    term_name: str
+    start_date: date
+    end_date: date
+    is_open: bool
+    description: Optional[str] = None
 
 
 # ══════════════════════════════════════════════════════════════

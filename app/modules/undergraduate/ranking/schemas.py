@@ -84,11 +84,18 @@ class StreamQuotaResponse(BaseModel):
     id: uuid.UUID
     stream: StreamType
     max_capacity: int
-    admission_term: str
+    admission_term_id: uuid.UUID
 
 class StreamQuotaUpdate(BaseModel):
     """Request to update stream quota."""
     max_capacity: int
+
+
+class StreamQuotaCreate(BaseModel):
+    """Request to create a stream quota for a specific admission term."""
+    stream: StreamType
+    max_capacity: int
+    admission_term_id: uuid.UUID
 
 
 # ── Officer Review ──

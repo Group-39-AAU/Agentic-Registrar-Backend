@@ -37,6 +37,7 @@ from app.modules.programs.models import AcademicProgram
 from app.modules.testing_center.models import UATRecord
 from app.modules.undergraduate.models import (
     ApplicationStatusHistory,
+    UndergraduateAdmissionTerm,
     UndergraduateApplication,
 )
 from app.shared.enums import (
@@ -159,6 +160,18 @@ async def seed_ranking_test():
             await engine.dispose()
             return
 
+        # ── Fetch an open admission term ──
+        term = (await session.execute(
+            select(UndergraduateAdmissionTerm).where(
+                UndergraduateAdmissionTerm.is_open == True,  # noqa: E712
+                UndergraduateAdmissionTerm.is_deleted == False,  # noqa: E712
+            ).order_by(UndergraduateAdmissionTerm.start_date.asc())
+        )).scalars().first()
+        if term is None:
+            print("❌ No open undergraduate admission term found! Run `python scripts/seed.py` first.")
+            await engine.dispose()
+            return
+
         # ── Create users, MoE records, applications, UAT records ──
         users = []
         moe_records = []
@@ -212,7 +225,7 @@ async def seed_ranking_test():
                 program_choice_1_id=p1_id,
                 program_choice_2_id=p2_id,
                 program_choice_3_id=p3_id,
-                admission_term="Fall 2026",
+                admission_term_id=term.id,
                 current_status=ApplicationStatus.UAT_COMPLETED,
                 payment_status=PaymentStatus.COMPLETED,
             ))

@@ -9,7 +9,7 @@ Contains:
 import uuid
 from typing import Optional
 
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,9 +24,15 @@ class StreamQuota(SoftDeleteBase):
     """
     __tablename__ = "stream_quotas"
 
-    stream: Mapped[StreamType] = mapped_column(unique=True, nullable=False, index=True)
+    stream: Mapped[StreamType] = mapped_column(nullable=False, index=True)
     max_capacity: Mapped[int] = mapped_column(Integer, nullable=False)
-    admission_term: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    admission_term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("undergraduate_admission_terms.id"), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("stream", "admission_term_id", name="uq_stream_quotas_stream_term"),
+    )
 
 
 class RankingResult(Base):

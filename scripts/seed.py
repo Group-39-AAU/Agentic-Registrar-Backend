@@ -14,6 +14,7 @@ Seeds:
 
 import asyncio
 import uuid
+from datetime import date
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -24,6 +25,7 @@ from app.core.config import settings
 from app.modules.programs.models import AcademicProgram
 from app.modules.moe.models import MoeStudentRecord
 from app.modules.undergraduate.ranking.models import StreamQuota
+from app.modules.undergraduate.models import UndergraduateAdmissionTerm
 from app.modules.auth.models import User
 from app.core.security import hash_password
 from app.shared.enums import StreamType, UserRole
@@ -91,8 +93,8 @@ MOE_RECORDS = [
 # ══════════════════════════════════════════════════════════════
 
 STREAM_QUOTAS = [
-    {"stream": StreamType.NATURAL, "max_capacity": 2500, "admission_term": "Fall 2026"},
-    {"stream": StreamType.SOCIAL, "max_capacity": 2500, "admission_term": "Fall 2026"},
+    {"stream": StreamType.NATURAL, "max_capacity": 2500},
+    {"stream": StreamType.SOCIAL, "max_capacity": 2500},
 ]
 
 
@@ -105,6 +107,24 @@ async def seed():
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_session() as session:
+        # ── Seed Admission Terms ──
+        existing_terms = (await session.execute(select(UndergraduateAdmissionTerm))).scalars().all()
+        if existing_terms:
+            active_term = existing_terms[0]
+            print(f"⚠️  {len(existing_terms)} admission terms already exist — skipping term seeding.")
+        else:
+            active_term = UndergraduateAdmissionTerm(
+                id=uuid.uuid4(),
+                term_name="Fall 2026",
+                start_date=date(2026, 9, 1),
+                end_date=date(2027, 1, 31),
+                is_open=True,
+                description="Primary intake for 2026/27",
+            )
+            session.add(active_term)
+            await session.commit()
+            print("✅ Seeded undergraduate admission term: Fall 2026.")
+
         # ── Seed Programs ──
         existing = (await session.execute(select(AcademicProgram))).scalars().all()
         if existing:
@@ -131,7 +151,14 @@ async def seed():
             print(f"⚠️  {len(existing_quotas)} stream quotas already exist — skipping quota seeding.")
         else:
             for q in STREAM_QUOTAS:
-                session.add(StreamQuota(id=uuid.uuid4(), **q))
+                session.add(
+                    StreamQuota(
+                        id=uuid.uuid4(),
+                        stream=q["stream"],
+                        max_capacity=q["max_capacity"],
+                        admission_term_id=active_term.id,
+                    )
+                )
             await session.commit()
             print(f"✅ Seeded {len(STREAM_QUOTAS)} stream quotas.")
 

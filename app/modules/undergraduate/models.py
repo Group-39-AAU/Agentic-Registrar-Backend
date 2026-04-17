@@ -9,10 +9,11 @@ Contains:
 """
 
 import uuid
+from datetime import date
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean, Float, ForeignKey, String, Text, UniqueConstraint,
+    Boolean, Date, Float, ForeignKey, String, Text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -25,6 +26,17 @@ from app.shared.enums import (
 
 
 # ── Core Aggregate ────────────────────────────────────────────
+
+
+class UndergraduateAdmissionTerm(SoftDeleteBase):
+    """Configurable undergraduate admission intake term."""
+    __tablename__ = "undergraduate_admission_terms"
+
+    term_name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    is_open: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class UndergraduateApplication(SoftDeleteBase):
@@ -55,8 +67,8 @@ class UndergraduateApplication(SoftDeleteBase):
         UUID(as_uuid=True), ForeignKey("academic_programs.id"), nullable=True
     )
 
-    admission_term: Mapped[str] = mapped_column(
-        String(50), index=True, nullable=False
+    admission_term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("undergraduate_admission_terms.id"), index=True, nullable=False
     )
     current_status: Mapped[ApplicationStatus] = mapped_column(
         nullable=False, default=ApplicationStatus.DRAFT, index=True
@@ -90,11 +102,12 @@ class UndergraduateApplication(SoftDeleteBase):
     decision: Mapped[Optional["RegistrarDecision"]] = relationship(
         back_populates="application", lazy="selectin", uselist=False
     )
+    admission_term: Mapped["UndergraduateAdmissionTerm"] = relationship(lazy="selectin")
 
     # ── Constraints ──
     __table_args__ = (
         UniqueConstraint(
-            "applicant_id", "admission_term",
+            "applicant_id", "admission_term_id",
             name="uq_one_app_per_term",
         ),
     )

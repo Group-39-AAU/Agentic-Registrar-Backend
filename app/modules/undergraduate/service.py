@@ -27,6 +27,7 @@ from app.modules.undergraduate.exceptions import (
 )
 from app.modules.undergraduate.models import (
     ApplicationDocument,
+    UndergraduateAdmissionTerm,
     ApplicationStatusHistory,
     RegistrarDecision,
     UndergraduateApplication,
@@ -40,6 +41,8 @@ from app.modules.undergraduate.repository import (
 )
 from app.modules.undergraduate.schemas import (
     ApplicationCreate,
+    AdmissionTermCreate,
+    AdmissionTermResponse,
     ApplicationResponse,
     ApplicationStatusUpdate,
     DecisionCreate,
@@ -116,7 +119,7 @@ class ApplicationService:
             program_choice_1_id=data.program_choice_1_id,
             program_choice_2_id=data.program_choice_2_id,
             program_choice_3_id=data.program_choice_3_id,
-            admission_term=data.admission_term,
+            admission_term_id=data.admission_term_id,
             current_status=ApplicationStatus.DRAFT,
             extra_data=data.extra_data,
         )
@@ -126,13 +129,14 @@ class ApplicationService:
             application.payment_status = PaymentStatus.COMPLETED
             application.payment_reference = "GOV_SPONSORED_NO_PAYMENT"
 
+        await self._ensure_open_admission_term(data.admission_term_id)
         self._app_repo.add(application)
 
         try:
             await self._db.flush()  # get the ID, check unique constraint
         except IntegrityError as e:
             await self._db.rollback()
-            if "uq_one_app_per_term" in str(e.orig):
+            if self._is_duplicate_term_application_error(e):
                 raise DuplicateApplicationError(
                     "You already have an application for this admission term"
                 )
@@ -299,6 +303,15 @@ class ApplicationService:
             return []
 
         app_ids = [a.id for a in applications]
+        term_ids = {a.admission_term_id for a in applications}
+
+        term_result = await self._db.execute(
+            select(UndergraduateAdmissionTerm).where(
+                UndergraduateAdmissionTerm.id.in_(term_ids),
+                UndergraduateAdmissionTerm.is_deleted == False,  # noqa: E712
+            )
+        )
+        term_map = {t.id: t for t in term_result.scalars().all()}
 
         uat_result = await self._db.execute(
             select(UATRecord).where(UATRecord.application_id.in_(app_ids))
@@ -343,6 +356,7 @@ class ApplicationService:
 
         out: list[ApplicationResponse] = []
         for a in applications:
+            term = term_map.get(a.admission_term_id)
             if a.sponsorship_type == SponsorshipType.SELF_SPONSORED:
                 p1 = choice_summary(a.program_choice_1_id)
                 p2 = choice_summary(a.program_choice_2_id)
@@ -360,7 +374,10 @@ class ApplicationService:
                     program_choice_1=p1,
                     program_choice_2=p2,
                     program_choice_3=p3,
-                    admission_term=a.admission_term,
+                    admission_term=ApplicationResponse.AdmissionTermSummary(
+                        id=a.admission_term_id,
+                        term_name=term.term_name if term else "Unknown",
+                    ),
                     current_status=a.current_status,
                     final_decision=a.final_decision,
                     payment_status=a.payment_status,
@@ -374,6 +391,47 @@ class ApplicationService:
                 )
             )
         return out
+
+    async def create_admission_term(self, data: AdmissionTermCreate) -> UndergraduateAdmissionTerm:
+        term = UndergraduateAdmissionTerm(
+            term_name=data.term_name,
+            start_date=data.start_date,
+            end_date=data.end_date,
+            is_open=data.is_open,
+            description=data.description,
+        )
+        self._db.add(term)
+        await self._db.commit()
+        await self._db.refresh(term)
+        return term
+
+    async def list_open_admission_terms(self) -> list[AdmissionTermResponse]:
+        result = await self._db.execute(
+            select(UndergraduateAdmissionTerm).where(
+                UndergraduateAdmissionTerm.is_deleted == False,  # noqa: E712
+                UndergraduateAdmissionTerm.is_open == True,  # noqa: E712
+            ).order_by(UndergraduateAdmissionTerm.start_date.asc())
+        )
+        return [AdmissionTermResponse.model_validate(t) for t in result.scalars().all()]
+
+    async def _ensure_open_admission_term(self, term_id: uuid.UUID) -> None:
+        result = await self._db.execute(
+            select(UndergraduateAdmissionTerm).where(
+                UndergraduateAdmissionTerm.id == term_id,
+                UndergraduateAdmissionTerm.is_deleted == False,  # noqa: E712
+                UndergraduateAdmissionTerm.is_open == True,  # noqa: E712
+            )
+        )
+        if result.scalar_one_or_none() is None:
+            raise MissingPrerequisiteError("Selected admission term is not open or does not exist")
+
+    @staticmethod
+    def _is_duplicate_term_application_error(error: IntegrityError) -> bool:
+        err_text = f"{error}\n{getattr(error, 'orig', '')}"
+        return (
+            "uq_one_app_per_term" in err_text
+            or "undergraduate_applications_applicant_id_admission_term_id_key" in err_text
+        )
 
     async def get_review_queue(
         self, *, limit: int = 50, offset: int = 0

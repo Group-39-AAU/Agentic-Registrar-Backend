@@ -19,10 +19,12 @@ class InvalidStateTransitionError(Exception):
 class DuplicateApplicationError(Exception):
     """Raised when a student applies to the same program/term twice."""
 
-    def __init__(self) -> None:
-        super().__init__(
-            "An application for this program and term already exists"
-        )
+    def __init__(
+        self,
+        detail: str = "An application for this program and term already exists",
+    ) -> None:
+        self.detail = detail
+        super().__init__(detail)
 
 
 class MissingPrerequisiteError(Exception):

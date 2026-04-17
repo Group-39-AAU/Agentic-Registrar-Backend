@@ -14,6 +14,7 @@ from app.modules.auth.models import User                          # noqa: F401
 from app.modules.programs.models import AcademicProgram           # noqa: F401
 from app.shared.audit.models import SystemAuditLog                # noqa: F401
 from app.modules.undergraduate.models import (                    # noqa: F401
+    UndergraduateAdmissionTerm,
     UndergraduateApplication, ApplicationDocument,
     ApplicationStatusHistory, RegistrarDecision,
 )
