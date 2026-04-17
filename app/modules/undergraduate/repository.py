@@ -64,6 +64,21 @@ class ApplicationRepository:
         result = await self._db.execute(stmt)
         return result.scalars().all()
 
+    async def exists_for_applicant_and_term(
+        self, applicant_id: uuid.UUID, admission_term_id: uuid.UUID
+    ) -> bool:
+        stmt = (
+            select(UndergraduateApplication.id)
+            .where(
+                UndergraduateApplication.applicant_id == applicant_id,
+                UndergraduateApplication.admission_term_id == admission_term_id,
+                UndergraduateApplication.is_deleted == False,  # noqa: E712
+            )
+            .limit(1)
+        )
+        result = await self._db.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
     async def get_pending_review_queue(
         self, *, limit: int = 50, offset: int = 0
     ) -> Sequence[UndergraduateApplication]:

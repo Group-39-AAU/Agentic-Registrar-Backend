@@ -116,6 +116,12 @@ class ApplicationListResponse(BaseModel):
     total: int
 
 
+class ApplicationExistsResponse(BaseModel):
+    """Response: whether the applicant already has an application for a term."""
+    admission_term_id: uuid.UUID
+    has_existing_application: bool
+
+
 class AdmissionTermCreate(BaseModel):
     term_name: str = Field(..., min_length=1, max_length=100)
     start_date: date

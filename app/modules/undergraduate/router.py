@@ -25,6 +25,7 @@ from app.modules.undergraduate.schemas import (
     AdmissionTermCreate,
     AdmissionTermResponse,
     ApplicationCreate,
+    ApplicationExistsResponse,
     ApplicationListResponse,
     ApplicationResponse,
     ApplicationStatusUpdate,
@@ -123,6 +124,24 @@ async def list_my_applications(
     """List the current student's applications."""
     svc = ApplicationService(db)
     return await svc.list_my_applications(current_user.id)
+
+
+@router.get("/applications/me/exists", response_model=ApplicationExistsResponse)
+async def check_my_application_exists(
+    admission_term_id: uuid.UUID = Query(..., description="Admission term ID to check"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check whether the current applicant already has an application for an admission term."""
+    svc = ApplicationService(db)
+    exists = await svc.has_application_for_term(
+        applicant_id=current_user.id,
+        admission_term_id=admission_term_id,
+    )
+    return ApplicationExistsResponse(
+        admission_term_id=admission_term_id,
+        has_existing_application=exists,
+    )
 
 
 @router.get("/applications/review-queue", response_model=list[ApplicationResponse])

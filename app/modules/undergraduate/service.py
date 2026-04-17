@@ -295,6 +295,14 @@ class ApplicationService:
         items = await self._app_repo.get_applications_for_applicant(applicant_id)
         return await self._build_application_responses(items)
 
+    async def has_application_for_term(
+        self, applicant_id: uuid.UUID, admission_term_id: uuid.UUID
+    ) -> bool:
+        return await self._app_repo.exists_for_applicant_and_term(
+            applicant_id=applicant_id,
+            admission_term_id=admission_term_id,
+        )
+
     async def _build_application_responses(
         self, applications: Sequence[UndergraduateApplication]
     ) -> list[ApplicationResponse]:
