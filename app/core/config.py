@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"  # development | testing | production
     API_V1_PREFIX: str = "/api/v1"
 
+    # Public base URL for links in emails (scheme + host, no trailing slash).
+    # Example: https://api.university.edu or http://localhost:8000
+    PUBLIC_APP_BASE_URL: str = "http://localhost:8000"
+
     # ── Database ─────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/registrar_db"
 
