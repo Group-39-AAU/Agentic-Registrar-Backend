@@ -6,15 +6,19 @@ validates it, and returns the authenticated User object.
 """
 
 import uuid
+from functools import lru_cache
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.security import decode_access_token
 from app.database.session import get_db
 from app.modules.auth.models import User
+from app.shared.email.providers.brevo_provider import BrevoProvider
+from app.shared.email.service import EmailService
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -57,3 +61,21 @@ async def get_current_user(
         raise credentials_exception
 
     return user
+
+
+@lru_cache
+def _build_email_service() -> EmailService:
+    provider = None
+    if settings.BREVO_API_KEY and settings.EMAIL_FROM:
+        provider = BrevoProvider(
+            api_key=settings.BREVO_API_KEY,
+            from_email=settings.EMAIL_FROM,
+            from_name=settings.EMAIL_FROM_NAME,
+            timeout_seconds=settings.EMAIL_TIMEOUT_SECONDS,
+        )
+    return EmailService(provider=provider, enabled=settings.EMAIL_ENABLED)
+
+
+def get_email_service() -> EmailService:
+    """Dependency provider for shared email service singleton."""
+    return _build_email_service()

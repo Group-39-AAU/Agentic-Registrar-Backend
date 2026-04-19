@@ -8,11 +8,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_email_service
 from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.auth.schemas import RegisterRequest, TokenResponse, UserResponse
 from app.modules.auth.service import AuthService
+from app.shared.email import EmailService
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -21,9 +22,10 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 async def register(
     data: RegisterRequest,
     db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
 ):
     """Create a new student account."""
-    svc = AuthService(db)
+    svc = AuthService(db, email_service=email_service)
     try:
         user = await svc.register(data)
     except ValueError as e:

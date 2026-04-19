@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # ── Logging ──────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
+    # ── Email (Brevo) ────────────────────────────────────
+    EMAIL_ENABLED: bool = True
+    BREVO_API_KEY: str = ""
+    EMAIL_FROM: str = ""
+    EMAIL_FROM_NAME: str = "Agentic Registrar"
+    EMAIL_TIMEOUT_SECONDS: int = 15
+
 
 @lru_cache
 def get_settings() -> Settings:

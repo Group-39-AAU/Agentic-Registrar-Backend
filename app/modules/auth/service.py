@@ -12,6 +12,7 @@ from app.core.logging import get_logger
 from app.core.security import create_access_token, hash_password, verify_password
 from app.modules.auth.models import User
 from app.modules.auth.schemas import RegisterRequest
+from app.shared.email import EmailService, build_welcome_email
 from app.shared.enums import UserRole
 
 logger = get_logger("auth.service")
@@ -20,8 +21,9 @@ logger = get_logger("auth.service")
 class AuthService:
     """Handles registration and authentication."""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, email_service: EmailService | None = None) -> None:
         self._db = db
+        self._email_service = email_service
 
     async def register(self, data: RegisterRequest) -> User:
         """
@@ -47,6 +49,16 @@ class AuthService:
         await self._db.commit()
         await self._db.refresh(user)
         logger.info("Registered new student: %s", user.email)
+
+        if self._email_service is not None:
+            try:
+                await self._email_service.send(
+                    build_welcome_email(to_email=user.email, first_name=user.first_name)
+                )
+            except Exception:
+                # Registration should still succeed even if email delivery fails.
+                logger.exception("Welcome email delivery failed for %s", user.email)
+
         return user
 
     async def authenticate(self, email: str, password: str) -> str:
