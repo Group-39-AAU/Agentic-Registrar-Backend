@@ -10,7 +10,10 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import get_current_user
+from app.core.config import settings
+from app.core.dependencies import get_current_user, get_email_service
+from app.core.logging import get_logger
+from app.core.logging import get_logger
 from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.undergraduate.exceptions import (
@@ -39,9 +42,12 @@ from app.modules.undergraduate.schemas import (
     StatusHistoryResponse,
 )
 from app.modules.undergraduate.service import ApplicationService, DecisionService
+from app.shared.email import EmailService, build_uat_acceptance_email
 from app.shared.enums import ApplicationStatus, UserRole
 
 router = APIRouter(prefix="/undergraduate", tags=["Undergraduate Admission"])
+
+logger = get_logger("undergraduate.router")
 
 
 @router.post("/admission-terms", response_model=AdmissionTermResponse, status_code=201)
@@ -472,6 +478,7 @@ async def verify_credentials(
     application_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
 ):
     """
     Verify academic credentials by looking up the student's admission number
@@ -636,6 +643,30 @@ async def verify_credentials(
                 student_name=student_name,
             )
             db.add(uat_record)
+
+            base = settings.PUBLIC_APP_BASE_URL.rstrip("/")
+            prefix = settings.API_V1_PREFIX
+            if not prefix.startswith("/"):
+                prefix = "/" + prefix
+            take_test_session_url = (
+                f"{base}{prefix}/testing-center/uat-session/{uat_id}"
+            )
+
+            try:
+                await email_service.send(
+                    build_uat_acceptance_email(
+                        to_email=applicant.email,
+                        first_name=applicant.first_name,
+                        uat_id=uat_id,
+                        take_test_session_url=take_test_session_url,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "UAT acceptance email failed application_id=%s uat_id=%s",
+                    application.id,
+                    uat_id,
+                )
 
     except InvalidStateTransitionError as e:
         _handle_domain_error(e)
