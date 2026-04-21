@@ -10,6 +10,8 @@ Services own all business logic:
 """
 
 import uuid
+from datetime import datetime
+import random
 from typing import Optional, Sequence
 
 from sqlalchemy import select
@@ -17,7 +19,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger, write_audit_log
+from app.core.config import settings
+from app.ai.models import AIEvaluation, AIExecutionTrace
+from app.modules.auth.models import User as UserModel
+from app.modules.moe.models import MoeStudentRecord
 from app.modules.programs.models import AcademicProgram
+from app.modules.undergraduate.agents.credential_lookup_agent import (
+    AGENT_VERSION as CREDENTIAL_AGENT_VERSION,
+    run_credential_lookup,
+)
+from app.modules.undergraduate.agents.intake_agent import (
+    AGENT_VERSION as INTAKE_AGENT_VERSION,
+    run_intake_validation,
+)
 from app.modules.undergraduate.exceptions import (
     DuplicateApplicationError,
     EntityNotFoundError,
@@ -51,6 +65,7 @@ from app.modules.undergraduate.schemas import (
     ProgramChoiceSummary,
 )
 from app.modules.testing_center.models import UATRecord
+from app.shared.email import EmailService, build_uat_acceptance_email
 from app.shared.audit.models import SystemAuditLog
 from app.shared.enums import (
     ApplicationStatus,
@@ -204,7 +219,10 @@ class ApplicationService:
         return application
 
     async def complete_payment(
-        self, application_id: uuid.UUID, payment_reference: str
+        self,
+        application_id: uuid.UUID,
+        payment_reference: str,
+        email_service: Optional[EmailService] = None,
     ) -> UndergraduateApplication:
         """
         Simulated payment callback — marks payment as complete and
@@ -230,6 +248,12 @@ class ApplicationService:
             actor_id=application.applicant_id,
             actor_role=UserRole.SYSTEM,
             trigger_reason="Payment completed successfully",
+        )
+
+        # Run AI agents sequentially once payment has been verified.
+        await self._run_post_payment_agents(
+            application=application,
+            email_service=email_service,
         )
 
         await self._db.commit()
@@ -516,6 +540,198 @@ class ApplicationService:
         self, application_id: uuid.UUID
     ) -> Sequence[ApplicationStatusHistory]:
         return await self._history_repo.get_history_for_application(application_id)
+
+    async def _run_post_payment_agents(
+        self,
+        application: UndergraduateApplication,
+        email_service: Optional[EmailService],
+    ) -> None:
+        """Run the automated AI pipeline after payment verification."""
+        await self._run_intake_validation_agent(application)
+
+        # Intake may leave status unchanged when checks fail.
+        if application.current_status != ApplicationStatus.UNDER_VERIFICATION:
+            return
+
+        await self._run_credential_verification_agent(
+            application=application,
+            email_service=email_service,
+        )
+
+    async def _run_intake_validation_agent(
+        self,
+        application: UndergraduateApplication,
+    ) -> None:
+        """Execute intake validation and persist AI reasoning + status effects."""
+        result = await run_intake_validation(
+            application_id=application.id,
+            sponsorship_type=application.sponsorship_type.value,
+            stream=application.stream.value,
+            admission_number=application.admission_number,
+            program_choice_1_id=application.program_choice_1_id,
+            program_choice_2_id=application.program_choice_2_id,
+            program_choice_3_id=application.program_choice_3_id,
+            payment_status=application.payment_status.value,
+            current_status=application.current_status.value,
+        )
+
+        if isinstance(result, dict):
+            overall_result = result.get("overall_result", "FLAG_FOR_REVIEW")
+            checks_passed = result.get("checks_passed", [])
+            checks_failed = result.get("checks_failed", [])
+            traces_list = result.get("traces", [])
+        else:
+            overall_result = getattr(result, "overall_result", "FLAG_FOR_REVIEW")
+            checks_passed = getattr(result, "checks_passed", [])
+            checks_failed = getattr(result, "checks_failed", [])
+            traces_list = getattr(result, "traces", [])
+
+        if overall_result == "PASS":
+            recommended = DecisionType.RECOMMEND_ADMIT
+            confidence = 1.0
+        else:
+            recommended = DecisionType.FLAG_FOR_REVIEW
+            confidence = 0.0
+
+        evaluation = AIEvaluation(
+            application_id=application.id,
+            agent_version=INTAKE_AGENT_VERSION,
+            recommended_decision=recommended,
+            confidence_score=confidence,
+            is_overridden=False,
+            summary_reasoning=(
+                f"Intake validation: {overall_result}. "
+                f"Passed: {checks_passed}. Failed: {checks_failed}."
+            ),
+        )
+        self._db.add(evaluation)
+        await self._db.flush()
+
+        for trace in traces_list:
+            trace_entry = AIExecutionTrace(
+                evaluation_id=evaluation.id,
+                step_name=trace["step_name"],
+                reasoning_log=trace["reasoning_log"],
+            )
+            self._db.add(trace_entry)
+
+        if overall_result == "PASS":
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.UNDER_VERIFICATION,
+                actor_id=application.applicant_id,
+                actor_role=UserRole.AGENT,
+                trigger_reason="Intake Agent: all completeness checks passed",
+            )
+
+    async def _run_credential_verification_agent(
+        self,
+        application: UndergraduateApplication,
+        email_service: Optional[EmailService],
+    ) -> None:
+        """Execute credential verification and persist AI reasoning + transitions."""
+        user_result = await self._db.execute(
+            select(UserModel).where(UserModel.id == application.applicant_id)
+        )
+        applicant = user_result.scalar_one_or_none()
+        if applicant is None:
+            raise EntityNotFoundError("User", str(application.applicant_id))
+
+        moe_result = await self._db.execute(
+            select(MoeStudentRecord).where(
+                MoeStudentRecord.admission_number == application.admission_number
+            )
+        )
+        moe_record = moe_result.scalar_one_or_none()
+
+        student_name = f"{applicant.first_name} {applicant.last_name}".strip().upper()
+        moe_full_name = moe_record.full_name.strip().upper() if moe_record else None
+
+        result = run_credential_lookup(
+            admission_number=application.admission_number,
+            student_name=student_name,
+            moe_full_name=moe_full_name,
+        )
+
+        evaluation = AIEvaluation(
+            application_id=application.id,
+            agent_version=CREDENTIAL_AGENT_VERSION,
+            recommended_decision=result.recommended,
+            confidence_score=result.confidence,
+            is_overridden=False,
+            summary_reasoning=result.summary,
+        )
+        self._db.add(evaluation)
+        await self._db.flush()
+
+        for trace in result.traces:
+            trace_entry = AIExecutionTrace(
+                evaluation_id=evaluation.id,
+                step_name=trace["step_name"],
+                reasoning_log=trace["reasoning_log"],
+            )
+            self._db.add(trace_entry)
+
+        if result.overall_result == "PASS":
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.AI_PRE_SCREENING,
+                actor_id=application.applicant_id,
+                actor_role=UserRole.AGENT,
+                trigger_reason=f"Credential Verification: PASS - {result.summary}",
+            )
+
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.UAT_PENDING,
+                actor_id=application.applicant_id,
+                actor_role=UserRole.SYSTEM,
+                trigger_reason="Credentials verified - UAT scheduling initiated",
+            )
+
+            year = datetime.now().year
+            random_digits = random.randint(100000, 999999)
+            uat_id = f"UAT-{year}-{random_digits}"
+
+            uat_record = UATRecord(
+                uat_id=uat_id,
+                application_id=application.id,
+                student_name=student_name,
+            )
+            self._db.add(uat_record)
+
+            if email_service is not None:
+                base = settings.PUBLIC_APP_BASE_URL.rstrip("/")
+                prefix = settings.API_V1_PREFIX
+                if not prefix.startswith("/"):
+                    prefix = "/" + prefix
+                take_test_session_url = (
+                    f"{base}{prefix}/testing-center/uat-session/{uat_id}"
+                )
+
+                try:
+                    await email_service.send(
+                        build_uat_acceptance_email(
+                            to_email=applicant.email,
+                            first_name=applicant.first_name,
+                            uat_id=uat_id,
+                            take_test_session_url=take_test_session_url,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "UAT acceptance email failed application_id=%s uat_id=%s",
+                        application.id,
+                        uat_id,
+                    )
+        else:
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.FLAGGED_FOR_REVIEW,
+                actor_id=application.applicant_id,
+                actor_role=UserRole.AGENT,
+                trigger_reason=f"Credential Verification: FLAGGED - {result.summary}",
+            )
 
     # ── Trilogy of Persistence (private) ──────────────────────
 
