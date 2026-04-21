@@ -16,6 +16,7 @@ undergraduate/
 │
 ├── agents/                  # AI agents (LangGraph pipelines)
 │   ├── intake_agent.py              # Application validation & eligibility check
+│   ├── credential_lookup_agent.py   # MoE admission-number + name verification
 │   ├── credential_verification_agent.py  # MoE record verification
 │   ├── ranking_agent.py             # Score calculation & seat allocation
 │   └── enrollment_agent.py          # ID generation & section assignment
@@ -58,15 +59,15 @@ Each transition is enforced by the state machine in `service.py` and logged in `
 ## AI Agents
 
 ### Intake Agent (`intake_agent.py`)
-**Trigger**: `POST /undergraduate/applications/{id}/validate`
+**Trigger**: Automatic after payment is verified
 **Pipeline**: `check_eligibility → validate_documents → decide`
 - Validates applicant eligibility against MoE records
 - Checks document completeness
 - Produces `AI_APPROVED` or `FLAGGED_FOR_REVIEW` decision
 
-### Credential Verification Agent (`credential_verification_agent.py`)
-**Trigger**: `POST /undergraduate/applications/{id}/verify-credentials`
-**Pipeline**: `extract → cross_reference → decide`
+### Credential Lookup Agent (`credential_lookup_agent.py`)
+**Trigger**: Automatic after Intake Agent passes
+**Pipeline**: `moe_lookup → name_cross_check → decide`
 - Cross-references students' data with MoE records
 - Flags discrepancies for human review
 
@@ -99,9 +100,7 @@ Each transition is enforced by the state machine in `service.py` and logged in `
 | `PATCH` | `/applications/{id}/status` | Officer/Admin | Manual status transition |
 | `GET` | `/applications/{id}/history` | Any | Get full status change history |
 | `POST` | `/applications/{id}/payment/initiate` | Applicant | Start payment flow |
-| `POST` | `/applications/{id}/payment/callback` | System | Payment confirmation callback |
-| `POST` | `/applications/{id}/validate` | Officer/Admin | Trigger Intake AI Agent |
-| `POST` | `/applications/{id}/verify-credentials` | Officer/Admin | Trigger Credential Verification Agent |
+| `POST` | `/applications/{id}/payment/callback` | System | Payment confirmation callback; auto-runs Intake and Credential agents |
 | `POST` | `/applications/{id}/decision` | Officer/Admin | Record a human decision |
 | `GET` | `/applications/{id}/decision` | Any | Get recorded decision |
 | `POST` | `/documents` | Applicant | Upload a document |
