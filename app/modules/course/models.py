@@ -189,3 +189,57 @@ class CourseOffering(SoftDeleteBase):
             name="ck_offering_section_count_positive",
         ),
     )
+
+
+class Section(SoftDeleteBase):
+    """
+    A concrete section under a :class:`CourseOffering` — assigned to
+    a specific room and weekly time slot, taught by a single
+    instructor, with its own seat capacity and running enrollment
+    count.
+
+    Time slots must fall within the standard university lecture hours
+    (08:30–17:30) per the SDS ``timeSlots`` invariant on the
+    AcademicScheduling Agent (Table 83). The format itself is stored
+    as free text (e.g. "MON 08:30-10:00, WED 08:30-10:00") so any
+    weekly recurrence rule the timetable agent picks fits.
+
+    The instructor FK is forward-declared as a string so this commit
+    compiles before the Instructor model lands in D2.
+    """
+
+    __tablename__ = "sections"
+
+    offering_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("course_offerings.id"),
+        nullable=False,
+        index=True,
+    )
+    section_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    room: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    time_slot: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    instructor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("instructors.id"),
+        nullable=True,
+        index=True,
+    )
+    capacity: Mapped[int] = mapped_column(Integer, nullable=False)
+    enrolled_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
+    offering: Mapped["CourseOffering"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "offering_id", "section_code",
+            name="uq_section_code_per_offering",
+        ),
+        CheckConstraint("capacity > 0", name="ck_section_capacity_positive"),
+        CheckConstraint(
+            "enrolled_count >= 0 AND enrolled_count <= capacity",
+            name="ck_section_enrolled_within_capacity",
+        ),
+    )
