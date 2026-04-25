@@ -117,3 +117,31 @@ class RiskStatus(str, Enum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
+
+
+class RegistrationStatus(str, Enum):
+    """
+    Per-student-per-term registration lifecycle.
+    Mirrors the state diagram in SDS Figure 39 verbatim, so every
+    state in the implemented state machine is traceable to the design.
+
+    Flow:
+        REGISTRATION_OPEN
+            -> ADVISOR_REVIEW           (student selects courses)
+            -> CHECKING_PREREQUISITES   (CurriculumComplianceAgent)
+            -> CHECKING_PAYMENT
+                -> VALIDATION_SUCCESS   (payment confirmed)
+                -> PAYMENT_HOLD         (payment missing)
+            -> REGISTERED               (CurriculumComplianceAgent finalises)
+            -> ADD_DROP_WINDOW          (late registration period)
+        CANCELLED is a terminal state reachable from any non-terminal state.
+    """
+    REGISTRATION_OPEN = "REGISTRATION_OPEN"
+    ADVISOR_REVIEW = "ADVISOR_REVIEW"
+    CHECKING_PREREQUISITES = "CHECKING_PREREQUISITES"
+    CHECKING_PAYMENT = "CHECKING_PAYMENT"
+    PAYMENT_HOLD = "PAYMENT_HOLD"
+    VALIDATION_SUCCESS = "VALIDATION_SUCCESS"
+    REGISTERED = "REGISTERED"
+    ADD_DROP_WINDOW = "ADD_DROP_WINDOW"
+    CANCELLED = "CANCELLED"
