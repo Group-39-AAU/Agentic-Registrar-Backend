@@ -291,3 +291,77 @@ class Student(SoftDeleteBase):
             name="ck_students_current_semester_range",
         ),
     )
+
+
+class Instructor(SoftDeleteBase):
+    """
+    Course-Management profile for a teaching staff member per SDS
+    Tables 58–59. References the generic ``users`` row 1-to-1 and
+    adds the staff identifier (``STAFF/XXXX/YY``) and owning
+    department.
+
+    The set of courses an instructor is assigned to teach in a given
+    term is recorded on :class:`InstructorAssignment`, not as a list
+    column on this row, so assignments can be inspected per-term and
+    audited independently.
+    """
+
+    __tablename__ = "instructors"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    instructor_id: Mapped[str] = mapped_column(
+        String(20), unique=True, nullable=False, index=True
+    )
+    department: Mapped[str] = mapped_column(
+        String(100), nullable=False, index=True
+    )
+
+
+class InstructorAssignment(Base):
+    """
+    Per-term assignment linking an :class:`Instructor` to a
+    :class:`Course`. Materialises the ``assignedCourses`` collection
+    from SDS Table 58 in a normalised way so the AcademicScheduling
+    Agent can reason about an instructor's load per term.
+
+    Append-only (inherits :class:`Base`) so de-assignments are
+    historically preserved rather than overwritten.
+    """
+
+    __tablename__ = "instructor_assignments"
+
+    instructor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("instructors.id"),
+        nullable=False,
+        index=True,
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("academic_terms.id"),
+        nullable=False,
+        index=True,
+    )
+
+    instructor: Mapped["Instructor"] = relationship(lazy="selectin")
+    course: Mapped["Course"] = relationship(lazy="selectin")
+    term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "instructor_id", "course_id", "term_id",
+            name="uq_instructor_course_term",
+        ),
+    )
