@@ -143,3 +143,49 @@ class CoursePrerequisite(Base):
             name="ck_course_prereq_not_self",
         ),
     )
+
+
+class CourseOffering(SoftDeleteBase):
+    """
+    A specific course offered in a specific academic term, with its
+    own seat capacity and number of sections. Sits between
+    :class:`Course` (term-independent) and :class:`Section` (concrete
+    timetable slot) so the catalog is reusable across terms.
+
+    Realises the SRS Course-FR-04 "Section & Schedule Generation"
+    use case — the Academic Scheduling Agent groups registered
+    students into the offering's sections honouring the recorded
+    capacity and section_count.
+    """
+
+    __tablename__ = "course_offerings"
+
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("academic_terms.id"),
+        nullable=False,
+        index=True,
+    )
+    capacity: Mapped[int] = mapped_column(Integer, nullable=False)
+    section_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    course: Mapped["Course"] = relationship(lazy="selectin")
+    term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "course_id", "term_id",
+            name="uq_course_offering_per_term",
+        ),
+        CheckConstraint("capacity > 0", name="ck_offering_capacity_positive"),
+        CheckConstraint(
+            "section_count > 0",
+            name="ck_offering_section_count_positive",
+        ),
+    )
