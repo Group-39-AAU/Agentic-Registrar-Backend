@@ -33,6 +33,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteBase
+from app.shared.enums import EnrollmentStatus, OfficerRole
 
 
 # ── Academic Calendar ────────────────────────────────────────────
@@ -241,5 +242,52 @@ class Section(SoftDeleteBase):
         CheckConstraint(
             "enrolled_count >= 0 AND enrolled_count <= capacity",
             name="ck_section_enrolled_within_capacity",
+        ),
+    )
+
+
+# ── People ───────────────────────────────────────────────────────
+
+
+class Student(SoftDeleteBase):
+    """
+    Course-Management profile for an admitted student. References the
+    generic ``users`` row created during admission and adds the
+    academic attributes from SDS Table 56:
+
+        - ``student_id``      : AAU format ``UGR/XXXX/YY``
+        - ``full_name``       : denormalised for display
+        - ``current_semester``: integer in [1, 12]
+        - ``enrollment_status``: ACTIVE / DISMISSED / WITHDRAWN /
+                                 GRADUATED — distinct from per-term
+                                 :class:`AcademicStatusType`
+
+    ``academicHistory`` from the SDS is intentionally a *derived* view
+    (read from grade rows + status history) and is not persisted on
+    this entity.
+    """
+
+    __tablename__ = "students"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    student_id: Mapped[str] = mapped_column(
+        String(20), unique=True, nullable=False, index=True
+    )
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    current_semester: Mapped[int] = mapped_column(Integer, nullable=False)
+    enrollment_status: Mapped[EnrollmentStatus] = mapped_column(
+        nullable=False, default=EnrollmentStatus.ACTIVE, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "current_semester BETWEEN 1 AND 12",
+            name="ck_students_current_semester_range",
         ),
     )
