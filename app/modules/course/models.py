@@ -365,3 +365,44 @@ class InstructorAssignment(Base):
             name="uq_instructor_course_term",
         ),
     )
+
+
+class CourseManagementOfficer(SoftDeleteBase):
+    """
+    Course-Management profile for the human officer per SDS Tables
+    61–62. References the generic ``users`` row 1-to-1 and adds:
+
+        - ``staff_id``           : ``REG/XXXX/YY`` format
+        - ``role``               : REGISTRAR_OFFICER or DEPARTMENT_HEAD
+        - ``authorization_level``: integer in [1, 5]; gates which
+                                    sensitivity tier of records the
+                                    officer may modify
+
+    Per SRS §3.5 inverse requirement and SDS Table 62, only an officer
+    with ``role == DEPARTMENT_HEAD`` may grant a manual prerequisite
+    override on the Curriculum Compliance Agent's verdict.
+    """
+
+    __tablename__ = "course_management_officers"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    staff_id: Mapped[str] = mapped_column(
+        String(20), unique=True, nullable=False, index=True
+    )
+    role: Mapped[OfficerRole] = mapped_column(
+        nullable=False, default=OfficerRole.REGISTRAR_OFFICER, index=True
+    )
+    authorization_level: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "authorization_level BETWEEN 1 AND 5",
+            name="ck_officer_authorization_level_range",
+        ),
+    )
