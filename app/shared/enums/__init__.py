@@ -145,3 +145,42 @@ class RegistrationStatus(str, Enum):
     REGISTERED = "REGISTERED"
     ADD_DROP_WINDOW = "ADD_DROP_WINDOW"
     CANCELLED = "CANCELLED"
+
+
+class GradeLetter(str, Enum):
+    """
+    AAU letter-grade scale used by Track B (grading lifecycle).
+    Includes the special non-numeric marks I (Incomplete) and NG
+    (No Grade) that route an academic-status calculation through
+    AcademicStandingAgent.handleEdgeCase per SDS Table 75.
+    """
+    A = "A"
+    A_MINUS = "A-"
+    B_PLUS = "B+"
+    B = "B"
+    B_MINUS = "B-"
+    C_PLUS = "C+"
+    C = "C"
+    C_MINUS = "C-"
+    D = "D"
+    F = "F"
+    I = "I"   # Incomplete
+    NG = "NG"  # No Grade
+
+
+class GradeSubmissionStatus(str, Enum):
+    """Per-section grade-batch lifecycle (Track B)."""
+    DRAFT = "DRAFT"
+    SUBMITTED = "SUBMITTED"
+    FLAGGED = "FLAGGED"
+    AUTHORISED = "AUTHORISED"
+    REJECTED = "REJECTED"
+
+
+class AddDropAction(str, Enum):
+    """
+    Pre-condition discriminator on
+    EnrollmentAdjustmentAgent.updateSectionCapacity (SDS Table 81).
+    """
+    ADD = "ADD"
+    DROP = "DROP"
