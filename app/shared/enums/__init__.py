@@ -183,3 +183,38 @@ class AddDropAction(str, Enum):
     """
     ADD = "ADD"
     DROP = "DROP"
+
+
+class AcademicStatusType(str, Enum):
+    """
+    Per-term academic standing assigned by AcademicStandingAgent
+    (SDS Table 75) and authorised by the CourseManagementOfficer.
+
+    Threshold invariants from SDS Table 74:
+        WARNING when CGPA < 2.0
+        DISTINCTION when CGPA > 3.5
+    """
+    PROMOTED = "PROMOTED"
+    WARNING = "WARNING"
+    DISTINCTION = "DISTINCTION"
+    DISMISSED = "DISMISSED"
+    INCOMPLETE = "INCOMPLETE"
+
+
+class EnrollmentStatus(str, Enum):
+    """
+    Per-student lifecycle on the Student entity (SDS Table 56).
+    Distinct from AcademicStatusType, which is per-term.
+    """
+    ACTIVE = "ACTIVE"
+    DISMISSED = "DISMISSED"
+    WITHDRAWN = "WITHDRAWN"
+    GRADUATED = "GRADUATED"
+
+
+class ExceptionStatus(str, Enum):
+    """Track C unified exception-queue lifecycle."""
+    OPEN = "OPEN"
+    IN_REVIEW = "IN_REVIEW"
+    RESOLVED = "RESOLVED"
+    ESCALATED = "ESCALATED"
