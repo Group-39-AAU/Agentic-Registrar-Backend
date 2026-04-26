@@ -23,6 +23,10 @@ from app.modules.moe.models import MoeStudentRecord                # noqa: F401
 from app.modules.testing_center.models import UATRecord            # noqa: F401
 from app.modules.undergraduate.ranking.models import StreamQuota, RankingResult  # noqa: F401
 from app.modules.undergraduate.enrollment.models import Enrollment                # noqa: F401
+from app.modules.course.models import (                                           # noqa: F401
+    AcademicTerm, Course, CoursePrerequisite, CourseOffering, Section,
+    Student, Instructor, InstructorAssignment, CourseManagementOfficer,
+)
 
 from app.modules.auth.router import router as auth_router
 from app.modules.programs.router import router as programs_router
