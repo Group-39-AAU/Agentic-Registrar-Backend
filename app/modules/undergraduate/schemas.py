@@ -67,6 +67,51 @@ class ApplicationStatusUpdate(BaseModel):
     trigger_reason: Optional[str] = None
 
 
+class CorrectionUpdateRequest(BaseModel):
+    """Request: student submits identity/admission corrections."""
+
+    admission_number: Optional[str] = Field(default=None, min_length=1, max_length=50)
+    first_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    last_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_at_least_one_field(self):
+        if not any([self.admission_number, self.first_name, self.last_name]):
+            raise ValueError("Provide at least one field to update")
+        return self
+
+
+class FlagResolutionRequest(BaseModel):
+    """Request: admin resolves a flagged application."""
+
+    action: str = Field(
+        ...,
+        description=(
+            "One of: APPROVE_AND_CONTINUE, REQUEST_STUDENT_CORRECTION, "
+            "ESCALATE_TO_PENDING_REVIEW, REJECT_NOW"
+        ),
+    )
+    resolution_note: str = Field(..., min_length=1, max_length=500)
+
+
+class FlagContextResponse(BaseModel):
+    """Response: latest AI reasoning details for a flagged application."""
+
+    application_id: uuid.UUID
+    current_status: ApplicationStatus
+    latest_ai_recommendation: Optional[DecisionType] = None
+    latest_ai_confidence: Optional[float] = None
+    latest_ai_summary: Optional[str] = None
+    traces: list[dict[str, str]] = Field(default_factory=list)
+
+
+class ReRunChecksResponse(BaseModel):
+    """Response: status after re-running post-payment checks."""
+
+    application: "ApplicationResponse"
+    message: str
+
+
 class ProgramChoiceSummary(BaseModel):
     """Program fields exposed on application responses (from academic_programs)."""
     id: uuid.UUID

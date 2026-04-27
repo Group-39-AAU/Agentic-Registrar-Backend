@@ -37,6 +37,7 @@ from app.modules.undergraduate.exceptions import (
     EntityNotFoundError,
     InvalidStateTransitionError,
     MissingPrerequisiteError,
+    UnauthorizedApplicationAccessError,
     UnauthorizedDecisionError,
 )
 from app.modules.undergraduate.models import (
@@ -59,9 +60,12 @@ from app.modules.undergraduate.schemas import (
     AdmissionTermResponse,
     ApplicationResponse,
     ApplicationStatusUpdate,
+    CorrectionUpdateRequest,
     DecisionCreate,
     DocumentCreate,
     DocumentVerify,
+    FlagContextResponse,
+    FlagResolutionRequest,
     ProgramChoiceSummary,
 )
 from app.modules.testing_center.models import UATRecord
@@ -88,11 +92,28 @@ ALLOWED_TRANSITIONS: dict[ApplicationStatus, set[ApplicationStatus]] = {
     ApplicationStatus.PAYMENT_VERIFIED: {ApplicationStatus.UNDER_VERIFICATION},
     ApplicationStatus.UNDER_VERIFICATION: {ApplicationStatus.AI_PRE_SCREENING, ApplicationStatus.FLAGGED_FOR_REVIEW},
     ApplicationStatus.AI_PRE_SCREENING: {ApplicationStatus.UAT_PENDING, ApplicationStatus.FLAGGED_FOR_REVIEW},
+    ApplicationStatus.FLAGGED_FOR_REVIEW: {
+        ApplicationStatus.UNDER_VERIFICATION,
+        ApplicationStatus.UAT_PENDING,
+        ApplicationStatus.PENDING_REVIEW,
+        ApplicationStatus.CHANGES_REQUESTED,
+    },
+    ApplicationStatus.CHANGES_REQUESTED: {
+        ApplicationStatus.UNDER_VERIFICATION,
+        ApplicationStatus.FLAGGED_FOR_REVIEW,
+    },
     ApplicationStatus.UAT_PENDING: {ApplicationStatus.UAT_COMPLETED},
     ApplicationStatus.UAT_COMPLETED: {ApplicationStatus.PENDING_REVIEW},
     ApplicationStatus.PENDING_REVIEW: {ApplicationStatus.DECIDED},
     ApplicationStatus.DECIDED: {ApplicationStatus.ENROLLED},
     ApplicationStatus.ENROLLED: set(),  # Terminal state
+}
+
+FLAG_RESOLUTION_ACTIONS = {
+    "APPROVE_AND_CONTINUE",
+    "REQUEST_STUDENT_CORRECTION",
+    "ESCALATE_TO_PENDING_REVIEW",
+    "REJECT_NOW",
 }
 
 
@@ -122,9 +143,8 @@ class ApplicationService:
         actor_id: uuid.UUID,
     ) -> UndergraduateApplication:
         """
-        Create a new application in DRAFT, then transition to SUBMITTED.
-        For government-sponsored: auto-set payment to COMPLETED and
-        advance to PAYMENT_VERIFIED (they skip payment).
+        Create a new application in DRAFT, then transition to SUBMITTED
+        and PAYMENT_PENDING. All applicants complete the payment flow.
         """
         application = UndergraduateApplication(
             applicant_id=actor_id,
@@ -138,11 +158,6 @@ class ApplicationService:
             current_status=ApplicationStatus.DRAFT,
             extra_data=data.extra_data,
         )
-
-        # Government-sponsored: auto-complete payment
-        if data.sponsorship_type == SponsorshipType.GOVERNMENT:
-            application.payment_status = PaymentStatus.COMPLETED
-            application.payment_reference = "GOV_SPONSORED_NO_PAYMENT"
 
         await self._ensure_open_admission_term(data.admission_term_id)
         self._app_repo.add(application)
@@ -175,16 +190,6 @@ class ApplicationService:
             trigger_reason="Awaiting payment",
         )
 
-        # Government-sponsored: auto-advance past payment
-        if data.sponsorship_type == SponsorshipType.GOVERNMENT:
-            await self._transition_status(
-                application=application,
-                new_status=ApplicationStatus.PAYMENT_VERIFIED,
-                actor_id=actor_id,
-                actor_role=UserRole.SYSTEM,
-                trigger_reason="Government-sponsored — payment not required",
-            )
-
         await self._db.commit()
         await self._db.refresh(application)
         return application
@@ -195,7 +200,7 @@ class ApplicationService:
         self, application_id: uuid.UUID, actor_id: uuid.UUID
     ) -> UndergraduateApplication:
         """
-        Generate a simulated payment reference for a self-sponsored application.
+        Generate a simulated payment reference for an application.
         Application must be in PAYMENT_PENDING status.
         """
         application = await self._app_repo.get_by_id(application_id)
@@ -205,11 +210,6 @@ class ApplicationService:
         if application.current_status != ApplicationStatus.PAYMENT_PENDING:
             raise InvalidStateTransitionError(
                 application.current_status.value, "Payment can only be initiated in PAYMENT_PENDING"
-            )
-
-        if application.sponsorship_type == SponsorshipType.GOVERNMENT:
-            raise MissingPrerequisiteError(
-                "Government-sponsored applications do not require payment"
             )
 
         # Generate simulated payment reference
@@ -283,6 +283,56 @@ class ApplicationService:
             actor_id=actor_id,
             actor_role=actor_role,
             trigger_reason=data.trigger_reason,
+        )
+
+        await self._db.commit()
+        await self._db.refresh(application)
+        return application
+
+    async def update_requested_corrections(
+        self,
+        application_id: uuid.UUID,
+        data: CorrectionUpdateRequest,
+        actor_id: uuid.UUID,
+    ) -> UndergraduateApplication:
+        """Allow applicant to update correction fields while in CHANGES_REQUESTED."""
+        application = await self._app_repo.get_by_id(application_id)
+        if application is None:
+            raise EntityNotFoundError("UndergraduateApplication", str(application_id))
+
+        if application.applicant_id != actor_id:
+            raise UnauthorizedApplicationAccessError(
+                "You can only update your own application corrections"
+            )
+
+        if application.current_status != ApplicationStatus.CHANGES_REQUESTED:
+            raise InvalidStateTransitionError(
+                application.current_status.value, ApplicationStatus.CHANGES_REQUESTED.value
+            )
+
+        user_result = await self._db.execute(
+            select(UserModel).where(UserModel.id == actor_id)
+        )
+        applicant = user_result.scalar_one_or_none()
+        if applicant is None:
+            raise EntityNotFoundError("User", str(actor_id))
+
+        updated_fields: list[str] = []
+        if data.admission_number and data.admission_number != application.admission_number:
+            application.admission_number = data.admission_number
+            updated_fields.append("admission_number")
+        if data.first_name and data.first_name != applicant.first_name:
+            applicant.first_name = data.first_name
+            updated_fields.append("first_name")
+        if data.last_name and data.last_name != applicant.last_name:
+            applicant.last_name = data.last_name
+            updated_fields.append("last_name")
+
+        if not updated_fields:
+            raise MissingPrerequisiteError("No effective changes detected to update")
+
+        application.remarks = (
+            f"Student submitted corrections for fields: {', '.join(updated_fields)}"
         )
 
         await self._db.commit()
@@ -473,6 +523,172 @@ class ApplicationService:
         )
         return await self._build_application_responses(items)
 
+    async def get_flagged_queue(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> list[ApplicationResponse]:
+        result = await self._db.execute(
+            select(UndergraduateApplication)
+            .where(
+                UndergraduateApplication.current_status == ApplicationStatus.FLAGGED_FOR_REVIEW,
+                UndergraduateApplication.is_deleted == False,  # noqa: E712
+            )
+            .order_by(UndergraduateApplication.created_at.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return await self._build_application_responses(result.scalars().all())
+
+    async def get_flag_context(self, application_id: uuid.UUID) -> FlagContextResponse:
+        application = await self._app_repo.get_by_id(application_id)
+        if application is None:
+            raise EntityNotFoundError("UndergraduateApplication", str(application_id))
+
+        eval_result = await self._db.execute(
+            select(AIEvaluation)
+            .where(AIEvaluation.application_id == application_id)
+            .order_by(AIEvaluation.created_at.desc())
+            .limit(1)
+        )
+        latest_eval = eval_result.scalar_one_or_none()
+
+        traces: list[dict[str, str]] = []
+        if latest_eval is not None:
+            trace_result = await self._db.execute(
+                select(AIExecutionTrace)
+                .where(AIExecutionTrace.evaluation_id == latest_eval.id)
+                .order_by(AIExecutionTrace.created_at.asc())
+            )
+            traces = [
+                {"step_name": t.step_name, "reasoning_log": t.reasoning_log}
+                for t in trace_result.scalars().all()
+            ]
+
+        return FlagContextResponse(
+            application_id=application.id,
+            current_status=application.current_status,
+            latest_ai_recommendation=latest_eval.recommended_decision if latest_eval else None,
+            latest_ai_confidence=latest_eval.confidence_score if latest_eval else None,
+            latest_ai_summary=latest_eval.summary_reasoning if latest_eval else None,
+            traces=traces,
+        )
+
+    async def resolve_flagged_application(
+        self,
+        application_id: uuid.UUID,
+        data: FlagResolutionRequest,
+        actor_id: uuid.UUID,
+        actor_role: UserRole,
+    ) -> UndergraduateApplication:
+        application = await self._app_repo.get_by_id(application_id)
+        if application is None:
+            raise EntityNotFoundError("UndergraduateApplication", str(application_id))
+        if application.current_status != ApplicationStatus.FLAGGED_FOR_REVIEW:
+            raise InvalidStateTransitionError(
+                application.current_status.value, ApplicationStatus.FLAGGED_FOR_REVIEW.value
+            )
+
+        if data.action not in FLAG_RESOLUTION_ACTIONS:
+            raise MissingPrerequisiteError(
+                f"Invalid action '{data.action}'. Allowed: {sorted(FLAG_RESOLUTION_ACTIONS)}"
+            )
+
+        trigger = f"{data.action}: {data.resolution_note}"
+        if data.action == "APPROVE_AND_CONTINUE":
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.UAT_PENDING,
+                actor_id=actor_id,
+                actor_role=actor_role,
+                trigger_reason=trigger,
+            )
+        elif data.action == "REQUEST_STUDENT_CORRECTION":
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.CHANGES_REQUESTED,
+                actor_id=actor_id,
+                actor_role=actor_role,
+                trigger_reason=trigger,
+            )
+        elif data.action == "ESCALATE_TO_PENDING_REVIEW":
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.PENDING_REVIEW,
+                actor_id=actor_id,
+                actor_role=actor_role,
+                trigger_reason=trigger,
+            )
+        else:  # REJECT_NOW
+            existing_decision = await self._db.execute(
+                select(RegistrarDecision).where(
+                    RegistrarDecision.application_id == application.id
+                )
+            )
+            if existing_decision.scalar_one_or_none() is None:
+                self._db.add(
+                    RegistrarDecision(
+                        application_id=application.id,
+                        reviewer_id=actor_id,
+                        human_decision=DecisionType.REJECT,
+                        justification_remarks=data.resolution_note,
+                        override_reason="Resolved from flagged flow",
+                    )
+                )
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.PENDING_REVIEW,
+                actor_id=actor_id,
+                actor_role=actor_role,
+                trigger_reason=f"REJECT_NOW escalation: {data.resolution_note}",
+            )
+            application.final_decision = DecisionType.REJECT.value
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.DECIDED,
+                actor_id=actor_id,
+                actor_role=actor_role,
+                trigger_reason=f"REJECT_NOW decision: {data.resolution_note}",
+            )
+
+        await self._db.commit()
+        await self._db.refresh(application)
+        return application
+
+    async def rerun_post_payment_checks(
+        self,
+        application_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        actor_role: UserRole,
+        email_service: Optional[EmailService] = None,
+    ) -> UndergraduateApplication:
+        application = await self._app_repo.get_by_id(application_id)
+        if application is None:
+            raise EntityNotFoundError("UndergraduateApplication", str(application_id))
+
+        if application.current_status not in {
+            ApplicationStatus.CHANGES_REQUESTED,
+            ApplicationStatus.FLAGGED_FOR_REVIEW,
+        }:
+            raise InvalidStateTransitionError(
+                application.current_status.value, ApplicationStatus.CHANGES_REQUESTED.value
+            )
+
+        await self._transition_status(
+            application=application,
+            new_status=ApplicationStatus.UNDER_VERIFICATION,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            trigger_reason="Manual re-run of intake/credential checks after correction",
+        )
+
+        await self._run_credential_verification_agent(
+            application=application,
+            email_service=email_service,
+        )
+
+        await self._db.commit()
+        await self._db.refresh(application)
+        return application
+
     # ── Document Operations ───────────────────────────────────
 
     async def add_document(
@@ -622,6 +838,17 @@ class ApplicationService:
                 actor_id=application.applicant_id,
                 actor_role=UserRole.AGENT,
                 trigger_reason="Intake Agent: all completeness checks passed",
+            )
+        else:
+            await self._transition_status(
+                application=application,
+                new_status=ApplicationStatus.FLAGGED_FOR_REVIEW,
+                actor_id=application.applicant_id,
+                actor_role=UserRole.AGENT,
+                trigger_reason=(
+                    "Intake Agent: flagged for review due to failed checks - "
+                    f"{checks_failed}"
+                ),
             )
 
     async def _run_credential_verification_agent(
