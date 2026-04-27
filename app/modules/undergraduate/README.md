@@ -36,9 +36,14 @@ undergraduate/
 ## Application Lifecycle
 
 ```
-SUBMITTED → PAYMENT_PENDING → PAYMENT_VERIFIED → DOCUMENTS_UPLOADED
-    → DOCUMENTS_VERIFIED → UNDER_AI_REVIEW → (AI_APPROVED | FLAGGED_FOR_REVIEW)
-    → UAT_PENDING → UAT_COMPLETED → PENDING_REVIEW → DECIDED → ENROLLED
+DRAFT → SUBMITTED → PAYMENT_PENDING → PAYMENT_VERIFIED
+    → UNDER_VERIFICATION
+    → (FLAGGED_FOR_REVIEW | AI_PRE_SCREENING → UAT_PENDING → UAT_COMPLETED)
+    → PENDING_REVIEW → DECIDED → ENROLLED
+
+FLAGGED_FOR_REVIEW → (CHANGES_REQUESTED → UNDER_VERIFICATION)
+                   | UAT_PENDING
+                   | PENDING_REVIEW
 ```
 
 Each transition is enforced by the state machine in `service.py` and logged in `application_status_history`.
@@ -95,12 +100,17 @@ Each transition is enforced by the state machine in `service.py` and logged in `
 | `POST` | `/applications` | Applicant | Submit a new undergraduate application |
 | `GET` | `/applications` | Officer/Admin | List all applications (paginated, filterable) |
 | `GET` | `/applications/me` | Applicant | List current user's applications |
-| `GET` | `/applications/review-queue` | Officer/Admin | List applications needing review |
+| `GET` | `/applications/review-queue` | Officer/Admin | List applications in `PENDING_REVIEW` |
+| `GET` | `/applications/flagged-queue` | Officer/Admin | List applications in `FLAGGED_FOR_REVIEW` |
 | `GET` | `/applications/{id}` | Any | Get application details |
 | `PATCH` | `/applications/{id}/status` | Officer/Admin | Manual status transition |
-| `GET` | `/applications/{id}/history` | Any | Get full status change history |
+| `PATCH` | `/applications/{id}/submit-corrections` | Applicant | Update `admission_number` / `first_name` / `last_name` while in `CHANGES_REQUESTED` |
+| `GET` | `/applications/{id}/history` | Officer/Admin | Get full status change history |
+| `GET` | `/applications/{id}/flag-context` | Officer/Admin | Latest AI summary/traces for flagged case |
+| `POST` | `/applications/{id}/resolve-flag` | Officer/Admin | Resolve a flagged case and route next step |
+| `POST` | `/applications/{id}/re-run-checks` | Officer/Admin | Re-run verification after corrections |
 | `POST` | `/applications/{id}/payment/initiate` | Applicant | Start payment flow |
-| `POST` | `/applications/{id}/payment/callback` | System | Payment confirmation callback; auto-runs Intake and Credential agents |
+| `POST` | `/applications/{id}/payment/callback` | System | Payment callback; auto-runs Intake + Credential Lookup agents |
 | `POST` | `/applications/{id}/decision` | Officer/Admin | Record a human decision |
 | `GET` | `/applications/{id}/decision` | Any | Get recorded decision |
 | `POST` | `/documents` | Applicant | Upload a document |

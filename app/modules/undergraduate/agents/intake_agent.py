@@ -6,8 +6,7 @@ an application is complete before it can proceed to document verification.
 
 Checks performed:
     1. Profile completeness (sponsorship, stream, program choices)
-    2. Required documents uploaded (GRADE_12_CERTIFICATE, ID_CARD)
-    3. Payment verified
+    2. Payment verification (payment_status = COMPLETED)
 
 If all checks pass → transitions to UNDER_VERIFICATION.
 If any fail → writes AIEvaluation with FLAG_FOR_REVIEW and keeps current status.

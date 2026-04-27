@@ -43,6 +43,14 @@ class UnauthorizedDecisionError(Exception):
         super().__init__(detail)
 
 
+class UnauthorizedApplicationAccessError(Exception):
+    """Raised when a user attempts to modify another applicant's record."""
+
+    def __init__(self, detail: str = "Not allowed to modify this application") -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
 class EntityNotFoundError(Exception):
     """Raised when a requested entity does not exist."""
 

@@ -19,6 +19,7 @@ from app.modules.undergraduate.exceptions import (
     EntityNotFoundError,
     InvalidStateTransitionError,
     MissingPrerequisiteError,
+    UnauthorizedApplicationAccessError,
     UnauthorizedDecisionError,
 )
 from app.modules.undergraduate.schemas import (
@@ -29,13 +30,17 @@ from app.modules.undergraduate.schemas import (
     ApplicationListResponse,
     ApplicationResponse,
     ApplicationStatusUpdate,
+    CorrectionUpdateRequest,
     DecisionCreate,
     DecisionResponse,
     DocumentCreate,
     DocumentResponse,
     DocumentVerify,
+    FlagContextResponse,
+    FlagResolutionRequest,
     PaymentCallbackRequest,
     PaymentInitiateResponse,
+    ReRunChecksResponse,
     StatusHistoryResponse,
 )
 from app.modules.undergraduate.service import ApplicationService, DecisionService
@@ -81,9 +86,16 @@ def _handle_domain_error(e: Exception) -> None:
         raise HTTPException(status_code=400, detail=str(e))
     if isinstance(e, UnauthorizedDecisionError):
         raise HTTPException(status_code=403, detail=str(e))
+    if isinstance(e, UnauthorizedApplicationAccessError):
+        raise HTTPException(status_code=403, detail=str(e))
     if isinstance(e, MissingPrerequisiteError):
         raise HTTPException(status_code=400, detail=str(e))
     raise e
+
+
+def _officer_admin_only(current_user: User) -> None:
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(403, "Only registrar officers or admins can perform this action")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -114,6 +126,7 @@ async def list_applications(
     db: AsyncSession = Depends(get_db),
 ):
     """List all applications (registrar/admin view)."""
+    _officer_admin_only(current_user)
     svc = ApplicationService(db)
     items, total = await svc.list_applications(limit=limit, offset=offset)
     return ApplicationListResponse(items=items, total=total)
@@ -155,8 +168,22 @@ async def review_queue(
     db: AsyncSession = Depends(get_db),
 ):
     """Get applications waiting for registrar review."""
+    _officer_admin_only(current_user)
     svc = ApplicationService(db)
     return await svc.get_review_queue(limit=limit, offset=offset)
+
+
+@router.get("/applications/flagged-queue", response_model=list[ApplicationResponse])
+async def flagged_queue(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get applications currently flagged for manual review."""
+    _officer_admin_only(current_user)
+    svc = ApplicationService(db)
+    return await svc.get_flagged_queue(limit=limit, offset=offset)
 
 
 @router.get("/applications/{application_id}", response_model=ApplicationResponse)
@@ -182,6 +209,7 @@ async def change_application_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Transition an application's status (registrar/system)."""
+    _officer_admin_only(current_user)
     svc = ApplicationService(db)
     try:
         app = await svc.change_status(
@@ -190,6 +218,34 @@ async def change_application_status(
             actor_role=current_user.role,
         )
     except (EntityNotFoundError, InvalidStateTransitionError) as e:
+        _handle_domain_error(e)
+    return await svc.to_application_response(app)
+
+
+@router.patch(
+    "/applications/{application_id}/submit-corrections",
+    response_model=ApplicationResponse,
+)
+async def submit_corrections(
+    application_id: uuid.UUID,
+    data: CorrectionUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Student submits admission-number/name corrections in CHANGES_REQUESTED."""
+    svc = ApplicationService(db)
+    try:
+        app = await svc.update_requested_corrections(
+            application_id=application_id,
+            data=data,
+            actor_id=current_user.id,
+        )
+    except (
+        EntityNotFoundError,
+        InvalidStateTransitionError,
+        MissingPrerequisiteError,
+        UnauthorizedApplicationAccessError,
+    ) as e:
         _handle_domain_error(e)
     return await svc.to_application_response(app)
 
@@ -209,8 +265,7 @@ async def initiate_payment(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Generate a simulated payment link for a self-sponsored application.
-    Government-sponsored applications do not require payment.
+    Generate a simulated payment link for an application.
     """
     svc = ApplicationService(db)
     try:
@@ -279,6 +334,7 @@ async def verify_document(
     db: AsyncSession = Depends(get_db),
 ):
     """Officer verifies or rejects a submitted document."""
+    _officer_admin_only(current_user)
     svc = ApplicationService(db)
     try:
         return await svc.verify_document(
@@ -305,8 +361,80 @@ async def get_status_history(
     db: AsyncSession = Depends(get_db),
 ):
     """Get the full status transition history for an application."""
+    _officer_admin_only(current_user)
     svc = ApplicationService(db)
     return await svc.get_status_history(application_id)
+
+
+@router.get(
+    "/applications/{application_id}/flag-context",
+    response_model=FlagContextResponse,
+)
+async def get_flag_context(
+    application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the latest AI context and traces for a flagged case."""
+    _officer_admin_only(current_user)
+    svc = ApplicationService(db)
+    try:
+        return await svc.get_flag_context(application_id)
+    except EntityNotFoundError as e:
+        _handle_domain_error(e)
+
+
+@router.post(
+    "/applications/{application_id}/resolve-flag",
+    response_model=ApplicationResponse,
+)
+async def resolve_flag(
+    application_id: uuid.UUID,
+    data: FlagResolutionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve a flagged case and route it back into the pipeline."""
+    _officer_admin_only(current_user)
+    svc = ApplicationService(db)
+    try:
+        app = await svc.resolve_flagged_application(
+            application_id=application_id,
+            data=data,
+            actor_id=current_user.id,
+            actor_role=current_user.role,
+        )
+    except (EntityNotFoundError, InvalidStateTransitionError, MissingPrerequisiteError) as e:
+        _handle_domain_error(e)
+    return await svc.to_application_response(app)
+
+
+@router.post(
+    "/applications/{application_id}/re-run-checks",
+    response_model=ReRunChecksResponse,
+)
+async def rerun_checks(
+    application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """Re-run credential checks after student corrections."""
+    _officer_admin_only(current_user)
+    svc = ApplicationService(db)
+    try:
+        app = await svc.rerun_post_payment_checks(
+            application_id=application_id,
+            actor_id=current_user.id,
+            actor_role=current_user.role,
+            email_service=email_service,
+        )
+    except (EntityNotFoundError, InvalidStateTransitionError) as e:
+        _handle_domain_error(e)
+    return ReRunChecksResponse(
+        application=await svc.to_application_response(app),
+        message="Post-payment checks re-run completed",
+    )
 
 
 # ══════════════════════════════════════════════════════════════
