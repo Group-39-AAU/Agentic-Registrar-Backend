@@ -185,6 +185,25 @@ class AddDropAction(str, Enum):
     DROP = "DROP"
 
 
+class AddDropRequestStatus(str, Enum):
+    """
+    Lifecycle of an AddDropRequest from submission to applied change.
+
+    Flow:
+        PENDING                      (student just submitted)
+            -> APPROVED              (EnrollmentAdjustmentAgent passed)
+            -> DENIED                (agent blocked it)
+            -> OVERRIDDEN            (officer override of a DENIED request)
+        APPROVED | OVERRIDDEN
+            -> APPLIED               (change written to the registration)
+    """
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    DENIED = "DENIED"
+    OVERRIDDEN = "OVERRIDDEN"
+    APPLIED = "APPLIED"
+
+
 class AcademicStatusType(str, Enum):
     """
     Per-term academic standing assigned by AcademicStandingAgent

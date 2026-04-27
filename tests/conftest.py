@@ -44,6 +44,8 @@ from app.modules.undergraduate.enrollment.models import Enrollment      # noqa: 
 from app.modules.course.models import (                                 # noqa: F401
     AcademicTerm, Course, CoursePrerequisite, CourseOffering, Section,
     Student, Instructor, InstructorAssignment, CourseManagementOfficer,
+    Registration, RegistrationCourse, RegistrationStatusHistory,
+    AddDropRequest, AdvisoryRecommendation, PrerequisiteOverride,
 )
 
 from app.database.base import Base

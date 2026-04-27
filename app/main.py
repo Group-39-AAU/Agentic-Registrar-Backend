@@ -26,6 +26,8 @@ from app.modules.undergraduate.enrollment.models import Enrollment              
 from app.modules.course.models import (                                           # noqa: F401
     AcademicTerm, Course, CoursePrerequisite, CourseOffering, Section,
     Student, Instructor, InstructorAssignment, CourseManagementOfficer,
+    Registration, RegistrationCourse, RegistrationStatusHistory,
+    AddDropRequest, AdvisoryRecommendation, PrerequisiteOverride,
 )
 
 from app.modules.auth.router import router as auth_router
