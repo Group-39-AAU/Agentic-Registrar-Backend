@@ -22,18 +22,21 @@ Tables 55–84 (detailed design).
 """
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean, Date, ForeignKey, Integer, String, Text, UniqueConstraint,
-    CheckConstraint,
+    JSON, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer,
+    String, Text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteBase
-from app.shared.enums import EnrollmentStatus, OfficerRole
+from app.shared.enums import (
+    AddDropAction, AddDropRequestStatus, EnrollmentStatus, OfficerRole,
+    RegistrationStatus, RiskStatus, SponsorshipType,
+)
 
 
 # ── Academic Calendar ────────────────────────────────────────────
@@ -404,5 +407,301 @@ class CourseManagementOfficer(SoftDeleteBase):
         CheckConstraint(
             "authorization_level BETWEEN 1 AND 5",
             name="ck_officer_authorization_level_range",
+        ),
+    )
+
+
+# ── Track A — Registration Workflow ──────────────────────────────
+
+
+class Registration(SoftDeleteBase):
+    """
+    Per-student-per-term registration aggregate. Drives the SDS
+    Figure 39 state machine via :class:`RegistrationStatus`.
+
+    The ``payment_reference`` is the opaque identifier returned by
+    PayMock and is the field the Curriculum Compliance Agent's
+    ``checkPaymentStatus`` uses to confirm payment is settled before
+    the registration can transition to ``REGISTERED``.
+
+    UniqueConstraint(student_id, term_id) enforces SRS Course-FR-01's
+    "one registration per student per term" rule — the re-registration
+    guard listed in the Track A implementation checklist.
+    """
+
+    __tablename__ = "registrations"
+
+    student_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("students.id"),
+        nullable=False,
+        index=True,
+    )
+    term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("academic_terms.id"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[RegistrationStatus] = mapped_column(
+        nullable=False,
+        default=RegistrationStatus.REGISTRATION_OPEN,
+        index=True,
+    )
+    sponsorship_type: Mapped[SponsorshipType] = mapped_column(nullable=False)
+    payment_reference: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    finalised_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    student: Mapped["Student"] = relationship(lazy="selectin")
+    term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
+    courses: Mapped[list["RegistrationCourse"]] = relationship(
+        back_populates="registration", lazy="selectin",
+    )
+    status_history: Mapped[list["RegistrationStatusHistory"]] = relationship(
+        back_populates="registration", lazy="selectin",
+        order_by="RegistrationStatusHistory.created_at.asc()",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "student_id", "term_id",
+            name="uq_one_registration_per_student_term",
+        ),
+    )
+
+
+class RegistrationCourse(Base):
+    """
+    Junction recording which courses a registration includes. The
+    ``section_id`` is null until the Academic Scheduling Agent has
+    placed the student into a section; thereafter it pins which
+    section the student attends.
+
+    Append-only (inherits :class:`Base`) — drops are surfaced as
+    AddDropRequest rows rather than mutations of this table, so the
+    registration history is reconstructable.
+    """
+
+    __tablename__ = "registration_courses"
+
+    registration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registrations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sections.id"),
+        nullable=True,
+        index=True,
+    )
+    is_dropped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+
+    registration: Mapped["Registration"] = relationship(
+        back_populates="courses", lazy="selectin",
+    )
+    course: Mapped["Course"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "registration_id", "course_id",
+            name="uq_registration_course_pair",
+        ),
+    )
+
+
+class RegistrationStatusHistory(Base):
+    """
+    Immutable audit trail of every Registration status transition.
+    Mirrors the undergraduate ``ApplicationStatusHistory`` pattern.
+
+    ``changed_by_id`` is null for agent-driven transitions; the
+    ``agent_id`` column is set instead so observability dashboards
+    can attribute the transition to a specific agent instance.
+    """
+
+    __tablename__ = "registration_status_history"
+
+    registration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registrations.id"),
+        nullable=False,
+        index=True,
+    )
+    previous_status: Mapped[Optional[RegistrationStatus]] = mapped_column(
+        nullable=True
+    )
+    new_status: Mapped[RegistrationStatus] = mapped_column(nullable=False)
+    changed_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    agent_id: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True
+    )
+    trigger_reason: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+
+    registration: Mapped["Registration"] = relationship(
+        back_populates="status_history", lazy="selectin",
+    )
+
+
+# ── Track A — Add/Drop Workflow ──────────────────────────────────
+
+
+class AddDropRequest(SoftDeleteBase):
+    """
+    A student-initiated post-registration change request handled by
+    the EnrollmentAdjustmentAgent.
+
+    ``deadline_snapshot`` is captured at submit time so late-window
+    rule changes do not retroactively break records (Track A
+    implementation checklist invariant).
+
+    ``override_by_id`` and ``override_justification`` are populated
+    only when an officer overrides a DENIED request — for prerequisite
+    overrides the calling code MUST verify the officer's role is
+    ``DEPARTMENT_HEAD`` per SRS §3.5.
+    """
+
+    __tablename__ = "add_drop_requests"
+
+    registration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registrations.id"),
+        nullable=False,
+        index=True,
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    target_section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sections.id"),
+        nullable=True,
+    )
+    action: Mapped[AddDropAction] = mapped_column(nullable=False)
+    deadline_snapshot: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[AddDropRequestStatus] = mapped_column(
+        nullable=False,
+        default=AddDropRequestStatus.PENDING,
+        index=True,
+    )
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    override_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    override_justification: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+
+    registration: Mapped["Registration"] = relationship(lazy="selectin")
+    course: Mapped["Course"] = relationship(lazy="selectin")
+
+
+# ── Track A — Advisory ───────────────────────────────────────────
+
+
+class AdvisoryRecommendation(Base):
+    """
+    Persisted snapshot of an AcademicAdvisoryAgent verdict (SDS
+    Table 69). Immutable so the officer reviewing an add/drop
+    request can see exactly what advice the student was given at
+    advice-time, even after the curriculum has moved on.
+
+    ``proposed_courses``       — list of course UUIDs the student asked about
+    ``recommended_courses``    — list of course UUIDs the agent suggests next
+    ``gap_analysis``           — completed-vs-remaining structured payload
+    """
+
+    __tablename__ = "advisory_recommendations"
+
+    student_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("students.id"),
+        nullable=False,
+        index=True,
+    )
+    term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("academic_terms.id"),
+        nullable=False,
+        index=True,
+    )
+    risk_status: Mapped[RiskStatus] = mapped_column(nullable=False)
+    risk_explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    proposed_courses: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    recommended_courses: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    gap_analysis: Mapped[dict] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+
+    student: Mapped["Student"] = relationship(lazy="selectin")
+    term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
+
+
+# ── Track A — Prerequisite Override Audit ────────────────────────
+
+
+class PrerequisiteOverride(Base):
+    """
+    Immutable record of a Department-Head-granted bypass of the
+    Curriculum Compliance Agent's prerequisite verdict. Required by
+    SRS §3.5 inverse requirement and by SDS Table 62 (only an
+    officer with ``role == DEPARTMENT_HEAD`` may grant the override;
+    enforcement lives in the service layer).
+
+    A registration may accumulate multiple PrerequisiteOverride rows
+    (one per overridden course), so the trail is fully reconstructable
+    when the override is later questioned.
+    """
+
+    __tablename__ = "prerequisite_overrides"
+
+    registration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registrations.id"),
+        nullable=False,
+        index=True,
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    granted_by_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
+    )
+    justification: Mapped[str] = mapped_column(Text, nullable=False)
+
+    registration: Mapped["Registration"] = relationship(lazy="selectin")
+    course: Mapped["Course"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "registration_id", "course_id",
+            name="uq_prerequisite_override_per_course",
         ),
     )
