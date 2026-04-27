@@ -122,9 +122,8 @@ class ApplicationService:
         actor_id: uuid.UUID,
     ) -> UndergraduateApplication:
         """
-        Create a new application in DRAFT, then transition to SUBMITTED.
-        For government-sponsored: auto-set payment to COMPLETED and
-        advance to PAYMENT_VERIFIED (they skip payment).
+        Create a new application in DRAFT, then transition to SUBMITTED
+        and PAYMENT_PENDING. All applicants complete the payment flow.
         """
         application = UndergraduateApplication(
             applicant_id=actor_id,
@@ -138,11 +137,6 @@ class ApplicationService:
             current_status=ApplicationStatus.DRAFT,
             extra_data=data.extra_data,
         )
-
-        # Government-sponsored: auto-complete payment
-        if data.sponsorship_type == SponsorshipType.GOVERNMENT:
-            application.payment_status = PaymentStatus.COMPLETED
-            application.payment_reference = "GOV_SPONSORED_NO_PAYMENT"
 
         await self._ensure_open_admission_term(data.admission_term_id)
         self._app_repo.add(application)
@@ -175,16 +169,6 @@ class ApplicationService:
             trigger_reason="Awaiting payment",
         )
 
-        # Government-sponsored: auto-advance past payment
-        if data.sponsorship_type == SponsorshipType.GOVERNMENT:
-            await self._transition_status(
-                application=application,
-                new_status=ApplicationStatus.PAYMENT_VERIFIED,
-                actor_id=actor_id,
-                actor_role=UserRole.SYSTEM,
-                trigger_reason="Government-sponsored — payment not required",
-            )
-
         await self._db.commit()
         await self._db.refresh(application)
         return application
@@ -195,7 +179,7 @@ class ApplicationService:
         self, application_id: uuid.UUID, actor_id: uuid.UUID
     ) -> UndergraduateApplication:
         """
-        Generate a simulated payment reference for a self-sponsored application.
+        Generate a simulated payment reference for an application.
         Application must be in PAYMENT_PENDING status.
         """
         application = await self._app_repo.get_by_id(application_id)
@@ -205,11 +189,6 @@ class ApplicationService:
         if application.current_status != ApplicationStatus.PAYMENT_PENDING:
             raise InvalidStateTransitionError(
                 application.current_status.value, "Payment can only be initiated in PAYMENT_PENDING"
-            )
-
-        if application.sponsorship_type == SponsorshipType.GOVERNMENT:
-            raise MissingPrerequisiteError(
-                "Government-sponsored applications do not require payment"
             )
 
         # Generate simulated payment reference
