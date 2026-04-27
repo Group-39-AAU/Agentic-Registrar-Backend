@@ -36,9 +36,9 @@ from app.core.security import hash_password
 from app.modules.auth.models import User
 from app.modules.course.models import (
     AcademicTerm, Course, CoursePrerequisite, CourseOffering, Section,
-    Instructor, InstructorAssignment, Student,
+    Instructor, InstructorAssignment, Student, CourseManagementOfficer,
 )
-from app.shared.enums import EnrollmentStatus, UserRole
+from app.shared.enums import EnrollmentStatus, OfficerRole, UserRole
 
 
 DATABASE_URL = str(settings.DATABASE_URL)
@@ -216,6 +216,27 @@ STUDENTS = [
     ("UGR/0028/14", "Christian", "Wolde",     8),
     ("UGR/0029/14", "Daniel",    "Tamirat",   8),
     ("UGR/0030/14", "Eleni",     "Berhanu",   8),
+]
+
+
+# ══════════════════════════════════════════════════════════════
+#  Officers
+# ══════════════════════════════════════════════════════════════
+# (staff_id, first_name, last_name, role, authorization_level, email)
+# A registrar officer plus a department head — the latter is the
+# *only* role allowed to override prerequisite blocks per SRS §3.5.
+
+OFFICERS = [
+    (
+        "REG/9001/10", "Tewodros", "Adane",
+        OfficerRole.REGISTRAR_OFFICER, 5,
+        "registrar.officer@aau.edu.et",
+    ),
+    (
+        "REG/9002/10", "Selamawit", "Mengistu",
+        OfficerRole.DEPARTMENT_HEAD, 3,
+        "cs.dept.head@aau.edu.et",
+    ),
 ]
 
 
@@ -498,6 +519,42 @@ async def _seed_students(session: AsyncSession) -> None:
         print(f"⚠️  All {len(existing)} students already present — skipping.")
 
 
+async def _seed_officers(session: AsyncSession) -> None:
+    existing = (
+        await session.execute(select(CourseManagementOfficer))
+    ).scalars().all()
+    by_staff = {o.staff_id: o for o in existing}
+
+    new_count = 0
+    for staff_id, first_name, last_name, role, level, email in OFFICERS:
+        if staff_id in by_staff:
+            continue
+        user = await _ensure_user(
+            session,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            role=UserRole.REGISTRAR_OFFICER,
+            user_uid=_uid("user", "officer", staff_id),
+        )
+        session.add(
+            CourseManagementOfficer(
+                id=_uid("officer", staff_id),
+                user_id=user.id,
+                staff_id=staff_id,
+                role=role,
+                authorization_level=level,
+            )
+        )
+        new_count += 1
+
+    await session.commit()
+    if new_count:
+        print(f"✅ Seeded {new_count} course-management officers.")
+    else:
+        print(f"⚠️  All {len(existing)} officers already present — skipping.")
+
+
 async def seed() -> None:
     engine = create_async_engine(DATABASE_URL, echo=False)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -511,6 +568,7 @@ async def seed() -> None:
             session, term, courses_by_code, instructors,
         )
         await _seed_students(session)
+        await _seed_officers(session)
 
     await engine.dispose()
     print("\n🎉 Course Management Phase 0 seed complete.")
