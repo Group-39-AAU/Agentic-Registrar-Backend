@@ -16,5 +16,15 @@ extends :class:`app.ai.base.BaseAgent`.
 """
 
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
+from app.modules.course.agents.curriculum_compliance_agent import (
+    ComplianceCheckResult,
+    CurriculumComplianceAgent,
+    MAX_CREDIT_LOAD_ECTS,
+)
 
-__all__ = ["CourseBaseAgent"]
+__all__ = [
+    "CourseBaseAgent",
+    "ComplianceCheckResult",
+    "CurriculumComplianceAgent",
+    "MAX_CREDIT_LOAD_ECTS",
+]
