@@ -38,6 +38,7 @@ from app.modules.testing_center.router import router as testing_center_router
 from app.modules.undergraduate.ranking.router import router as ranking_router
 from app.modules.undergraduate.ranking.review_router import router as review_router
 from app.modules.undergraduate.enrollment.router import router as enrollment_router
+from app.modules.course.router import router as course_router
 
 
 def create_app() -> FastAPI:
@@ -69,6 +70,7 @@ def create_app() -> FastAPI:
     app.include_router(ranking_router, prefix=settings.API_V1_PREFIX)
     app.include_router(review_router, prefix=settings.API_V1_PREFIX)
     app.include_router(enrollment_router, prefix=settings.API_V1_PREFIX)
+    app.include_router(course_router, prefix=settings.API_V1_PREFIX)
 
     # ── Event Subscriptions ──
     from app.shared.events import subscribe
