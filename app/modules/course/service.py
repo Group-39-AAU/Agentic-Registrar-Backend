@@ -25,7 +25,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger, write_audit_log
-from app.modules.course.agents import CurriculumComplianceAgent
+from app.modules.course.agents import (
+    AcademicSchedulingAgent, CurriculumComplianceAgent,
+)
 from app.modules.course.exceptions import (
     ComplianceCheckFailedError,
     DuplicateRegistrationError,
@@ -35,8 +37,9 @@ from app.modules.course.exceptions import (
     UnauthorizedActorError,
 )
 from app.modules.course.models import (
-    AcademicTerm, Course, Registration, RegistrationCourse,
-    RegistrationStatusHistory, Student,
+    AcademicTerm, Course, CourseOffering, Instructor, Registration,
+    RegistrationCourse, RegistrationStatusHistory, ScheduleConflict,
+    Section, Student,
 )
 from app.modules.course.repository import (
     AcademicTermRepository, CourseRepository, RegistrationRepository,
@@ -437,3 +440,158 @@ class RegistrationService:
         await self.db.commit()
         await self.db.refresh(registration, attribute_names=["courses"])
         return registration, compliance
+
+
+class SchedulingService:
+    """
+    Officer-triggered schedule generation plus the read-only
+    timetable views consumed by students and instructors. Wraps the
+    AcademicSchedulingAgent and owns the transaction boundary so the
+    router stays thin.
+    """
+
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        scheduling_agent: Optional[AcademicSchedulingAgent] = None,
+    ) -> None:
+        self.db = db
+        self.terms = AcademicTermRepository(db)
+        self.scheduling_agent = scheduling_agent or AcademicSchedulingAgent()
+
+    # ── Officer trigger ──────────────────────────────────────────
+
+    async def generate_schedule(
+        self,
+        term_id: uuid.UUID,
+        department: str,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+    ) -> dict:
+        """
+        Run the full scheduling pipeline (allocate + timetable) for
+        a (term, department) pair. Officer-only.
+        """
+        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+            raise UnauthorizedActorError(
+                "Only registrar officers or admins can generate schedules."
+            )
+        term = await self.terms.get(term_id)
+        if term is None:
+            raise EntityNotFoundError("AcademicTerm", str(term_id))
+
+        payload = await self.scheduling_agent.process_task({
+            "session": self.db,
+            "term_id": term_id,
+            "department": department,
+        })
+        await self.db.commit()
+
+        write_audit_log(
+            action="course.schedule.generated",
+            actor_role=officer_role.value,
+            actor_id=officer_id,
+            resource_type="AcademicTerm",
+            resource_id=term_id,
+            decision="ok",
+            metadata={
+                "department": department,
+                "allocated": payload["allocation"]["allocated_count"],
+                "failed": payload["allocation"]["failed_count"],
+                "conflicts": payload["schedule"]["conflict_count"],
+            },
+        )
+        return payload
+
+    # ── Read views ───────────────────────────────────────────────
+
+    async def get_student_timetable(
+        self,
+        student_id: uuid.UUID,
+        term_id: uuid.UUID,
+    ) -> list[dict]:
+        """
+        Return the student's per-section schedule for the term: only
+        rows whose section_id is set (i.e. allocate_sections has run)
+        and whose registration is not cancelled.
+        """
+        rows = (
+            await self.db.execute(
+                select(RegistrationCourse, Section, Course)
+                .join(Section, RegistrationCourse.section_id == Section.id)
+                .join(CourseOffering, Section.offering_id == CourseOffering.id)
+                .join(Course, CourseOffering.course_id == Course.id)
+                .join(Registration, RegistrationCourse.registration_id == Registration.id)
+                .where(
+                    Registration.student_id == student_id,
+                    Registration.term_id == term_id,
+                    Registration.is_deleted == False,  # noqa: E712
+                    RegistrationCourse.is_dropped == False,  # noqa: E712
+                    RegistrationCourse.section_id.is_not(None),
+                )
+            )
+        ).all()
+        return [
+            {
+                "section_id": sec.id,
+                "course_code": course.code,
+                "course_title": course.title,
+                "section_code": sec.section_code,
+                "room": sec.room,
+                "time_slot": sec.time_slot,
+                "instructor_id": sec.instructor_id,
+            }
+            for _rc, sec, course in rows
+        ]
+
+    async def get_instructor_timetable(
+        self,
+        instructor_id: uuid.UUID,
+        term_id: uuid.UUID,
+    ) -> list[dict]:
+        """Return every section assigned to this instructor for the term."""
+        rows = (
+            await self.db.execute(
+                select(Section, Course)
+                .join(CourseOffering, Section.offering_id == CourseOffering.id)
+                .join(Course, CourseOffering.course_id == Course.id)
+                .where(
+                    CourseOffering.term_id == term_id,
+                    Section.instructor_id == instructor_id,
+                    Section.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).all()
+        return [
+            {
+                "section_id": sec.id,
+                "course_code": course.code,
+                "course_title": course.title,
+                "section_code": sec.section_code,
+                "room": sec.room,
+                "time_slot": sec.time_slot,
+                "instructor_id": sec.instructor_id,
+            }
+            for sec, course in rows
+        ]
+
+    async def list_open_conflicts(
+        self,
+        term_id: uuid.UUID,
+        officer_role: UserRole,
+        department: Optional[str] = None,
+    ) -> list[ScheduleConflict]:
+        """Officer-only: list every OPEN ScheduleConflict in the term."""
+        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+            raise UnauthorizedActorError(
+                "Only registrar officers or admins can view the conflict report."
+            )
+        from app.shared.enums import ScheduleConflictStatus
+        stmt = select(ScheduleConflict).where(
+            ScheduleConflict.term_id == term_id,
+            ScheduleConflict.status == ScheduleConflictStatus.OPEN,
+        )
+        if department:
+            stmt = stmt.where(ScheduleConflict.department == department)
+        return list((await self.db.execute(stmt)).scalars().all())
