@@ -14,7 +14,9 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.shared.enums import RegistrationStatus, SponsorshipType
+from app.shared.enums import (
+    AddDropAction, AddDropRequestStatus, RegistrationStatus, SponsorshipType,
+)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -166,3 +168,38 @@ class ScheduleGenerateResponse(BaseModel):
     """Payload returned from the officer's generate endpoint."""
     allocation: dict
     schedule: dict
+
+
+# ══════════════════════════════════════════════════════════════
+#  Add/Drop
+# ══════════════════════════════════════════════════════════════
+
+
+class AddDropRequestCreate(BaseModel):
+    """Request: student submits an add/drop change."""
+    registration_id: uuid.UUID
+    course_id: uuid.UUID
+    action: AddDropAction
+    deadline: date
+    target_section_id: Optional[uuid.UUID] = None
+
+
+class AddDropRequestResponse(BaseModel):
+    """Read view of an AddDropRequest."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    registration_id: uuid.UUID
+    course_id: uuid.UUID
+    target_section_id: Optional[uuid.UUID] = None
+    action: AddDropAction
+    deadline_snapshot: date
+    status: AddDropRequestStatus
+    reason: Optional[str] = None
+    override_by_id: Optional[uuid.UUID] = None
+    override_justification: Optional[str] = None
+
+
+class AddDropOverrideRequest(BaseModel):
+    """Officer override payload."""
+    justification: str = Field(..., min_length=3, max_length=4000)

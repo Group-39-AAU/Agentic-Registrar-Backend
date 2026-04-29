@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from app.shared.email.service import EmailService
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -620,11 +623,13 @@ class AddDropService:
         db: AsyncSession,
         *,
         adjustment_agent: Optional[EnrollmentAdjustmentAgent] = None,
+        email_service: Optional["EmailService"] = None,
     ) -> None:
         self.db = db
         self.registrations = RegistrationRepository(db)
         self.requests = AddDropRequestRepository(db)
         self.agent = adjustment_agent or EnrollmentAdjustmentAgent()
+        self.email_service = email_service
 
     # ── Submit (the spine) ──────────────────────────────────────
 
@@ -719,6 +724,7 @@ class AddDropService:
                 "details": result.details,
             },
         )
+        await self._notify_student(registration, request)
 
     async def _apply_approved_change(
         self, request: AddDropRequest, registration: Registration,
@@ -879,9 +885,50 @@ class AddDropService:
                 "justification": justification.strip(),
             },
         )
+        await self._notify_student(registration, request)
         await self.db.commit()
         await self.db.refresh(request)
         return request
+
+    async def _notify_student(
+        self, registration: Registration, request: AddDropRequest,
+    ) -> None:
+        """
+        Wire the agent's notification payload to the EmailService.
+        Always emits a structured stdout audit-log row; the actual
+        email is only attempted when an EmailService was injected
+        (production wiring) so unit tests run without SMTP setup.
+        """
+        payload = self.agent.notify_adjustment_success(
+            registration.student_id, request,
+        )
+        write_audit_log(
+            action="course.add_drop.notification",
+            actor_role=UserRole.AGENT.value,
+            actor_id=None,
+            resource_type="AddDropRequest",
+            resource_id=request.id,
+            decision="notified",
+            metadata=payload,
+        )
+        if self.email_service is None:
+            return
+        # Resolve the student's email via the User row.
+        student = await self.db.get(Student, registration.student_id)
+        if student is None:
+            return
+        from app.modules.auth.models import User
+        user = await self.db.get(User, student.user_id)
+        if user is None or not user.email:
+            return
+        from app.shared.email.schemas import EmailMessage
+        await self.email_service.send(
+            EmailMessage(
+                to_email=user.email,
+                subject=payload["subject"],
+                text_body=payload["body"],
+            )
+        )
 
     # ── Reads ───────────────────────────────────────────────────
 
