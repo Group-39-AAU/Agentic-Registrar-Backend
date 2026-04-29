@@ -81,3 +81,39 @@ class UserRole(str, Enum):
     ADMIN = "ADMIN"
     SYSTEM = "SYSTEM"   # Automated background jobs
     AGENT = "AGENT"     # LangGraph AI agents
+
+
+# ══════════════════════════════════════════════════════════════
+#  Course Management — Foundation Enums
+# ══════════════════════════════════════════════════════════════
+
+
+class AgentStatus(str, Enum):
+    """
+    Lifecycle state of every agent that extends BaseAgent.
+    Casing matches SDS Table 86 verbatim.
+    """
+    IDLE = "IDLE"
+    BUSY = "BUSY"
+    WAITING_HUMAN = "WAITING_HUMAN"
+    ERROR = "ERROR"
+
+
+class OfficerRole(str, Enum):
+    """
+    Role discriminator for CourseManagementOfficer (SDS Table 62).
+    Only DEPARTMENT_HEAD may override unmet prerequisites per SRS §3.5
+    inverse requirement.
+    """
+    REGISTRAR_OFFICER = "REGISTRAR_OFFICER"
+    DEPARTMENT_HEAD = "DEPARTMENT_HEAD"
+
+
+class RiskStatus(str, Enum):
+    """
+    Returned by AcademicAdvisoryAgent.flagRiskLevel (SDS Table 69).
+    HIGH escalates to a mandatory CourseManagementOfficer review.
+    """
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
