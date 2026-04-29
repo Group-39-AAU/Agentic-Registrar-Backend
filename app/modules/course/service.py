@@ -18,7 +18,7 @@ state-machine transitions.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select
@@ -27,26 +27,30 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.logging import get_logger, write_audit_log
 from app.modules.course.agents import (
     AcademicSchedulingAgent, CurriculumComplianceAgent,
+    EnrollmentAdjustmentAgent,
 )
 from app.modules.course.exceptions import (
+    AdjustmentDeniedError,
     ComplianceCheckFailedError,
     DuplicateRegistrationError,
     EntityNotFoundError,
+    InvalidAdjustmentRequestError,
     InvalidStateTransitionError,
     RegistrationWindowClosedError,
     UnauthorizedActorError,
 )
 from app.modules.course.models import (
-    AcademicTerm, Course, CourseOffering, Instructor, Registration,
-    RegistrationCourse, RegistrationStatusHistory, ScheduleConflict,
-    Section, Student,
+    AcademicTerm, AddDropRequest, Course, CourseOffering, Instructor,
+    Registration, RegistrationCourse, RegistrationStatusHistory,
+    ScheduleConflict, Section, Student,
 )
 from app.modules.course.repository import (
-    AcademicTermRepository, CourseRepository, RegistrationRepository,
-    StudentRepository,
+    AcademicTermRepository, AddDropRequestRepository, CourseRepository,
+    RegistrationRepository, StudentRepository,
 )
 from app.shared.enums import (
-    RegistrationStatus, SponsorshipType, UserRole,
+    AddDropAction, AddDropRequestStatus, RegistrationStatus,
+    SponsorshipType, UserRole,
 )
 
 logger = get_logger("course.service")
@@ -595,3 +599,296 @@ class SchedulingService:
         if department:
             stmt = stmt.where(ScheduleConflict.department == department)
         return list((await self.db.execute(stmt)).scalars().all())
+
+
+class AddDropService:
+    """
+    Drives the AddDropRequest lifecycle:
+
+        PENDING
+          -> APPROVED -> APPLIED            (agent approves)
+          -> DENIED                         (agent blocks)
+              -> OVERRIDDEN -> APPLIED      (officer override)
+
+    The EnrollmentAdjustmentAgent makes the policy decision; this
+    service is responsible for persisting the outcome, applying the
+    actual change to the registration, and writing the audit trail.
+    """
+
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        adjustment_agent: Optional[EnrollmentAdjustmentAgent] = None,
+    ) -> None:
+        self.db = db
+        self.registrations = RegistrationRepository(db)
+        self.requests = AddDropRequestRepository(db)
+        self.agent = adjustment_agent or EnrollmentAdjustmentAgent()
+
+    # ── Submit (the spine) ──────────────────────────────────────
+
+    async def submit_request(
+        self,
+        registration_id: uuid.UUID,
+        course_id: uuid.UUID,
+        action: AddDropAction,
+        deadline: date,
+        student_user_id: uuid.UUID,
+        target_section_id: Optional[uuid.UUID] = None,
+    ) -> AddDropRequest:
+        """
+        Persist a new AddDropRequest, run the agent, and either:
+            • apply the change and flip status to APPLIED, or
+            • flip status to DENIED and raise AdjustmentDeniedError
+              with the agent payload.
+        """
+        registration = await self.registrations.get(registration_id)
+        if registration is None:
+            raise EntityNotFoundError("Registration", str(registration_id))
+        if registration.status not in {
+            RegistrationStatus.REGISTERED,
+            RegistrationStatus.ADD_DROP_WINDOW,
+        }:
+            raise InvalidAdjustmentRequestError(
+                f"Registration is in {registration.status.value}; only "
+                "REGISTERED or ADD_DROP_WINDOW registrations accept add/drop."
+            )
+
+        request = AddDropRequest(
+            registration_id=registration_id,
+            course_id=course_id,
+            target_section_id=target_section_id,
+            action=action,
+            deadline_snapshot=deadline,
+            status=AddDropRequestStatus.PENDING,
+        )
+        self.db.add(request)
+        await self.db.flush()
+
+        await self._run_agent_and_apply(
+            request, registration, student_user_id,
+        )
+        await self.db.commit()
+        await self.db.refresh(request)
+        return request
+
+    async def _run_agent_and_apply(
+        self,
+        request: AddDropRequest,
+        registration: Registration,
+        actor_id: uuid.UUID,
+    ) -> None:
+        result = await self.agent.process_add_drop(
+            self.db, request, registration,
+        )
+        if not result.approved:
+            request.status = AddDropRequestStatus.DENIED
+            request.reason = "; ".join(result.reasons)
+            write_audit_log(
+                action="course.add_drop.denied",
+                actor_role=UserRole.AGENT.value,
+                actor_id=None,
+                resource_type="AddDropRequest",
+                resource_id=request.id,
+                decision=AddDropRequestStatus.DENIED.value,
+                metadata={
+                    "agent_id": self.agent.agent_id,
+                    "reasons": result.reasons,
+                    "details": result.details,
+                },
+            )
+            raise AdjustmentDeniedError({
+                "approved": False,
+                "reasons": result.reasons,
+                "details": result.details,
+            })
+
+        request.status = AddDropRequestStatus.APPROVED
+        await self._apply_approved_change(request, registration)
+        request.status = AddDropRequestStatus.APPLIED
+        write_audit_log(
+            action="course.add_drop.applied",
+            actor_role=UserRole.AGENT.value,
+            actor_id=actor_id,
+            resource_type="AddDropRequest",
+            resource_id=request.id,
+            decision=AddDropRequestStatus.APPLIED.value,
+            metadata={
+                "agent_id": self.agent.agent_id,
+                "details": result.details,
+            },
+        )
+
+    async def _apply_approved_change(
+        self, request: AddDropRequest, registration: Registration,
+    ) -> None:
+        """Materialise an approved request as a RegistrationCourse mutation."""
+        if request.action == AddDropAction.ADD:
+            await self._apply_add(request, registration)
+        else:
+            await self._apply_drop(request, registration)
+
+    async def _apply_add(
+        self, request: AddDropRequest, registration: Registration,
+    ) -> None:
+        # Find an offering for this course in the term.
+        offering = (
+            await self.db.execute(
+                select(CourseOffering).where(
+                    CourseOffering.course_id == request.course_id,
+                    CourseOffering.term_id == registration.term_id,
+                    CourseOffering.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if offering is None:
+            raise InvalidAdjustmentRequestError(
+                f"Course {request.course_id} has no offering for term "
+                f"{registration.term_id}."
+            )
+
+        # Pick a section: caller-specified target_section_id wins, else
+        # any section under the offering with free capacity.
+        section: Optional[Section] = None
+        if request.target_section_id is not None:
+            section = await self.db.get(Section, request.target_section_id)
+            if section is None or section.offering_id != offering.id:
+                raise InvalidAdjustmentRequestError(
+                    "target_section_id does not belong to this course's offering."
+                )
+        else:
+            sections = (
+                await self.db.execute(
+                    select(Section).where(
+                        Section.offering_id == offering.id,
+                        Section.is_deleted == False,  # noqa: E712
+                    )
+                )
+            ).scalars().all()
+            for s in sections:
+                if s.enrolled_count < s.capacity:
+                    section = s
+                    break
+            if section is None:
+                raise InvalidAdjustmentRequestError(
+                    "All sections of this course are at capacity."
+                )
+
+        await self.agent.update_section_capacity(
+            self.db, section.id, AddDropAction.ADD,
+        )
+
+        existing_link = (
+            await self.db.execute(
+                select(RegistrationCourse).where(
+                    RegistrationCourse.registration_id == registration.id,
+                    RegistrationCourse.course_id == request.course_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_link is None:
+            self.db.add(RegistrationCourse(
+                registration_id=registration.id,
+                course_id=request.course_id,
+                section_id=section.id,
+                is_dropped=False,
+            ))
+        else:
+            existing_link.section_id = section.id
+            existing_link.is_dropped = False
+
+    async def _apply_drop(
+        self, request: AddDropRequest, registration: Registration,
+    ) -> None:
+        link = (
+            await self.db.execute(
+                select(RegistrationCourse).where(
+                    RegistrationCourse.registration_id == registration.id,
+                    RegistrationCourse.course_id == request.course_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if link is None:
+            raise InvalidAdjustmentRequestError(
+                "Cannot drop a course the student is not registered for."
+            )
+        if link.section_id is not None:
+            await self.agent.update_section_capacity(
+                self.db, link.section_id, AddDropAction.DROP,
+            )
+        link.is_dropped = True
+
+    # ── Officer override ────────────────────────────────────────
+
+    async def officer_override(
+        self,
+        request_id: uuid.UUID,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+        justification: str,
+    ) -> AddDropRequest:
+        """
+        Flip a DENIED request to OVERRIDDEN, then APPLIED. Officer
+        role is REGISTRAR_OFFICER, DEPARTMENT_HEAD, or ADMIN —
+        prerequisite-specific overrides go through a different audit
+        trail (PrerequisiteOverride) handled by the registration
+        service.
+        """
+        if officer_role not in {
+            UserRole.REGISTRAR_OFFICER, UserRole.ADMIN,
+        }:
+            raise UnauthorizedActorError(
+                "Only registrar officers or admins can override an add/drop request."
+            )
+        if not justification or not justification.strip():
+            raise InvalidAdjustmentRequestError(
+                "Override justification is required."
+            )
+
+        request = await self.requests.get(request_id)
+        if request is None:
+            raise EntityNotFoundError("AddDropRequest", str(request_id))
+        if request.status != AddDropRequestStatus.DENIED:
+            raise InvalidAdjustmentRequestError(
+                f"Cannot override request in status {request.status.value}; "
+                "only DENIED requests can be overridden."
+            )
+
+        registration = await self.registrations.get(request.registration_id)
+        if registration is None:
+            raise EntityNotFoundError(
+                "Registration", str(request.registration_id),
+            )
+
+        request.status = AddDropRequestStatus.OVERRIDDEN
+        request.override_by_id = officer_id
+        request.override_justification = justification.strip()
+        await self._apply_approved_change(request, registration)
+        request.status = AddDropRequestStatus.APPLIED
+
+        write_audit_log(
+            action="course.add_drop.officer_override",
+            actor_role=officer_role.value,
+            actor_id=officer_id,
+            resource_type="AddDropRequest",
+            resource_id=request.id,
+            decision=AddDropRequestStatus.APPLIED.value,
+            metadata={
+                "previous_reason": request.reason,
+                "justification": justification.strip(),
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(request)
+        return request
+
+    # ── Reads ───────────────────────────────────────────────────
+
+    async def get(self, request_id: uuid.UUID) -> Optional[AddDropRequest]:
+        return await self.requests.get(request_id)
+
+    async def list_for_registration(
+        self, registration_id: uuid.UUID,
+    ) -> list[AddDropRequest]:
+        return await self.requests.list_for_registration(registration_id)

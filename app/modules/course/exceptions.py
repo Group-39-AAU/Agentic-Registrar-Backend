@@ -63,3 +63,24 @@ class EntityNotFoundError(Exception):
         self.entity = entity
         self.entity_id = entity_id
         super().__init__(f"{entity} with id {entity_id} not found")
+
+
+class AdjustmentDeniedError(Exception):
+    """
+    Raised by AddDropService.submit_request when the
+    EnrollmentAdjustmentAgent blocks the request. Carries the
+    structured agent payload so the router can show plain-language
+    reasons against the request.
+    """
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        super().__init__("Add/drop request was denied by the adjustment agent.")
+
+
+class InvalidAdjustmentRequestError(Exception):
+    """Raised when an add/drop request is malformed for its target state."""
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
