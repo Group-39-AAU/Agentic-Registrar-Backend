@@ -28,6 +28,7 @@ from app.modules.course.models import (                                         
     Student, Instructor, InstructorAssignment, CourseManagementOfficer,
     Registration, RegistrationCourse, RegistrationStatusHistory,
     AddDropRequest, AdvisoryRecommendation, PrerequisiteOverride,
+    ScheduleConflict,
 )
 
 from app.modules.auth.router import router as auth_router

@@ -35,7 +35,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database.base import Base, SoftDeleteBase
 from app.shared.enums import (
     AddDropAction, AddDropRequestStatus, EnrollmentStatus, OfficerRole,
-    RegistrationStatus, RiskStatus, SponsorshipType,
+    RegistrationStatus, RiskStatus, ScheduleConflictStatus,
+    ScheduleConflictType, SponsorshipType,
 )
 
 
@@ -704,4 +705,69 @@ class PrerequisiteOverride(Base):
             "registration_id", "course_id",
             name="uq_prerequisite_override_per_course",
         ),
+    )
+
+
+# ── Track A — Scheduling Conflict Report ─────────────────────────
+
+
+class ScheduleConflict(Base):
+    """
+    Records a scheduling clash detected by the AcademicSchedulingAgent
+    that its auto-resolution heuristics could not fix on their own.
+    Used by the human-visible conflict report listed in the Track A
+    implementation checklist.
+
+    The agent writes one row per detected clash; the officer reviewing
+    the report flips ``status`` to RESOLVED_BY_OFFICER (with a
+    ``resolution_note``) once they have applied a manual fix.
+    """
+
+    __tablename__ = "schedule_conflicts"
+
+    term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("academic_terms.id"),
+        nullable=False,
+        index=True,
+    )
+    department: Mapped[str] = mapped_column(
+        String(100), nullable=False, index=True
+    )
+    conflict_type: Mapped[ScheduleConflictType] = mapped_column(
+        nullable=False, index=True
+    )
+    section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sections.id"), nullable=True,
+    )
+    other_section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sections.id"), nullable=True,
+    )
+    instructor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("instructors.id"), nullable=True,
+    )
+    time_slot: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True
+    )
+    room: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    detected_by_agent_id: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+    status: Mapped[ScheduleConflictStatus] = mapped_column(
+        nullable=False,
+        default=ScheduleConflictStatus.OPEN,
+        index=True,
+    )
+    resolution_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    resolved_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True,
+    )
+
+    term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
+    section: Mapped[Optional["Section"]] = relationship(
+        foreign_keys=[section_id], lazy="selectin",
+    )
+    other_section: Mapped[Optional["Section"]] = relationship(
+        foreign_keys=[other_section_id], lazy="selectin",
     )
