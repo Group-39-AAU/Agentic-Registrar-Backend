@@ -26,13 +26,21 @@ from app.modules.course.agents.curriculum_compliance_agent import (
     CurriculumComplianceAgent,
     MAX_CREDIT_LOAD_ECTS,
 )
+from app.modules.course.agents.enrollment_adjustment_agent import (
+    AdjustmentResult,
+    EnrollmentAdjustmentAgent,
+    MIN_CREDIT_LOAD_ECTS,
+)
 
 __all__ = [
     "AcademicSchedulingAgent",
+    "AdjustmentResult",
     "AllocationResult",
     "ComplianceCheckResult",
     "CourseBaseAgent",
     "CurriculumComplianceAgent",
+    "EnrollmentAdjustmentAgent",
     "MAX_CREDIT_LOAD_ECTS",
+    "MIN_CREDIT_LOAD_ECTS",
     "ScheduleArtefact",
 ]
