@@ -49,8 +49,15 @@ from app.modules.course.schemas import (
     RegistrationDraftCreate,
     RegistrationResponse,
     RegistrationSubmitResponse,
+    ScheduleConflictRead,
+    ScheduleGenerateRequest,
+    ScheduleGenerateResponse,
+    SectionTimetableEntry,
+    TimetableResponse,
 )
-from app.modules.course.service import RegistrationService, TermService
+from app.modules.course.service import (
+    RegistrationService, SchedulingService, TermService,
+)
 from app.shared.enums import UserRole
 
 
@@ -253,4 +260,96 @@ async def submit_registration(
     return RegistrationSubmitResponse(
         registration=RegistrationResponse.model_validate(registration),
         compliance=ComplianceResultResponse(**compliance),
+    )
+
+
+# ── Scheduling endpoints ─────────────────────────────────────────
+
+
+@router.post(
+    "/officer/schedule/generate",
+    response_model=ScheduleGenerateResponse,
+)
+async def officer_generate_schedule(
+    payload: ScheduleGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = SchedulingService(db)
+    try:
+        result = await svc.generate_schedule(
+            term_id=payload.term_id,
+            department=payload.department,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    return ScheduleGenerateResponse(**result)
+
+
+@router.get(
+    "/officer/schedule/conflicts",
+    response_model=list[ScheduleConflictRead],
+)
+async def officer_list_conflicts(
+    term_id: uuid.UUID,
+    department: str | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = SchedulingService(db)
+    try:
+        rows = await svc.list_open_conflicts(
+            term_id=term_id,
+            officer_role=current_user.role,
+            department=department,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    return rows
+
+
+@router.get(
+    "/me/timetable",
+    response_model=TimetableResponse,
+)
+async def get_my_timetable(
+    term_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    student = await _resolve_student(db, current_user)
+    svc = SchedulingService(db)
+    rows = await svc.get_student_timetable(student.id, term_id)
+    return TimetableResponse(
+        term_id=term_id,
+        entries=[SectionTimetableEntry(**r) for r in rows],
+    )
+
+
+@router.get(
+    "/instructors/{instructor_id}/timetable",
+    response_model=TimetableResponse,
+)
+async def get_instructor_timetable(
+    instructor_id: uuid.UUID,
+    term_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Read-only instructor timetable. Authorisation is permissive in
+    Phase 1: any authenticated user can view any instructor's
+    timetable. Tighten when role-aware instructor identity wiring
+    lands later.
+    """
+    del current_user  # auth confirmed by Depends; no role gate yet
+    svc = SchedulingService(db)
+    rows = await svc.get_instructor_timetable(instructor_id, term_id)
+    return TimetableResponse(
+        term_id=term_id,
+        entries=[SectionTimetableEntry(**r) for r in rows],
     )

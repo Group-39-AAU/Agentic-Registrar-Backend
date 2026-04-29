@@ -114,3 +114,55 @@ class RegistrationSubmitResponse(BaseModel):
     """Bundles the post-submit registration with the agent verdict."""
     registration: RegistrationResponse
     compliance: ComplianceResultResponse
+
+
+# ══════════════════════════════════════════════════════════════
+#  Scheduling — officer trigger + read views
+# ══════════════════════════════════════════════════════════════
+
+
+class ScheduleGenerateRequest(BaseModel):
+    """Officer payload for ``POST /officer/schedule/generate``."""
+    term_id: uuid.UUID
+    department: str = Field(..., min_length=1, max_length=100)
+
+
+class SectionTimetableEntry(BaseModel):
+    """One row in a student's or instructor's timetable view."""
+    section_id: uuid.UUID
+    course_code: str
+    course_title: str
+    section_code: str
+    room: Optional[str] = None
+    time_slot: Optional[str] = None
+    instructor_id: Optional[uuid.UUID] = None
+
+
+class TimetableResponse(BaseModel):
+    """Read-only timetable for a single actor."""
+    term_id: uuid.UUID
+    entries: list[SectionTimetableEntry] = Field(default_factory=list)
+
+
+class ScheduleConflictRead(BaseModel):
+    """Conflict-report row exposed to the officer."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    term_id: uuid.UUID
+    department: str
+    conflict_type: str
+    section_id: Optional[uuid.UUID] = None
+    other_section_id: Optional[uuid.UUID] = None
+    instructor_id: Optional[uuid.UUID] = None
+    time_slot: Optional[str] = None
+    room: Optional[str] = None
+    description: str
+    status: str
+    detected_by_agent_id: str
+
+
+class ScheduleGenerateResponse(BaseModel):
+    """Payload returned from the officer's generate endpoint."""
+    allocation: dict
+    schedule: dict
