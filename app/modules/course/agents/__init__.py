@@ -15,6 +15,11 @@ Every concrete agent extends :class:`CourseBaseAgent`, which itself
 extends :class:`app.ai.base.BaseAgent`.
 """
 
+from app.modules.course.agents.academic_advisory_agent import (
+    AcademicAdvisoryAgent,
+    Advice,
+    GapAnalysis,
+)
 from app.modules.course.agents.academic_scheduling_agent import (
     AcademicSchedulingAgent,
     AllocationResult,
@@ -33,13 +38,16 @@ from app.modules.course.agents.enrollment_adjustment_agent import (
 )
 
 __all__ = [
+    "AcademicAdvisoryAgent",
     "AcademicSchedulingAgent",
     "AdjustmentResult",
+    "Advice",
     "AllocationResult",
     "ComplianceCheckResult",
     "CourseBaseAgent",
     "CurriculumComplianceAgent",
     "EnrollmentAdjustmentAgent",
+    "GapAnalysis",
     "MAX_CREDIT_LOAD_ECTS",
     "MIN_CREDIT_LOAD_ECTS",
     "ScheduleArtefact",
