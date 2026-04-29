@@ -29,13 +29,15 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_email_service
 from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.course.exceptions import (
+    AdjustmentDeniedError,
     ComplianceCheckFailedError,
     DuplicateRegistrationError,
     EntityNotFoundError,
+    InvalidAdjustmentRequestError,
     InvalidStateTransitionError,
     RegistrationWindowClosedError,
     UnauthorizedActorError,
@@ -43,6 +45,9 @@ from app.modules.course.exceptions import (
 from app.modules.course.repository import StudentRepository
 from app.modules.course.schemas import (
     AcademicTermResponse,
+    AddDropOverrideRequest,
+    AddDropRequestCreate,
+    AddDropRequestResponse,
     ComplianceResultResponse,
     CourseResponse,
     RegistrationCourseAdd,
@@ -56,8 +61,9 @@ from app.modules.course.schemas import (
     TimetableResponse,
 )
 from app.modules.course.service import (
-    RegistrationService, SchedulingService, TermService,
+    AddDropService, RegistrationService, SchedulingService, TermService,
 )
+from app.shared.email.service import EmailService
 from app.shared.enums import UserRole
 
 
@@ -353,3 +359,124 @@ async def get_instructor_timetable(
         term_id=term_id,
         entries=[SectionTimetableEntry(**r) for r in rows],
     )
+
+
+# ── Add/Drop endpoints ───────────────────────────────────────────
+
+
+@router.post(
+    "/add-drop/requests",
+    response_model=AddDropRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def submit_add_drop_request(
+    payload: AddDropRequestCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
+):
+    student = await _resolve_student(db, current_user)
+
+    # Confirm the registration belongs to the calling student.
+    svc = AddDropService(db, email_service=email_service)
+    registration = await svc.registrations.get(payload.registration_id)
+    if registration is None or registration.student_id != student.id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Registration not found."
+        )
+
+    try:
+        request = await svc.submit_request(
+            registration_id=payload.registration_id,
+            course_id=payload.course_id,
+            action=payload.action,
+            deadline=payload.deadline,
+            student_user_id=current_user.id,
+            target_section_id=payload.target_section_id,
+        )
+    except AdjustmentDeniedError as exc:
+        # 422 carries the agent verdict so the portal can show
+        # plain-language reasons against the failed request.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"compliance": exc.payload},
+        )
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    return request
+
+
+@router.get(
+    "/add-drop/requests/{request_id}",
+    response_model=AddDropRequestResponse,
+)
+async def get_add_drop_request(
+    request_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = AddDropService(db)
+    request = await svc.get(request_id)
+    if request is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Add/drop request not found."
+        )
+    # Owner OR officer may read.
+    if current_user.role not in {
+        UserRole.REGISTRAR_OFFICER, UserRole.ADMIN,
+    }:
+        student = await _resolve_student(db, current_user)
+        registration = await svc.registrations.get(request.registration_id)
+        if registration is None or registration.student_id != student.id:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "Add/drop request not found."
+            )
+    return request
+
+
+@router.get(
+    "/registrations/{registration_id}/add-drop-requests",
+    response_model=list[AddDropRequestResponse],
+)
+async def list_add_drop_requests(
+    registration_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    student = await _resolve_student(db, current_user)
+    svc = AddDropService(db)
+    registration = await svc.registrations.get(registration_id)
+    if registration is None or registration.student_id != student.id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Registration not found."
+        )
+    return await svc.list_for_registration(registration_id)
+
+
+@router.post(
+    "/officer/add-drop/{request_id}/override",
+    response_model=AddDropRequestResponse,
+)
+async def officer_override_add_drop(
+    request_id: uuid.UUID,
+    payload: AddDropOverrideRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
+):
+    svc = AddDropService(db, email_service=email_service)
+    try:
+        return await svc.officer_override(
+            request_id=request_id,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+            justification=payload.justification,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
