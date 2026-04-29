@@ -204,6 +204,31 @@ class AddDropRequestStatus(str, Enum):
     APPLIED = "APPLIED"
 
 
+class ScheduleConflictType(str, Enum):
+    """
+    Kinds of clashes the AcademicSchedulingAgent surfaces when its
+    auto-resolution heuristics cannot place a section cleanly.
+
+    Mapped to SDS Table 84 by usage:
+        ROOM_DOUBLE_BOOKED       — two sections, same (time_slot, room)
+        INSTRUCTOR_DOUBLE_BOOKED — two sections, same instructor, same slot
+        NO_AVAILABLE_ROOM        — no inventory room satisfies capacity
+        NO_AVAILABLE_INSTRUCTOR  — department has no free instructor
+    """
+    ROOM_DOUBLE_BOOKED = "ROOM_DOUBLE_BOOKED"
+    INSTRUCTOR_DOUBLE_BOOKED = "INSTRUCTOR_DOUBLE_BOOKED"
+    NO_AVAILABLE_ROOM = "NO_AVAILABLE_ROOM"
+    NO_AVAILABLE_INSTRUCTOR = "NO_AVAILABLE_INSTRUCTOR"
+
+
+class ScheduleConflictStatus(str, Enum):
+    """Lifecycle of a ScheduleConflict row from detection to closure."""
+    OPEN = "OPEN"
+    RESOLVED_BY_AGENT = "RESOLVED_BY_AGENT"
+    RESOLVED_BY_OFFICER = "RESOLVED_BY_OFFICER"
+    DISMISSED = "DISMISSED"
+
+
 class AcademicStatusType(str, Enum):
     """
     Per-term academic standing assigned by AcademicStandingAgent

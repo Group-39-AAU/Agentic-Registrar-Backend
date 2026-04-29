@@ -46,6 +46,7 @@ from app.modules.course.models import (                                 # noqa: 
     Student, Instructor, InstructorAssignment, CourseManagementOfficer,
     Registration, RegistrationCourse, RegistrationStatusHistory,
     AddDropRequest, AdvisoryRecommendation, PrerequisiteOverride,
+    ScheduleConflict,
 )
 
 from app.database.base import Base
