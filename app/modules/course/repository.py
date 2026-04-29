@@ -127,3 +127,34 @@ class RegistrationRepository:
                 )
             )
         ).scalar_one_or_none()
+
+
+class AddDropRequestRepository:
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get(self, request_id: uuid.UUID):
+        from app.modules.course.models import AddDropRequest
+        return (
+            await self.db.execute(
+                select(AddDropRequest).where(
+                    AddDropRequest.id == request_id,
+                    AddDropRequest.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def list_for_registration(
+        self, registration_id: uuid.UUID,
+    ):
+        from app.modules.course.models import AddDropRequest
+        return list(
+            (
+                await self.db.execute(
+                    select(AddDropRequest).where(
+                        AddDropRequest.registration_id == registration_id,
+                        AddDropRequest.is_deleted == False,  # noqa: E712
+                    )
+                )
+            ).scalars().all()
+        )
