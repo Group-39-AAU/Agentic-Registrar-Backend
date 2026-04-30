@@ -15,8 +15,8 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, RegistrationStatus, RiskStatus,
-    SponsorshipType,
+    AddDropAction, AddDropRequestStatus, EnrollmentStatus, RegistrationStatus,
+    RiskStatus, SponsorshipType,
 )
 
 
@@ -246,3 +246,25 @@ class AdvisoryRecommendationRead(BaseModel):
 class AdvisoryReviewCloseRequest(BaseModel):
     """Officer payload for closing an advisory HITL review."""
     review_notes: str = Field(..., min_length=3, max_length=4000)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Bridge: admission Enrollment → course-management Student
+# ══════════════════════════════════════════════════════════════
+
+
+class StudentOnboardRequest(BaseModel):
+    """Officer payload for onboarding a Student from an Enrollment row."""
+    enrollment_id: uuid.UUID
+
+
+class StudentResponse(BaseModel):
+    """Read view of a Student row."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    user_id: uuid.UUID
+    student_id: str
+    full_name: str
+    current_semester: int
+    enrollment_status: EnrollmentStatus

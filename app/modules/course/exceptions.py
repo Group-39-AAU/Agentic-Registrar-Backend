@@ -84,3 +84,13 @@ class InvalidAdjustmentRequestError(Exception):
     def __init__(self, detail: str) -> None:
         self.detail = detail
         super().__init__(detail)
+
+
+class StudentAlreadyOnboardedError(Exception):
+    """Raised when an Enrollment has already been bridged to a Student row."""
+
+    def __init__(self, student_id: str) -> None:
+        self.student_id = student_id
+        super().__init__(
+            f"A Student record already exists for student_id={student_id}"
+        )

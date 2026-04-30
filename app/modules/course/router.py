@@ -40,6 +40,7 @@ from app.modules.course.exceptions import (
     InvalidAdjustmentRequestError,
     InvalidStateTransitionError,
     RegistrationWindowClosedError,
+    StudentAlreadyOnboardedError,
     UnauthorizedActorError,
 )
 from app.modules.course.repository import StudentRepository
@@ -61,10 +62,12 @@ from app.modules.course.schemas import (
     ScheduleGenerateRequest,
     ScheduleGenerateResponse,
     SectionTimetableEntry,
+    StudentOnboardRequest,
+    StudentResponse,
     TimetableResponse,
 )
 from app.modules.course.service import (
-    AddDropService, AdvisoryService, RegistrationService,
+    AddDropService, AdvisoryService, OnboardingService, RegistrationService,
     SchedulingService, TermService,
 )
 from app.shared.email.service import EmailService
@@ -579,6 +582,37 @@ async def list_high_risk_advisory_queue(
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+
+
+@router.post(
+    "/officer/students/onboard-from-enrollment",
+    response_model=StudentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def officer_onboard_student_from_enrollment(
+    payload: StudentOnboardRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Bridges an admission Enrollment row into a course-management
+    Student row so the admitted student can use the Track A
+    endpoints. Officer-only (REGISTRAR_OFFICER or ADMIN). Idempotent:
+    409 if a Student already exists for the Enrollment's user.
+    """
+    svc = OnboardingService(db)
+    try:
+        return await svc.onboard_student_from_enrollment(
+            enrollment_id=payload.enrollment_id,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except StudentAlreadyOnboardedError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
 
 
 @router.post(

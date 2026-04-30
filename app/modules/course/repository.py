@@ -74,6 +74,16 @@ class StudentRepository:
             )
         ).scalar_one_or_none()
 
+    async def get_by_student_id(self, student_id: str) -> Optional[Student]:
+        return (
+            await self.db.execute(
+                select(Student).where(
+                    Student.student_id == student_id,
+                    Student.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+
 
 class RegistrationRepository:
     def __init__(self, db: AsyncSession) -> None:
