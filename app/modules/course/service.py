@@ -40,6 +40,7 @@ from app.modules.course.exceptions import (
     InvalidAdjustmentRequestError,
     InvalidStateTransitionError,
     RegistrationWindowClosedError,
+    StudentAlreadyOnboardedError,
     UnauthorizedActorError,
 )
 from app.modules.course.models import (
@@ -53,8 +54,8 @@ from app.modules.course.repository import (
     RegistrationRepository, StudentRepository,
 )
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, RegistrationStatus, RiskStatus,
-    SponsorshipType, UserRole,
+    AddDropAction, AddDropRequestStatus, EnrollmentStatus, RegistrationStatus,
+    RiskStatus, SponsorshipType, UserRole,
 )
 
 logger = get_logger("course.service")
@@ -1156,3 +1157,88 @@ class AdvisoryService:
         self, student_id: uuid.UUID,
     ) -> list[AdvisoryRecommendation]:
         return await self.recommendations.list_for_student(student_id)
+
+
+class OnboardingService:
+    """
+    Bridges the undergraduate admission module's Enrollment row to a
+    course-management Student row. Without this, an admitted student
+    has a User account + an Enrollment record but no Student profile,
+    so they cannot use any of the Track A endpoints.
+
+    Phase-1 contract: officer-triggered (REGISTRAR_OFFICER or ADMIN)
+    via POST /api/v1/courses/officer/students/onboard-from-enrollment.
+    Phase-2 will replace this with an event-bus subscription on an
+    EnrollmentCompletedEvent published by the admission Enrollment Agent.
+
+    Idempotent: re-running for an Enrollment whose Student already
+    exists raises StudentAlreadyOnboardedError carrying the existing
+    student_id, which the router maps to 409.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+        self.students = StudentRepository(db)
+
+    async def onboard_student_from_enrollment(
+        self,
+        enrollment_id: uuid.UUID,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+    ) -> Student:
+        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+            raise UnauthorizedActorError(
+                "Only registrar officers or admins can onboard a student "
+                "from an Enrollment record."
+            )
+
+        # Resolve the Enrollment row.
+        from app.modules.undergraduate.enrollment.models import Enrollment
+        enrollment = (
+            await self.db.execute(
+                select(Enrollment).where(Enrollment.id == enrollment_id)
+            )
+        ).scalar_one_or_none()
+        if enrollment is None:
+            raise EntityNotFoundError("Enrollment", str(enrollment_id))
+
+        # Idempotency: if a Student already exists for this user, surface
+        # it as a conflict rather than creating a duplicate.
+        existing = await self.students.get_by_user_id(enrollment.applicant_id)
+        if existing is not None:
+            raise StudentAlreadyOnboardedError(existing.student_id)
+
+        # Pull display name from the User row.
+        from app.modules.auth.models import User
+        user = await self.db.get(User, enrollment.applicant_id)
+        if user is None:
+            raise EntityNotFoundError("User", str(enrollment.applicant_id))
+        full_name = f"{user.first_name} {user.last_name}".strip() or user.email
+
+        student = Student(
+            user_id=enrollment.applicant_id,
+            student_id=enrollment.university_id,
+            full_name=full_name,
+            current_semester=1,                    # fresh admit
+            enrollment_status=EnrollmentStatus.ACTIVE,
+        )
+        self.db.add(student)
+        await self.db.flush()
+
+        write_audit_log(
+            action="course.student.onboarded_from_enrollment",
+            actor_role=officer_role.value,
+            actor_id=officer_id,
+            resource_type="Student",
+            resource_id=student.id,
+            decision="created",
+            metadata={
+                "enrollment_id": str(enrollment_id),
+                "university_id": enrollment.university_id,
+                "department": enrollment.department,
+                "section": enrollment.section,
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(student)
+        return student
