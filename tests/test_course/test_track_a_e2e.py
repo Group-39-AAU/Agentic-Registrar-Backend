@@ -166,7 +166,7 @@ async def test_full_registration_lifecycle_reaches_REGISTERED(
     )
 
     finalised, compliance = await reg_service.submit(
-        reg.id, student_user_id=uuid.uuid4(),
+        reg.id, student_user_id=seeded_student.user_id,
     )
     assert finalised.status == RegistrationStatus.REGISTERED
     assert compliance["overall_passed"] is True
@@ -184,7 +184,7 @@ async def test_payment_missing_lands_in_PAYMENT_HOLD(
     )
 
     finalised, compliance = await reg_service.submit(
-        reg.id, student_user_id=uuid.uuid4(),
+        reg.id, student_user_id=seeded_student.user_id,
     )
     assert finalised.status == RegistrationStatus.PAYMENT_HOLD
     assert compliance["payment_result"]["passed"] is False
@@ -207,7 +207,7 @@ async def test_schedule_generation_populates_student_timetable(
     isolated_pay_mock.set_payment_status(
         seeded_student.id, cs_catalog["CS101"]["course"].id, paid=True,
     )
-    await reg_service.submit(reg.id, student_user_id=uuid.uuid4())
+    await reg_service.submit(reg.id, student_user_id=seeded_student.user_id)
 
     # Before generation: timetable empty (section_id null)
     before = await sched_service.get_student_timetable(
@@ -273,7 +273,7 @@ async def test_add_then_drop_round_trip(
         )
 
     finalised, _ = await reg_service.submit(
-        reg.id, student_user_id=uuid.uuid4(),
+        reg.id, student_user_id=seeded_student.user_id,
     )
     assert finalised.status == RegistrationStatus.REGISTERED
 
@@ -304,7 +304,7 @@ async def test_add_then_drop_round_trip(
         course_id=add_target.id,
         action=AddDropAction.ADD,
         deadline=date(2099, 1, 1),
-        student_user_id=uuid.uuid4(),
+        student_user_id=seeded_student.user_id,
     )
     assert add_request.status == AddDropRequestStatus.APPLIED
 
@@ -314,7 +314,7 @@ async def test_add_then_drop_round_trip(
         course_id=add_target.id,
         action=AddDropAction.DROP,
         deadline=date(2099, 1, 1),
-        student_user_id=uuid.uuid4(),
+        student_user_id=seeded_student.user_id,
     )
     assert drop_request.status == AddDropRequestStatus.APPLIED
 
@@ -324,7 +324,7 @@ async def test_add_then_drop_round_trip(
 
 async def test_high_risk_advisory_routes_to_officer_queue_and_closes(
     async_session, advisory_service,
-    seeded_student, open_term, cs_catalog,
+    seeded_student, seeded_officer, open_term, cs_catalog,
 ):
     rec = await advisory_service.evaluate_plan(
         student_id=seeded_student.id,
@@ -344,7 +344,7 @@ async def test_high_risk_advisory_routes_to_officer_queue_and_closes(
     await advisory_service.close_officer_review(
         recommendation_id=rec.id,
         officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=uuid.uuid4(),
+        officer_id=seeded_officer.user_id,
         review_notes="Met with student; advised lighter load.",
     )
 
@@ -377,7 +377,7 @@ async def test_prereq_failure_bounces_back_and_student_resubmits(
     )
 
     with pytest.raises(ComplianceCheckFailedError):
-        await reg_service.submit(reg.id, student_user_id=uuid.uuid4())
+        await reg_service.submit(reg.id, student_user_id=seeded_student.user_id)
 
     bounced = await reg_service.registrations.get(reg.id)
     assert bounced.status == RegistrationStatus.REGISTRATION_OPEN
@@ -394,6 +394,6 @@ async def test_prereq_failure_bounces_back_and_student_resubmits(
     )
 
     finalised, _ = await reg_service.submit(
-        reg.id, student_user_id=uuid.uuid4(),
+        reg.id, student_user_id=seeded_student.user_id,
     )
     assert finalised.status == RegistrationStatus.REGISTERED

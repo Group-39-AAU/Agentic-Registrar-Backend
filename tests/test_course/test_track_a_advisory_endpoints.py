@@ -87,7 +87,8 @@ async def test_low_risk_evaluation_does_not_appear_in_officer_queue(
 
 
 async def test_officer_close_review_drains_queue_and_records_notes(
-    async_session, advisory_service, seeded_student, seeded_term, cs_courses,
+    async_session, advisory_service, seeded_student, seeded_officer,
+    seeded_term, cs_courses,
 ):
     rec = await advisory_service.evaluate_plan(
         student_id=seeded_student.id,
@@ -104,7 +105,7 @@ async def test_officer_close_review_drains_queue_and_records_notes(
     closed = await advisory_service.close_officer_review(
         recommendation_id=rec.id,
         officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=uuid.uuid4(),
+        officer_id=seeded_officer.user_id,
         review_notes="Met with student; advised dropping CS201 to lower load.",
     )
     assert closed.reviewed_at is not None

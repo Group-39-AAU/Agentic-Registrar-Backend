@@ -149,22 +149,22 @@ async def test_list_high_risk_open_rejects_student_role(
 
 
 async def test_close_officer_review_marks_reviewed(
-    async_session, advisory_service, seeded_student, seeded_term, cs_curriculum,
+    async_session, advisory_service, seeded_student, seeded_officer,
+    seeded_term, cs_curriculum,
 ):
     rec = await advisory_service.evaluate_plan(
         student_id=seeded_student.id, term_id=seeded_term.id,
         proposed_course_ids=[cs_curriculum["CS101"].id],
         cgpa=1.7, completed_course_ids=set(),
     )
-    officer_id = uuid.uuid4()
     closed = await advisory_service.close_officer_review(
         recommendation_id=rec.id,
         officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=officer_id,
+        officer_id=seeded_officer.user_id,
         review_notes="Reviewed; advised manual reduction of load.",
     )
     assert closed.reviewed_at is not None
-    assert closed.reviewed_by_id == officer_id
+    assert closed.reviewed_by_id == seeded_officer.user_id
     assert closed.review_notes.startswith("Reviewed")
 
     # No longer appears in the open queue
@@ -209,7 +209,8 @@ async def test_close_officer_review_rejects_empty_notes(
 
 
 async def test_close_officer_review_rejects_double_close(
-    advisory_service, seeded_student, seeded_term, cs_curriculum,
+    advisory_service, seeded_student, seeded_officer,
+    seeded_term, cs_curriculum,
 ):
     rec = await advisory_service.evaluate_plan(
         student_id=seeded_student.id, term_id=seeded_term.id,
@@ -219,14 +220,14 @@ async def test_close_officer_review_rejects_double_close(
     await advisory_service.close_officer_review(
         recommendation_id=rec.id,
         officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=uuid.uuid4(),
+        officer_id=seeded_officer.user_id,
         review_notes="First review",
     )
     with pytest.raises(InvalidAdjustmentRequestError):
         await advisory_service.close_officer_review(
             recommendation_id=rec.id,
             officer_role=UserRole.REGISTRAR_OFFICER,
-            officer_id=uuid.uuid4(),
+            officer_id=seeded_officer.user_id,
             review_notes="Second close",
         )
 

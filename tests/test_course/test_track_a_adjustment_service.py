@@ -287,7 +287,7 @@ async def test_submit_rejects_non_REGISTERED_registration(
 
 async def test_officer_override_flips_DENIED_to_APPLIED(
     async_session, add_drop_service, registration_at_floor, cs_courses,
-    cs_offerings_and_sections,
+    cs_offerings_and_sections, seeded_student, seeded_officer,
 ):
     with pytest.raises(AdjustmentDeniedError):
         await add_drop_service.submit_request(
@@ -295,7 +295,7 @@ async def test_officer_override_flips_DENIED_to_APPLIED(
             course_id=cs_courses[0].id,
             action=AddDropAction.DROP,
             deadline=date(2099, 1, 1),
-            student_user_id=uuid.uuid4(),
+            student_user_id=seeded_student.user_id,
         )
     await async_session.commit()
 
@@ -308,15 +308,14 @@ async def test_officer_override_flips_DENIED_to_APPLIED(
     ).scalar_one()
     assert denied.status == AddDropRequestStatus.DENIED
 
-    officer_id = uuid.uuid4()
     overridden = await add_drop_service.officer_override(
         request_id=denied.id,
         officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=officer_id,
+        officer_id=seeded_officer.user_id,
         justification="medical exemption documented in case file 2026-04-29",
     )
     assert overridden.status == AddDropRequestStatus.APPLIED
-    assert overridden.override_by_id == officer_id
+    assert overridden.override_by_id == seeded_officer.user_id
     assert overridden.override_justification.startswith("medical exemption")
 
 
