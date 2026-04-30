@@ -33,3 +33,13 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Silence the known pytest-asyncio + aiosqlite teardown warning where the
+# aiosqlite worker thread tries to push results onto an event loop that
+# pytest-asyncio has already closed. The result of the test run is not
+# affected; the warning just clutters output.
+filterwarnings = [
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning",
+]
+

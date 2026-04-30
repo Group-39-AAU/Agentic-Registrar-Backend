@@ -31,8 +31,8 @@ from app.shared.enums import (
 # ── Fixtures ─────────────────────────────────────────────────────
 
 
-@pytest_asyncio.fixture
-async def sched_service(async_session) -> SchedulingService:
+@pytest.fixture
+def sched_service(async_session) -> SchedulingService:
     """Service injected with a deterministic agent_id for log assertions."""
     agent = AcademicSchedulingAgent(agent_id="AGENT_ASA_TEST")
     return SchedulingService(async_session, scheduling_agent=agent)

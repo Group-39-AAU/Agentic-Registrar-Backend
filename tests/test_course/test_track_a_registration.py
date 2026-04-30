@@ -69,13 +69,13 @@ async def cs_chain_with_payments(async_session) -> dict[str, Course]:
     return {"CS101": cs101, "CS201": cs201}
 
 
-@pytest_asyncio.fixture
-async def isolated_pay_mock() -> PayMock:
+@pytest.fixture
+def isolated_pay_mock() -> PayMock:
     return PayMock()
 
 
-@pytest_asyncio.fixture
-async def reg_service(async_session, isolated_pay_mock):
+@pytest.fixture
+def reg_service(async_session, isolated_pay_mock):
     agent = CurriculumComplianceAgent(
         agent_id="AGENT_CCA_TEST",
         payment_service=isolated_pay_mock,

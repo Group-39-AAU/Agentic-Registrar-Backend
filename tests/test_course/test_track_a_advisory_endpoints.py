@@ -26,8 +26,8 @@ from app.shared.enums import RiskStatus, UserRole
 # ── Fixtures ────────────────────────────────────────────────────
 
 
-@pytest_asyncio.fixture
-async def advisory_service(async_session) -> AdvisoryService:
+@pytest.fixture
+def advisory_service(async_session) -> AdvisoryService:
     agent = AcademicAdvisoryAgent(agent_id="AGENT_AAA_TEST")
     return AdvisoryService(async_session, advisory_agent=agent)
 
