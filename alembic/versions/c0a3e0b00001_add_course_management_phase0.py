@@ -67,24 +67,18 @@ _RISK_STATUS = ("LOW", "MEDIUM", "HIGH")
 
 
 def upgrade() -> None:
-    # ── 1. Pre-create the ENUM types that are NOT yet referenced by a
-    #       Phase-0 column but will be needed by Track A/B/C migrations.
-    #       Creating them here keeps all course-management types in one
-    #       place and avoids name collisions later.
+    # NOTE: We intentionally do NOT pre-create the eight enum types that
+    # are only referenced by Track A/B/C tables. SQLAlchemy's
+    # ``create_type=False`` flag is unreliable in alembic
+    # ``op.create_table`` contexts — the table-create still fires the
+    # enum's ``before_create`` listener, which calls ``CREATE TYPE`` and
+    # collides with the pre-created instance. Each track creates the
+    # enums it needs, defining each enum object once and reusing the
+    # same instance across its tables (SQLAlchemy memoises by identity).
+    #
+    # The two enums actually used by Phase-0 columns (enrollmentstatus,
+    # officerrole) are auto-created by their respective table columns.
     bind = op.get_bind()
-
-    sa.Enum(*_REGISTRATION_STATUS, name="registrationstatus").create(bind, checkfirst=True)
-    sa.Enum(*_GRADE_LETTER, name="gradeletter").create(bind, checkfirst=True)
-    sa.Enum(*_GRADE_SUBMISSION_STATUS, name="gradesubmissionstatus").create(bind, checkfirst=True)
-    sa.Enum(*_ACADEMIC_STATUS_TYPE, name="academicstatustype").create(bind, checkfirst=True)
-    sa.Enum(*_EXCEPTION_STATUS, name="exceptionstatus").create(bind, checkfirst=True)
-    sa.Enum(*_AGENT_STATUS, name="agentstatus").create(bind, checkfirst=True)
-    sa.Enum(*_ADD_DROP_ACTION, name="adddropaction").create(bind, checkfirst=True)
-    sa.Enum(*_RISK_STATUS, name="riskstatus").create(bind, checkfirst=True)
-
-    # The two enums actually used by Phase-0 columns are NOT pre-created
-    # here — sa.Column(sa.Enum(..., name=...)) will create them as part
-    # of CREATE TABLE.
 
     # ── 2. academic_terms ────────────────────────────────────────
     op.create_table(
@@ -314,17 +308,8 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_academic_terms_term_name"), table_name="academic_terms")
     op.drop_table("academic_terms")
 
-    # Drop ENUM types
-    for enum_name in (
-        "officerrole",
-        "enrollmentstatus",
-        "riskstatus",
-        "adddropaction",
-        "agentstatus",
-        "exceptionstatus",
-        "academicstatustype",
-        "gradesubmissionstatus",
-        "gradeletter",
-        "registrationstatus",
-    ):
+    # Drop the ENUM types created by Phase-0 columns. The other enums
+    # (registrationstatus, gradeletter, etc.) are created by their
+    # respective track migrations and dropped on those downgrades.
+    for enum_name in ("officerrole", "enrollmentstatus"):
         sa.Enum(name=enum_name).drop(bind, checkfirst=True)
