@@ -81,7 +81,16 @@ class PayMock:
         """Wipe all entries. Tests call this in fixture teardown."""
         self._payment_status_map.clear()
 
-    def __len__(self) -> int:
+    @property
+    def entry_count(self) -> int:
+        """
+        Number of (student, course) entries currently held. Exposed
+        as a property rather than ``__len__`` because making PayMock
+        sized would render an empty instance falsy — and several
+        agent constructors use ``payment_service or pay_mock`` as a
+        fallback, which would silently route empty test PayMocks to
+        the module-level singleton.
+        """
         return len(self._payment_status_map)
 
 
