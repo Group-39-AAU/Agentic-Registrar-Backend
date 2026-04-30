@@ -158,3 +158,50 @@ class AddDropRequestRepository:
                 )
             ).scalars().all()
         )
+
+
+class AdvisoryRecommendationRepository:
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get(self, recommendation_id: uuid.UUID):
+        from app.modules.course.models import AdvisoryRecommendation
+        return (
+            await self.db.execute(
+                select(AdvisoryRecommendation).where(
+                    AdvisoryRecommendation.id == recommendation_id,
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def list_for_student(
+        self, student_id: uuid.UUID,
+    ):
+        from app.modules.course.models import AdvisoryRecommendation
+        return list(
+            (
+                await self.db.execute(
+                    select(AdvisoryRecommendation).where(
+                        AdvisoryRecommendation.student_id == student_id,
+                    ).order_by(AdvisoryRecommendation.created_at.desc())
+                )
+            ).scalars().all()
+        )
+
+    async def list_high_risk_open(
+        self, term_id: uuid.UUID,
+    ):
+        from app.modules.course.models import AdvisoryRecommendation
+        from app.shared.enums import RiskStatus
+        return list(
+            (
+                await self.db.execute(
+                    select(AdvisoryRecommendation).where(
+                        AdvisoryRecommendation.term_id == term_id,
+                        AdvisoryRecommendation.risk_status == RiskStatus.HIGH,
+                        AdvisoryRecommendation.requires_officer_review == True,  # noqa: E712
+                        AdvisoryRecommendation.reviewed_at.is_(None),
+                    ).order_by(AdvisoryRecommendation.created_at.asc())
+                )
+            ).scalars().all()
+        )
