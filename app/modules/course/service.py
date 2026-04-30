@@ -29,8 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger, write_audit_log
 from app.modules.course.agents import (
-    AcademicSchedulingAgent, CurriculumComplianceAgent,
-    EnrollmentAdjustmentAgent,
+    AcademicAdvisoryAgent, AcademicSchedulingAgent, Advice,
+    CurriculumComplianceAgent, EnrollmentAdjustmentAgent,
 )
 from app.modules.course.exceptions import (
     AdjustmentDeniedError,
@@ -43,16 +43,17 @@ from app.modules.course.exceptions import (
     UnauthorizedActorError,
 )
 from app.modules.course.models import (
-    AcademicTerm, AddDropRequest, Course, CourseOffering, Instructor,
-    Registration, RegistrationCourse, RegistrationStatusHistory,
-    ScheduleConflict, Section, Student,
+    AcademicTerm, AddDropRequest, AdvisoryRecommendation, Course,
+    CourseOffering, Instructor, Registration, RegistrationCourse,
+    RegistrationStatusHistory, ScheduleConflict, Section, Student,
 )
 from app.modules.course.repository import (
-    AcademicTermRepository, AddDropRequestRepository, CourseRepository,
+    AcademicTermRepository, AddDropRequestRepository,
+    AdvisoryRecommendationRepository, CourseRepository,
     RegistrationRepository, StudentRepository,
 )
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, RegistrationStatus,
+    AddDropAction, AddDropRequestStatus, RegistrationStatus, RiskStatus,
     SponsorshipType, UserRole,
 )
 
@@ -939,3 +940,219 @@ class AddDropService:
         self, registration_id: uuid.UUID,
     ) -> list[AddDropRequest]:
         return await self.requests.list_for_registration(registration_id)
+
+
+class AdvisoryService:
+    """
+    Persists AcademicAdvisoryAgent verdicts as AdvisoryRecommendation
+    rows and exposes the HIGH-risk officer-review queue.
+
+    Phase-1 contract: the calling service supplies ``cgpa`` and
+    ``completed_course_ids`` because there is no Grade model yet
+    (Track B). Once Track B lands, those inputs will be derived
+    from the grade history.
+    """
+
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        advisory_agent: Optional[AcademicAdvisoryAgent] = None,
+    ) -> None:
+        self.db = db
+        self.recommendations = AdvisoryRecommendationRepository(db)
+        self.terms = AcademicTermRepository(db)
+        self.registrations = RegistrationRepository(db)
+        self.students = StudentRepository(db)
+        self.agent = advisory_agent or AcademicAdvisoryAgent()
+
+    # ── evaluate_plan ───────────────────────────────────────────
+
+    async def evaluate_plan(
+        self,
+        student_id: uuid.UUID,
+        term_id: uuid.UUID,
+        proposed_course_ids: list[uuid.UUID],
+        *,
+        cgpa: float,
+        completed_course_ids: Optional[set[uuid.UUID]] = None,
+    ) -> AdvisoryRecommendation:
+        """
+        Run the AcademicAdvisoryAgent against the proposed plan,
+        persist the verdict as an AdvisoryRecommendation row, and
+        return it. HIGH-risk verdicts land with
+        ``requires_officer_review=True`` so the officer queue picks
+        them up immediately.
+        """
+        term = await self.terms.get(term_id)
+        if term is None:
+            raise EntityNotFoundError("AcademicTerm", str(term_id))
+
+        student = (
+            await self.db.execute(
+                select(Student).where(Student.id == student_id)
+            )
+        ).scalar_one_or_none()
+        if student is None:
+            raise EntityNotFoundError("Student", str(student_id))
+
+        # Resolve total proposed credits from the catalog.
+        total_credits = 0
+        if proposed_course_ids:
+            rows = (
+                await self.db.execute(
+                    select(Course).where(
+                        Course.id.in_(proposed_course_ids),
+                        Course.is_deleted == False,  # noqa: E712
+                    )
+                )
+            ).scalars().all()
+            total_credits = sum(c.credit_hours for c in rows)
+
+        # Phase-1 default: use the catalog department of the first
+        # proposed course, falling back to "Computer Science" if
+        # nothing is proposed yet.
+        department = await self._resolve_department(student, proposed_course_ids)
+
+        advice: Advice = await self.agent.process_task({
+            "session": self.db,
+            "department": department,
+            "current_semester": student.current_semester,
+            "cgpa": cgpa,
+            "total_proposed_credits": total_credits,
+            "completed_course_ids": completed_course_ids or set(),
+        })
+
+        recommendation = AdvisoryRecommendation(
+            student_id=student_id,
+            term_id=term_id,
+            risk_status=advice.risk_status,
+            risk_explanation=advice.explanation,
+            proposed_courses=[str(cid) for cid in proposed_course_ids],
+            recommended_courses=advice.recommended_courses,
+            gap_analysis=advice.gap_analysis.to_dict(),
+            requires_officer_review=advice.requires_officer_review,
+        )
+        self.db.add(recommendation)
+        await self.db.flush()
+
+        write_audit_log(
+            action="course.advisory.evaluated",
+            actor_role=UserRole.AGENT.value,
+            actor_id=None,
+            resource_type="AdvisoryRecommendation",
+            resource_id=recommendation.id,
+            decision=advice.risk_status.value,
+            metadata={
+                "agent_id": self.agent.agent_id,
+                "requires_officer_review": advice.requires_officer_review,
+                "total_proposed_credits": total_credits,
+                "cgpa": cgpa,
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(recommendation)
+        return recommendation
+
+    async def _resolve_department(
+        self, student: Student, proposed_course_ids: list[uuid.UUID],
+    ) -> str:
+        """
+        Pick the department to evaluate against. The Phase-1
+        Student entity carries no department field, so we read it
+        from the first proposed course; if the student proposed
+        nothing yet, fall back to the first known department in
+        the catalog so the gap analysis still has something to
+        ground in.
+        """
+        if proposed_course_ids:
+            first_course = (
+                await self.db.execute(
+                    select(Course).where(Course.id == proposed_course_ids[0])
+                )
+            ).scalar_one_or_none()
+            if first_course is not None:
+                return first_course.department
+        any_course = (
+            await self.db.execute(
+                select(Course).where(
+                    Course.is_deleted == False  # noqa: E712
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        return any_course.department if any_course else "Unknown"
+
+    # ── Officer review queue ────────────────────────────────────
+
+    async def list_high_risk_open(
+        self,
+        term_id: uuid.UUID,
+        officer_role: UserRole,
+    ) -> list[AdvisoryRecommendation]:
+        if officer_role not in {
+            UserRole.REGISTRAR_OFFICER, UserRole.ADMIN,
+        }:
+            raise UnauthorizedActorError(
+                "Only registrar officers or admins can view the "
+                "advisory officer-review queue."
+            )
+        return await self.recommendations.list_high_risk_open(term_id)
+
+    async def close_officer_review(
+        self,
+        recommendation_id: uuid.UUID,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+        review_notes: str,
+    ) -> AdvisoryRecommendation:
+        if officer_role not in {
+            UserRole.REGISTRAR_OFFICER, UserRole.ADMIN,
+        }:
+            raise UnauthorizedActorError(
+                "Only registrar officers or admins can close an "
+                "advisory review."
+            )
+        if not review_notes or not review_notes.strip():
+            raise InvalidAdjustmentRequestError(
+                "Review notes are required to close an advisory review."
+            )
+        recommendation = await self.recommendations.get(recommendation_id)
+        if recommendation is None:
+            raise EntityNotFoundError(
+                "AdvisoryRecommendation", str(recommendation_id),
+            )
+        if recommendation.reviewed_at is not None:
+            raise InvalidAdjustmentRequestError(
+                "Advisory recommendation has already been reviewed."
+            )
+        recommendation.reviewed_by_id = officer_id
+        recommendation.reviewed_at = datetime.now(timezone.utc)
+        recommendation.review_notes = review_notes.strip()
+
+        write_audit_log(
+            action="course.advisory.review_closed",
+            actor_role=officer_role.value,
+            actor_id=officer_id,
+            resource_type="AdvisoryRecommendation",
+            resource_id=recommendation.id,
+            decision="reviewed",
+            metadata={
+                "risk_status": recommendation.risk_status.value,
+                "notes_length": len(recommendation.review_notes or ""),
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(recommendation)
+        return recommendation
+
+    # ── Reads ───────────────────────────────────────────────────
+
+    async def get(
+        self, recommendation_id: uuid.UUID,
+    ) -> Optional[AdvisoryRecommendation]:
+        return await self.recommendations.get(recommendation_id)
+
+    async def list_for_student(
+        self, student_id: uuid.UUID,
+    ) -> list[AdvisoryRecommendation]:
+        return await self.recommendations.list_for_student(student_id)

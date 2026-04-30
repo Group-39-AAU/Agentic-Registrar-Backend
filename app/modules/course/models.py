@@ -623,13 +623,18 @@ class AddDropRequest(SoftDeleteBase):
 class AdvisoryRecommendation(Base):
     """
     Persisted snapshot of an AcademicAdvisoryAgent verdict (SDS
-    Table 69). Immutable so the officer reviewing an add/drop
-    request can see exactly what advice the student was given at
-    advice-time, even after the curriculum has moved on.
+    Table 69). The advisory content (proposed_courses,
+    recommended_courses, gap_analysis, risk_status, risk_explanation)
+    is the immutable snapshot — once the agent has spoken, those
+    fields don't change. The officer-review fields are mutable and
+    track whether a HIGH-risk verdict has been reviewed.
 
     ``proposed_courses``       — list of course UUIDs the student asked about
-    ``recommended_courses``    — list of course UUIDs the agent suggests next
+    ``recommended_courses``    — agent's prioritised next-step suggestions
     ``gap_analysis``           — completed-vs-remaining structured payload
+    ``requires_officer_review`` — agent flagged this for HITL review
+    ``reviewed_by_id``         — officer who closed the review
+    ``reviewed_at`` / ``review_notes`` — review-closure metadata
     """
 
     __tablename__ = "advisory_recommendations"
@@ -646,7 +651,7 @@ class AdvisoryRecommendation(Base):
         nullable=False,
         index=True,
     )
-    risk_status: Mapped[RiskStatus] = mapped_column(nullable=False)
+    risk_status: Mapped[RiskStatus] = mapped_column(nullable=False, index=True)
     risk_explanation: Mapped[str] = mapped_column(Text, nullable=False)
     proposed_courses: Mapped[list] = mapped_column(
         JSON, nullable=False, default=list
@@ -657,6 +662,18 @@ class AdvisoryRecommendation(Base):
     gap_analysis: Mapped[dict] = mapped_column(
         JSON, nullable=False, default=dict
     )
+
+    # Officer-review fields (HITL escalation gate for HIGH risk).
+    requires_officer_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, index=True,
+    )
+    reviewed_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True,
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    review_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     student: Mapped["Student"] = relationship(lazy="selectin")
     term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
