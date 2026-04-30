@@ -197,7 +197,7 @@ async def test_submit_happy_path_reaches_REGISTERED(
     )
 
     finalised, compliance = await reg_service.submit(
-        reg.id, student_user_id=uuid.uuid4(),
+        reg.id, student_user_id=seeded_student.user_id,
     )
     assert finalised.status == RegistrationStatus.REGISTERED
     assert finalised.finalised_at is not None
@@ -219,7 +219,7 @@ async def test_submit_with_payment_missing_lands_in_PAYMENT_HOLD(
     )
 
     finalised, compliance = await reg_service.submit(
-        reg.id, student_user_id=uuid.uuid4(),
+        reg.id, student_user_id=seeded_student.user_id,
     )
     assert finalised.status == RegistrationStatus.PAYMENT_HOLD
     assert compliance["overall_passed"] is False
@@ -246,7 +246,7 @@ async def test_submit_with_missing_prereq_returns_to_REGISTRATION_OPEN(
     )
 
     with pytest.raises(ComplianceCheckFailedError) as exc_info:
-        await reg_service.submit(reg.id, student_user_id=uuid.uuid4())
+        await reg_service.submit(reg.id, student_user_id=seeded_student.user_id)
 
     payload = exc_info.value.payload
     assert payload["overall_passed"] is False
@@ -274,7 +274,7 @@ async def test_submit_writes_status_history_for_every_transition(
     isolated_pay_mock.set_payment_status(
         seeded_student.id, cs_chain_with_payments["CS101"].id, paid=True,
     )
-    await reg_service.submit(reg.id, student_user_id=uuid.uuid4())
+    await reg_service.submit(reg.id, student_user_id=seeded_student.user_id)
 
     history = (
         await async_session.execute(

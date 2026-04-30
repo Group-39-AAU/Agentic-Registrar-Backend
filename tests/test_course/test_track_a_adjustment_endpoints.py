@@ -181,7 +181,7 @@ async def test_no_email_when_email_service_not_injected(
 
 async def test_email_sent_after_officer_override(
     async_session, add_drop_service, recording_email,
-    registration_at_floor, cs_courses,
+    registration_at_floor, cs_courses, seeded_student, seeded_officer,
 ):
     from app.modules.course.exceptions import AdjustmentDeniedError
     with pytest.raises(AdjustmentDeniedError):
@@ -190,7 +190,7 @@ async def test_email_sent_after_officer_override(
             course_id=cs_courses[0].id,
             action=AddDropAction.DROP,
             deadline=date(2099, 1, 1),
-            student_user_id=uuid.uuid4(),
+            student_user_id=seeded_student.user_id,
         )
     await async_session.commit()
     assert recording_email.sent == []     # no email on denial
@@ -206,7 +206,7 @@ async def test_email_sent_after_officer_override(
     await add_drop_service.officer_override(
         request_id=denied.id,
         officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=uuid.uuid4(),
+        officer_id=seeded_officer.user_id,
         justification="medical exemption documented",
     )
     assert len(recording_email.sent) == 1   # one email fired on override
