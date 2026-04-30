@@ -714,8 +714,12 @@ class PrerequisiteOverride(Base):
     )
     justification: Mapped[str] = mapped_column(Text, nullable=False)
 
-    registration: Mapped["Registration"] = relationship(lazy="selectin")
-    course: Mapped["Course"] = relationship(lazy="selectin")
+    registration: Mapped["Registration"] = relationship(
+        foreign_keys=[registration_id], lazy="selectin",
+    )
+    course: Mapped["Course"] = relationship(
+        foreign_keys=[course_id], lazy="selectin",
+    )
 
     __table_args__ = (
         UniqueConstraint(

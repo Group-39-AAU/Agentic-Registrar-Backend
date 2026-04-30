@@ -268,3 +268,28 @@ class StudentResponse(BaseModel):
     full_name: str
     current_semester: int
     enrollment_status: EnrollmentStatus
+
+
+# ══════════════════════════════════════════════════════════════
+#  Department-Head prerequisite override (SRS §3.5)
+# ══════════════════════════════════════════════════════════════
+
+
+class PrerequisiteOverrideRequest(BaseModel):
+    """
+    Department Head's payload to bypass the prereq check for a
+    single (registration, course) pair.
+    """
+    course_id: uuid.UUID
+    justification: str = Field(..., min_length=3, max_length=4000)
+
+
+class PrerequisiteOverrideResponse(BaseModel):
+    """Read view of a PrerequisiteOverride row."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    registration_id: uuid.UUID
+    course_id: uuid.UUID
+    granted_by_id: uuid.UUID
+    justification: str

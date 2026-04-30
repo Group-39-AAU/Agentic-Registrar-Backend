@@ -44,8 +44,9 @@ from app.modules.course.exceptions import (
     UnauthorizedActorError,
 )
 from app.modules.course.models import (
-    AcademicTerm, AddDropRequest, AdvisoryRecommendation, Course,
-    CourseOffering, Instructor, Registration, RegistrationCourse,
+    AcademicTerm, AddDropRequest, AdvisoryRecommendation,
+    CourseManagementOfficer, Course, CourseOffering, Instructor,
+    PrerequisiteOverride, Registration, RegistrationCourse,
     RegistrationStatusHistory, ScheduleConflict, Section, Student,
 )
 from app.modules.course.repository import (
@@ -54,8 +55,8 @@ from app.modules.course.repository import (
     RegistrationRepository, StudentRepository,
 )
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, EnrollmentStatus, RegistrationStatus,
-    RiskStatus, SponsorshipType, UserRole,
+    AddDropAction, AddDropRequestStatus, EnrollmentStatus, OfficerRole,
+    RegistrationStatus, RiskStatus, SponsorshipType, UserRole,
 )
 
 logger = get_logger("course.service")
@@ -389,11 +390,24 @@ class RegistrationService:
             reason="student submitted",
         )
 
-        # 2. Run the CurriculumComplianceAgent.
+        # 2. Resolve any prerequisite overrides for this registration so
+        # the agent can skip prereq checks for the overridden courses
+        # (SRS §3.5 Department-Head bypass).
+        override_rows = (
+            await self.db.execute(
+                select(PrerequisiteOverride.course_id).where(
+                    PrerequisiteOverride.registration_id == registration.id,
+                )
+            )
+        ).scalars().all()
+        overridden_course_ids = set(override_rows)
+
+        # 3. Run the CurriculumComplianceAgent.
         compliance = await self.compliance_agent.process_task({
             "session": self.db,
             "registration": registration,
             "completed_course_ids": completed_course_ids or set(),
+            "overridden_course_ids": overridden_course_ids,
         })
 
         prereq_passed = all(p["passed"] for p in compliance["prereq_results"])
@@ -449,6 +463,101 @@ class RegistrationService:
         await self.db.commit()
         await self.db.refresh(registration, attribute_names=["courses"])
         return registration, compliance
+
+    # ── Department-Head prerequisite override (SRS §3.5) ─────────
+
+    async def grant_prerequisite_override(
+        self,
+        registration_id: uuid.UUID,
+        course_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
+        justification: str,
+    ) -> PrerequisiteOverride:
+        """
+        Records a Department-Head bypass of the
+        CurriculumComplianceAgent's prerequisite verdict.
+
+        Authorisation: SRS §3.5 inverse requirement and SDS Table 62
+        require role==DEPARTMENT_HEAD on the
+        CourseManagementOfficer row — the auth-level User.role
+        (REGISTRAR_OFFICER) is necessary but not sufficient. The
+        check looks up the officer's CourseManagementOfficer row by
+        user_id and rejects anything other than DEPARTMENT_HEAD.
+
+        Idempotent on (registration_id, course_id) per the model's
+        UniqueConstraint — a duplicate raises
+        InvalidAdjustmentRequestError so the calling officer sees a
+        clean reason rather than a 500.
+        """
+        if not justification or not justification.strip():
+            raise InvalidAdjustmentRequestError(
+                "Override justification is required."
+            )
+
+        # Officer-level check: must be a Department Head.
+        officer = (
+            await self.db.execute(
+                select(CourseManagementOfficer).where(
+                    CourseManagementOfficer.user_id == officer_user_id,
+                    CourseManagementOfficer.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
+            raise UnauthorizedActorError(
+                "Only a Department Head may grant a prerequisite "
+                "override (SRS §3.5)."
+            )
+
+        # Resolve the registration + course so 404s are clean.
+        registration = await self.registrations.get(registration_id)
+        if registration is None:
+            raise EntityNotFoundError("Registration", str(registration_id))
+        course = await self.courses.get(course_id)
+        if course is None:
+            raise EntityNotFoundError("Course", str(course_id))
+
+        # Idempotency: explicit pre-check so we surface a clean error.
+        existing = (
+            await self.db.execute(
+                select(PrerequisiteOverride).where(
+                    PrerequisiteOverride.registration_id == registration_id,
+                    PrerequisiteOverride.course_id == course_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            raise InvalidAdjustmentRequestError(
+                f"A prerequisite override already exists for course "
+                f"{course.code} on this registration."
+            )
+
+        override = PrerequisiteOverride(
+            registration_id=registration_id,
+            course_id=course_id,
+            granted_by_id=officer_user_id,
+            justification=justification.strip(),
+        )
+        self.db.add(override)
+        await self.db.flush()
+
+        write_audit_log(
+            action="course.prerequisite.override_granted",
+            actor_role=UserRole.REGISTRAR_OFFICER.value,
+            actor_id=officer_user_id,
+            resource_type="Registration",
+            resource_id=registration_id,
+            decision="granted",
+            metadata={
+                "course_id": str(course_id),
+                "course_code": course.code,
+                "officer_role": OfficerRole.DEPARTMENT_HEAD.value,
+                "justification_length": len(override.justification),
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(override)
+        return override
 
 
 class SchedulingService:

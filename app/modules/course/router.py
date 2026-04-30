@@ -62,6 +62,8 @@ from app.modules.course.schemas import (
     ScheduleGenerateRequest,
     ScheduleGenerateResponse,
     SectionTimetableEntry,
+    PrerequisiteOverrideRequest,
+    PrerequisiteOverrideResponse,
     StudentOnboardRequest,
     StudentResponse,
     TimetableResponse,
@@ -582,6 +584,52 @@ async def list_high_risk_advisory_queue(
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+
+
+@router.post(
+    "/officer/registrations/{registration_id}/prerequisite-override",
+    response_model=PrerequisiteOverrideResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def department_head_grant_prerequisite_override(
+    registration_id: uuid.UUID,
+    payload: PrerequisiteOverrideRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Department-Head-only endpoint to bypass the prerequisite check
+    for a single (registration, course) pair per SRS §3.5 inverse
+    requirement.
+
+    Authorisation: ``current_user.role`` must be REGISTRAR_OFFICER
+    or ADMIN at the auth layer (rejects pure students), AND the
+    user must have a CourseManagementOfficer row with
+    role=DEPARTMENT_HEAD. Plain registrar officers get 403.
+
+    Once granted, the override is consulted by the
+    CurriculumComplianceAgent on the next submit; the prereq check
+    skips for the overridden course.
+    """
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only registrar officers or admins can grant prerequisite overrides.",
+        )
+    svc = RegistrationService(db)
+    try:
+        return await svc.grant_prerequisite_override(
+            registration_id=registration_id,
+            course_id=payload.course_id,
+            officer_user_id=current_user.id,
+            justification=payload.justification,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
 
 
 @router.post(

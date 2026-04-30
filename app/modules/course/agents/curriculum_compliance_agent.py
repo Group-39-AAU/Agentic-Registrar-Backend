@@ -97,6 +97,7 @@ class CurriculumComplianceAgent(CourseBaseAgent):
         student_id: uuid.UUID,
         course_id: uuid.UUID,
         completed_course_ids: set[uuid.UUID],
+        overridden_course_ids: Optional[set[uuid.UUID]] = None,
     ) -> ComplianceCheckResult:
         """
         Returns ``passed=True`` iff every CoursePrerequisite of
@@ -104,11 +105,26 @@ class CurriculumComplianceAgent(CourseBaseAgent):
         ``reasons`` list contains one line per missing prerequisite,
         keyed by course code for human readability.
 
+        ``overridden_course_ids`` carries the set of courses for which
+        a Department Head has granted a prerequisite bypass per SRS
+        §3.5. If ``course_id`` is in that set, this check returns
+        passed=True with a flag in ``details`` so the audit log knows
+        the verdict came from an override rather than a clean pass.
+
         The ``student_id`` parameter is here so the audit log can
         attribute the check to a student even though the underlying
         rule does not branch on student identity.
         """
         del student_id  # used only by audit-log callers
+
+        if overridden_course_ids and course_id in overridden_course_ids:
+            return ComplianceCheckResult(
+                passed=True,
+                details={
+                    "course_id": str(course_id),
+                    "via_prerequisite_override": True,
+                },
+            )
 
         prereqs = (
             await session.execute(
@@ -242,6 +258,11 @@ class CurriculumComplianceAgent(CourseBaseAgent):
             registration: Registration (with .courses eagerly loaded)
             completed_course_ids: set[uuid.UUID]
 
+        Optional keys:
+            overridden_course_ids: set[uuid.UUID] — courses with an
+                active PrerequisiteOverride; the prereq check skips
+                these (SRS §3.5 Department-Head bypass).
+
         Returns:
             {
                 "overall_passed": bool,
@@ -258,6 +279,9 @@ class CurriculumComplianceAgent(CourseBaseAgent):
         completed: set[uuid.UUID] = input_data.get(
             "completed_course_ids", set()
         )
+        overridden: set[uuid.UUID] = input_data.get(
+            "overridden_course_ids", set()
+        )
 
         active_course_ids = [
             rc.course_id for rc in registration.courses if not rc.is_dropped
@@ -267,6 +291,7 @@ class CurriculumComplianceAgent(CourseBaseAgent):
         for cid in active_course_ids:
             r = await self.verify_prerequisites(
                 session, registration.student_id, cid, completed,
+                overridden_course_ids=overridden,
             )
             prereq_results.append((cid, r))
         prereq_passed = all(r.passed for _, r in prereq_results)
