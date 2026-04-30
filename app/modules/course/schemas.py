@@ -15,7 +15,8 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, RegistrationStatus, SponsorshipType,
+    AddDropAction, AddDropRequestStatus, RegistrationStatus, RiskStatus,
+    SponsorshipType,
 )
 
 
@@ -203,3 +204,45 @@ class AddDropRequestResponse(BaseModel):
 class AddDropOverrideRequest(BaseModel):
     """Officer override payload."""
     justification: str = Field(..., min_length=3, max_length=4000)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Advisory
+# ══════════════════════════════════════════════════════════════
+
+
+class AdvisoryEvaluateRequest(BaseModel):
+    """
+    Student payload for ``POST /advisory/evaluate``.
+
+    Phase-1 note: ``cgpa`` and ``completed_course_ids`` come from
+    the caller because there is no Grade model yet. When Track B
+    lands these fields will become server-resolved.
+    """
+    term_id: uuid.UUID
+    proposed_course_ids: list[uuid.UUID] = Field(default_factory=list)
+    cgpa: float = Field(..., ge=0.0, le=4.0)
+    completed_course_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class AdvisoryRecommendationRead(BaseModel):
+    """Read view of an AdvisoryRecommendation row."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    student_id: uuid.UUID
+    term_id: uuid.UUID
+    risk_status: RiskStatus
+    risk_explanation: str
+    proposed_courses: list = Field(default_factory=list)
+    recommended_courses: list = Field(default_factory=list)
+    gap_analysis: dict = Field(default_factory=dict)
+    requires_officer_review: bool
+    reviewed_by_id: Optional[uuid.UUID] = None
+    reviewed_at: Optional[datetime] = None
+    review_notes: Optional[str] = None
+
+
+class AdvisoryReviewCloseRequest(BaseModel):
+    """Officer payload for closing an advisory HITL review."""
+    review_notes: str = Field(..., min_length=3, max_length=4000)

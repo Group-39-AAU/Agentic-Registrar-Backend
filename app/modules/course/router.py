@@ -48,6 +48,9 @@ from app.modules.course.schemas import (
     AddDropOverrideRequest,
     AddDropRequestCreate,
     AddDropRequestResponse,
+    AdvisoryEvaluateRequest,
+    AdvisoryRecommendationRead,
+    AdvisoryReviewCloseRequest,
     ComplianceResultResponse,
     CourseResponse,
     RegistrationCourseAdd,
@@ -61,7 +64,8 @@ from app.modules.course.schemas import (
     TimetableResponse,
 )
 from app.modules.course.service import (
-    AddDropService, RegistrationService, SchedulingService, TermService,
+    AddDropService, AdvisoryService, RegistrationService,
+    SchedulingService, TermService,
 )
 from app.shared.email.service import EmailService
 from app.shared.enums import UserRole
@@ -473,6 +477,127 @@ async def officer_override_add_drop(
             officer_role=current_user.role,
             officer_id=current_user.id,
             justification=payload.justification,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+# ── Advisory endpoints ───────────────────────────────────────────
+
+
+@router.post(
+    "/advisory/evaluate",
+    response_model=AdvisoryRecommendationRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def evaluate_advisory_plan(
+    payload: AdvisoryEvaluateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Student-triggered advisory evaluation. Persists an
+    AdvisoryRecommendation row and returns the agent's verdict.
+    HIGH-risk verdicts auto-flag for officer review (the row appears
+    in the officer queue immediately).
+    """
+    student = await _resolve_student(db, current_user)
+    svc = AdvisoryService(db)
+    try:
+        return await svc.evaluate_plan(
+            student_id=student.id,
+            term_id=payload.term_id,
+            proposed_course_ids=payload.proposed_course_ids,
+            cgpa=payload.cgpa,
+            completed_course_ids=set(payload.completed_course_ids),
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.get(
+    "/advisory/me/recommendations",
+    response_model=list[AdvisoryRecommendationRead],
+)
+async def list_my_advisory_recommendations(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    student = await _resolve_student(db, current_user)
+    svc = AdvisoryService(db)
+    return await svc.list_for_student(student.id)
+
+
+@router.get(
+    "/advisory/recommendations/{recommendation_id}",
+    response_model=AdvisoryRecommendationRead,
+)
+async def get_advisory_recommendation(
+    recommendation_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = AdvisoryService(db)
+    rec = await svc.get(recommendation_id)
+    if rec is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Advisory recommendation not found."
+        )
+    # Owner OR officer may read.
+    if current_user.role not in {
+        UserRole.REGISTRAR_OFFICER, UserRole.ADMIN,
+    }:
+        student = await _resolve_student(db, current_user)
+        if rec.student_id != student.id:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "Advisory recommendation not found.",
+            )
+    return rec
+
+
+@router.get(
+    "/officer/advisory/high-risk",
+    response_model=list[AdvisoryRecommendationRead],
+)
+async def list_high_risk_advisory_queue(
+    term_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer-only queue of pending HIGH-risk advisory verdicts.
+    """
+    svc = AdvisoryService(db)
+    try:
+        return await svc.list_high_risk_open(
+            term_id=term_id, officer_role=current_user.role,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+
+
+@router.post(
+    "/officer/advisory/{recommendation_id}/close",
+    response_model=AdvisoryRecommendationRead,
+)
+async def officer_close_advisory_review(
+    recommendation_id: uuid.UUID,
+    payload: AdvisoryReviewCloseRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    svc = AdvisoryService(db)
+    try:
+        return await svc.close_officer_review(
+            recommendation_id=recommendation_id,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+            review_notes=payload.review_notes,
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
