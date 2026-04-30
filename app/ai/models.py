@@ -5,7 +5,7 @@ AI Evaluation and Execution Trace models.
 import uuid
 from typing import Optional
 
-from sqlalchemy import Boolean, Float, ForeignKey, String, Text
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -56,11 +56,16 @@ class AIExecutionTrace(Base):
     )
     step_name: Mapped[str] = mapped_column(String(100), nullable=False)
     reasoning_log: Mapped[str] = mapped_column(Text, nullable=False)
+    # Cross-DB types: JSONB on Postgres, JSON on SQLite for test create_all.
     rag_references: Mapped[dict] = mapped_column(
-        JSONB, server_default="{}", nullable=False
+        JSON().with_variant(JSONB(), "postgresql"),
+        server_default="{}",
+        nullable=False,
     )
     token_usage: Mapped[dict] = mapped_column(
-        JSONB, server_default="{}", nullable=False
+        JSON().with_variant(JSONB(), "postgresql"),
+        server_default="{}",
+        nullable=False,
     )
 
     # ── Relationships ──

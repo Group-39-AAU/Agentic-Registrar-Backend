@@ -83,7 +83,10 @@ class CurriculumComplianceAgent(CourseBaseAgent):
         max_credit_load: int = MAX_CREDIT_LOAD_ECTS,
     ) -> None:
         super().__init__(agent_id=agent_id or f"{self.AGENT_ID_PREFIX}DEFAULT")
-        self._pay = payment_service or pay_mock
+        # Explicit `is None` rather than `or` — a caller-supplied PayMock
+        # could legitimately be empty, and `or` would silently fall back
+        # to the module singleton, breaking test isolation.
+        self._pay = payment_service if payment_service is not None else pay_mock
         self._max_credit_load = max_credit_load
 
     # ── verify_prerequisites (SDS Table 66) ──────────────────────

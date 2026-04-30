@@ -6,7 +6,7 @@ national exam results. The credential verification agent cross-checks
 uploaded certificates against these records.
 """
 
-from sqlalchemy import Float, Integer, String
+from sqlalchemy import JSON, Float, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -27,8 +27,10 @@ class MoeStudentRecord(Base):
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     exam_year: Mapped[int] = mapped_column(Integer, nullable=False)
     stream: Mapped[StreamType] = mapped_column(nullable=False)
+    # Cross-DB type: JSONB on Postgres (production), JSON on SQLite (tests).
     subjects: Mapped[dict] = mapped_column(
-        JSONB, nullable=False,
-        comment='{"Physics": 85, "Math": 92, "English": 78, ...}'
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        comment='{"Physics": 85, "Math": 92, "English": 78, ...}',
     )
     total_score: Mapped[float] = mapped_column(Float, nullable=False)
