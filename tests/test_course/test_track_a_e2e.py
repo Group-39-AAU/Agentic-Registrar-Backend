@@ -54,8 +54,8 @@ from app.shared.enums import (
 # ── Shared fixtures ──────────────────────────────────────────────
 
 
-@pytest_asyncio.fixture
-async def isolated_pay_mock() -> PayMock:
+@pytest.fixture
+def isolated_pay_mock() -> PayMock:
     return PayMock()
 
 
@@ -110,8 +110,8 @@ async def cs_catalog(async_session, open_term, seeded_instructor):
     return offerings_sections
 
 
-@pytest_asyncio.fixture
-async def reg_service(async_session, isolated_pay_mock):
+@pytest.fixture
+def reg_service(async_session, isolated_pay_mock):
     agent = CurriculumComplianceAgent(
         agent_id="AGENT_CCA_E2E",
         payment_service=isolated_pay_mock,
@@ -119,8 +119,8 @@ async def reg_service(async_session, isolated_pay_mock):
     return RegistrationService(async_session, compliance_agent=agent)
 
 
-@pytest_asyncio.fixture
-async def add_drop_service(async_session, isolated_pay_mock):
+@pytest.fixture
+def add_drop_service(async_session, isolated_pay_mock):
     agent = EnrollmentAdjustmentAgent(
         agent_id="AGENT_EAA_E2E",
         payment_service=isolated_pay_mock,
@@ -128,14 +128,14 @@ async def add_drop_service(async_session, isolated_pay_mock):
     return AddDropService(async_session, adjustment_agent=agent)
 
 
-@pytest_asyncio.fixture
-async def sched_service(async_session):
+@pytest.fixture
+def sched_service(async_session):
     agent = AcademicSchedulingAgent(agent_id="AGENT_ASA_E2E")
     return SchedulingService(async_session, scheduling_agent=agent)
 
 
-@pytest_asyncio.fixture
-async def advisory_service(async_session):
+@pytest.fixture
+def advisory_service(async_session):
     agent = AcademicAdvisoryAgent(agent_id="AGENT_AAA_E2E")
     return AdvisoryService(async_session, advisory_agent=agent)
 

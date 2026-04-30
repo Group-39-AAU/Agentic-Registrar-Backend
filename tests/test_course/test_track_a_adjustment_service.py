@@ -34,13 +34,13 @@ from app.shared.enums import (
 # ── Fixtures ─────────────────────────────────────────────────────
 
 
-@pytest_asyncio.fixture
-async def isolated_pay_mock() -> PayMock:
+@pytest.fixture
+def isolated_pay_mock() -> PayMock:
     return PayMock()
 
 
-@pytest_asyncio.fixture
-async def add_drop_service(async_session, isolated_pay_mock) -> AddDropService:
+@pytest.fixture
+def add_drop_service(async_session, isolated_pay_mock) -> AddDropService:
     agent = EnrollmentAdjustmentAgent(
         agent_id="AGENT_EAA_TEST",
         payment_service=isolated_pay_mock,

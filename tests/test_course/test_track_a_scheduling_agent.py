@@ -32,8 +32,8 @@ from app.shared.enums import (
 # ── Fixtures ─────────────────────────────────────────────────────
 
 
-@pytest_asyncio.fixture
-async def scheduling_agent() -> AcademicSchedulingAgent:
+@pytest.fixture
+def scheduling_agent() -> AcademicSchedulingAgent:
     return AcademicSchedulingAgent(agent_id="AGENT_ASA_TEST")
 
 

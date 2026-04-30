@@ -32,14 +32,14 @@ from app.shared.enums import (
 # ── Fixtures specific to compliance-agent tests ─────────────────
 
 
-@pytest_asyncio.fixture
-async def isolated_pay_mock() -> PayMock:
+@pytest.fixture
+def isolated_pay_mock() -> PayMock:
     """A per-test PayMock instance — never share the singleton."""
     return PayMock()
 
 
-@pytest_asyncio.fixture
-async def compliance_agent(isolated_pay_mock) -> CurriculumComplianceAgent:
+@pytest.fixture
+def compliance_agent(isolated_pay_mock) -> CurriculumComplianceAgent:
     return CurriculumComplianceAgent(
         agent_id="AGENT_CCA_TEST",
         payment_service=isolated_pay_mock,

@@ -46,18 +46,18 @@ class _RecordingEmailService:
 # ── Fixtures ────────────────────────────────────────────────────
 
 
-@pytest_asyncio.fixture
-async def isolated_pay_mock() -> PayMock:
+@pytest.fixture
+def isolated_pay_mock() -> PayMock:
     return PayMock()
 
 
-@pytest_asyncio.fixture
-async def recording_email() -> _RecordingEmailService:
+@pytest.fixture
+def recording_email() -> _RecordingEmailService:
     return _RecordingEmailService()
 
 
-@pytest_asyncio.fixture
-async def add_drop_service(
+@pytest.fixture
+def add_drop_service(
     async_session, isolated_pay_mock, recording_email,
 ) -> AddDropService:
     agent = EnrollmentAdjustmentAgent(
