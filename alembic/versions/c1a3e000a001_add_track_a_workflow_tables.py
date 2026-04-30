@@ -69,10 +69,50 @@ _SCHEDULE_CONFLICT_STATUS = (
 def upgrade() -> None:
     bind = op.get_bind()
 
-    # ── 1. Create the three new ENUM types ───────────────────────
-    sa.Enum(*_ADD_DROP_REQUEST_STATUS, name="adddroprequeststatus").create(bind, checkfirst=True)
-    sa.Enum(*_SCHEDULE_CONFLICT_TYPE, name="scheduleconflicttype").create(bind, checkfirst=True)
-    sa.Enum(*_SCHEDULE_CONFLICT_STATUS, name="scheduleconflictstatus").create(bind, checkfirst=True)
+    # ── 1. Define each ENUM type ONCE as a postgresql.ENUM instance ──
+    # We use postgresql.ENUM (not sa.Enum) so create_type=False is
+    # preserved through SQLAlchemy's adapt_emulated_to_native — sa.Enum
+    # drops the flag during adaptation, which causes duplicate-CREATE-TYPE
+    # errors at op.create_table time. We also reuse the same instance
+    # across multiple columns so SQLAlchemy's _on_table_create memo
+    # short-circuits the second-and-later CREATEs.
+    registration_status = postgresql.ENUM(
+        *_REGISTRATION_STATUS, name="registrationstatus", create_type=False,
+    )
+    add_drop_action = postgresql.ENUM(
+        *_ADD_DROP_ACTION, name="adddropaction", create_type=False,
+    )
+    risk_status = postgresql.ENUM(
+        *_RISK_STATUS, name="riskstatus", create_type=False,
+    )
+    sponsorship_type = postgresql.ENUM(
+        *_SPONSORSHIP_TYPE, name="sponsorshiptype", create_type=False,
+    )
+    add_drop_request_status = postgresql.ENUM(
+        *_ADD_DROP_REQUEST_STATUS, name="adddroprequeststatus", create_type=False,
+    )
+    schedule_conflict_type = postgresql.ENUM(
+        *_SCHEDULE_CONFLICT_TYPE, name="scheduleconflicttype", create_type=False,
+    )
+    schedule_conflict_status = postgresql.ENUM(
+        *_SCHEDULE_CONFLICT_STATUS, name="scheduleconflictstatus", create_type=False,
+    )
+
+    # Pre-create the enums Track A introduces. Pre-existing types from
+    # earlier migrations (registrationstatus, adddropaction, riskstatus,
+    # sponsorshiptype) are NOT pre-created here — they were either created
+    # by phase2_schema (sponsorshiptype) or, after this migration drop
+    # of Phase 0's pre-creation, do not yet exist. checkfirst=True keeps
+    # the calls idempotent regardless.
+    for enum_obj in (
+        registration_status,
+        add_drop_action,
+        risk_status,
+        add_drop_request_status,
+        schedule_conflict_type,
+        schedule_conflict_status,
+    ):
+        enum_obj.create(bind, checkfirst=True)
 
     # ── 2. registrations ─────────────────────────────────────────
     op.create_table(
@@ -80,15 +120,11 @@ def upgrade() -> None:
         sa.Column("student_id", sa.UUID(as_uuid=True), nullable=False),
         sa.Column("term_id", sa.UUID(as_uuid=True), nullable=False),
         sa.Column(
-            "status",
-            sa.Enum(*_REGISTRATION_STATUS, name="registrationstatus", create_type=False),
-            nullable=False,
-            server_default="REGISTRATION_OPEN",
+            "status", registration_status,
+            nullable=False, server_default="REGISTRATION_OPEN",
         ),
         sa.Column(
-            "sponsorship_type",
-            sa.Enum(*_SPONSORSHIP_TYPE, name="sponsorshiptype", create_type=False),
-            nullable=False,
+            "sponsorship_type", sponsorship_type, nullable=False,
         ),
         sa.Column("payment_reference", sa.String(length=255), nullable=True),
         sa.Column("finalised_at", postgresql.TIMESTAMP(timezone=True), nullable=True),
@@ -133,16 +169,8 @@ def upgrade() -> None:
     op.create_table(
         "registration_status_history",
         sa.Column("registration_id", sa.UUID(as_uuid=True), nullable=False),
-        sa.Column(
-            "previous_status",
-            sa.Enum(*_REGISTRATION_STATUS, name="registrationstatus", create_type=False),
-            nullable=True,
-        ),
-        sa.Column(
-            "new_status",
-            sa.Enum(*_REGISTRATION_STATUS, name="registrationstatus", create_type=False),
-            nullable=False,
-        ),
+        sa.Column("previous_status", registration_status, nullable=True),
+        sa.Column("new_status", registration_status, nullable=False),
         sa.Column("changed_by_id", sa.UUID(as_uuid=True), nullable=True),
         sa.Column("agent_id", sa.String(length=100), nullable=True),
         sa.Column("trigger_reason", sa.String(length=255), nullable=True),
@@ -160,17 +188,11 @@ def upgrade() -> None:
         sa.Column("registration_id", sa.UUID(as_uuid=True), nullable=False),
         sa.Column("course_id", sa.UUID(as_uuid=True), nullable=False),
         sa.Column("target_section_id", sa.UUID(as_uuid=True), nullable=True),
-        sa.Column(
-            "action",
-            sa.Enum(*_ADD_DROP_ACTION, name="adddropaction", create_type=False),
-            nullable=False,
-        ),
+        sa.Column("action", add_drop_action, nullable=False),
         sa.Column("deadline_snapshot", sa.Date(), nullable=False),
         sa.Column(
-            "status",
-            sa.Enum(*_ADD_DROP_REQUEST_STATUS, name="adddroprequeststatus", create_type=False),
-            nullable=False,
-            server_default="PENDING",
+            "status", add_drop_request_status,
+            nullable=False, server_default="PENDING",
         ),
         sa.Column("reason", sa.Text(), nullable=True),
         sa.Column("override_by_id", sa.UUID(as_uuid=True), nullable=True),
@@ -193,11 +215,7 @@ def upgrade() -> None:
         "advisory_recommendations",
         sa.Column("student_id", sa.UUID(as_uuid=True), nullable=False),
         sa.Column("term_id", sa.UUID(as_uuid=True), nullable=False),
-        sa.Column(
-            "risk_status",
-            sa.Enum(*_RISK_STATUS, name="riskstatus", create_type=False),
-            nullable=False,
-        ),
+        sa.Column("risk_status", risk_status, nullable=False),
         sa.Column("risk_explanation", sa.Text(), nullable=False),
         sa.Column("proposed_courses", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default="[]"),
         sa.Column("recommended_courses", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default="[]"),
@@ -245,11 +263,7 @@ def upgrade() -> None:
         "schedule_conflicts",
         sa.Column("term_id", sa.UUID(as_uuid=True), nullable=False),
         sa.Column("department", sa.String(length=100), nullable=False),
-        sa.Column(
-            "conflict_type",
-            sa.Enum(*_SCHEDULE_CONFLICT_TYPE, name="scheduleconflicttype", create_type=False),
-            nullable=False,
-        ),
+        sa.Column("conflict_type", schedule_conflict_type, nullable=False),
         sa.Column("section_id", sa.UUID(as_uuid=True), nullable=True),
         sa.Column("other_section_id", sa.UUID(as_uuid=True), nullable=True),
         sa.Column("instructor_id", sa.UUID(as_uuid=True), nullable=True),
@@ -258,10 +272,8 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=False),
         sa.Column("detected_by_agent_id", sa.String(length=100), nullable=False),
         sa.Column(
-            "status",
-            sa.Enum(*_SCHEDULE_CONFLICT_STATUS, name="scheduleconflictstatus", create_type=False),
-            nullable=False,
-            server_default="OPEN",
+            "status", schedule_conflict_status,
+            nullable=False, server_default="OPEN",
         ),
         sa.Column("resolution_note", sa.Text(), nullable=True),
         sa.Column("resolved_by_id", sa.UUID(as_uuid=True), nullable=True),
@@ -337,7 +349,16 @@ def downgrade() -> None:
         op.drop_index(op.f(index_name), table_name=table_name)
     op.drop_table("registrations")
 
-    # Drop the three Track-A-only ENUM types
-    sa.Enum(name="scheduleconflictstatus").drop(bind, checkfirst=True)
-    sa.Enum(name="scheduleconflicttype").drop(bind, checkfirst=True)
-    sa.Enum(name="adddroprequeststatus").drop(bind, checkfirst=True)
+    # Drop the ENUM types Track A creates. We now own all six because
+    # Phase 0 no longer pre-creates registrationstatus / adddropaction /
+    # riskstatus. sponsorshiptype is owned by phase2_schema and is left
+    # alone.
+    for enum_name in (
+        "scheduleconflictstatus",
+        "scheduleconflicttype",
+        "adddroprequeststatus",
+        "riskstatus",
+        "adddropaction",
+        "registrationstatus",
+    ):
+        sa.Enum(name=enum_name).drop(bind, checkfirst=True)
