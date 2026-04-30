@@ -35,10 +35,15 @@ from app.core.config import settings
 from app.core.security import hash_password
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    AcademicTerm, Course, CoursePrerequisite, CourseOffering, Section,
-    Instructor, InstructorAssignment, Student, CourseManagementOfficer,
+    AcademicTerm, AdvisoryRecommendation, Course, CoursePrerequisite,
+    CourseOffering, Section, Instructor, InstructorAssignment,
+    Registration, RegistrationCourse, RegistrationStatusHistory,
+    Student, CourseManagementOfficer,
 )
-from app.shared.enums import EnrollmentStatus, OfficerRole, UserRole
+from app.shared.enums import (
+    EnrollmentStatus, OfficerRole, RegistrationStatus, RiskStatus,
+    SponsorshipType, UserRole,
+)
 
 
 DATABASE_URL = str(settings.DATABASE_URL)
@@ -555,6 +560,164 @@ async def _seed_officers(session: AsyncSession) -> None:
         print(f"⚠️  All {len(existing)} officers already present — skipping.")
 
 
+# ══════════════════════════════════════════════════════════════
+#  Track A — sample registrations & advisory verdicts
+# ══════════════════════════════════════════════════════════════
+# Demo data so the registration / scheduling / advisory journeys
+# can be poked at via Swagger without the engineer first having to
+# walk through draft → submit → pay → register manually.
+#
+# Three sample registrations, all under "Fall 2026":
+#   - UGR/0001/14 (semester 1) REGISTERED with two CS courses
+#       (sponsorship: SELF_SPONSORED, payment_reference seeded)
+#   - UGR/0005/14 (semester 2) draft REGISTRATION_OPEN with one CS
+#       course (no payment yet — useful for testing the
+#       PAYMENT_HOLD branch via the API)
+#   - UGR/0017/14 (semester 5) REGISTERED with one CS course;
+#       carries one LOW-risk AdvisoryRecommendation so the officer
+#       queue tests have a non-HIGH baseline to filter against.
+
+# (student_id, courses, status, sponsorship, payment_reference, advisory)
+SAMPLE_REGISTRATIONS = [
+    {
+        "student_id": "UGR/0001/14",
+        "course_codes": ["CS101", "MATH101"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.SELF_SPONSORED,
+        "payment_reference": "MOCK-PAID-FALL2026-UGR0001",
+        "advisory": None,
+    },
+    {
+        "student_id": "UGR/0005/14",
+        "course_codes": ["CS201"],
+        "status": RegistrationStatus.REGISTRATION_OPEN,
+        "sponsorship": SponsorshipType.GOVERNMENT,
+        "payment_reference": None,
+        "advisory": None,
+    },
+    {
+        "student_id": "UGR/0017/14",
+        "course_codes": ["CS501"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.SELF_SPONSORED,
+        "payment_reference": "MOCK-PAID-FALL2026-UGR0017",
+        "advisory": "LOW",
+    },
+]
+
+
+async def _seed_registrations(
+    session: AsyncSession,
+    term: AcademicTerm,
+    courses_by_code: dict[str, Course],
+) -> None:
+    """Seed sample registrations + their status-history seed rows."""
+    students = (await session.execute(select(Student))).scalars().all()
+    by_student_id = {s.student_id: s for s in students}
+
+    new_regs = 0
+    new_links = 0
+    new_history = 0
+    for sample in SAMPLE_REGISTRATIONS:
+        student = by_student_id.get(sample["student_id"])
+        if student is None:
+            continue
+        existing = (
+            await session.execute(
+                select(Registration).where(
+                    Registration.student_id == student.id,
+                    Registration.term_id == term.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            continue
+
+        reg = Registration(
+            id=_uid("registration", term.term_name, sample["student_id"]),
+            student_id=student.id,
+            term_id=term.id,
+            status=sample["status"],
+            sponsorship_type=sample["sponsorship"],
+            payment_reference=sample["payment_reference"],
+        )
+        session.add(reg)
+        await session.flush()
+        new_regs += 1
+
+        # Initial-state history row, mirroring what the service does.
+        session.add(
+            RegistrationStatusHistory(
+                id=_uid("reghist", "init", sample["student_id"]),
+                registration_id=reg.id,
+                previous_status=None,
+                new_status=RegistrationStatus.REGISTRATION_OPEN,
+                trigger_reason="seeded draft",
+            )
+        )
+        new_history += 1
+        if sample["status"] == RegistrationStatus.REGISTERED:
+            session.add(
+                RegistrationStatusHistory(
+                    id=_uid("reghist", "registered", sample["student_id"]),
+                    registration_id=reg.id,
+                    previous_status=RegistrationStatus.REGISTRATION_OPEN,
+                    new_status=RegistrationStatus.REGISTERED,
+                    agent_id="SEED_SCRIPT",
+                    trigger_reason="seeded as already finalised",
+                )
+            )
+            new_history += 1
+
+        for code in sample["course_codes"]:
+            course = courses_by_code.get(code)
+            if course is None:
+                continue
+            session.add(
+                RegistrationCourse(
+                    id=_uid("regcourse", sample["student_id"], code),
+                    registration_id=reg.id,
+                    course_id=course.id,
+                )
+            )
+            new_links += 1
+
+        if sample["advisory"] == "LOW":
+            session.add(
+                AdvisoryRecommendation(
+                    id=_uid("advisory", "low", sample["student_id"]),
+                    student_id=student.id,
+                    term_id=term.id,
+                    risk_status=RiskStatus.LOW,
+                    risk_explanation=(
+                        "Seeded LOW-risk baseline: CGPA 3.2 with light "
+                        "single-course load."
+                    ),
+                    proposed_courses=[
+                        str(courses_by_code[c].id) for c in sample["course_codes"]
+                    ],
+                    recommended_courses=[],
+                    gap_analysis={
+                        "department": "Computer Science",
+                        "current_semester": student.current_semester,
+                        "completed_count": 0,
+                        "remaining_count": 0,
+                        "curriculum_size": 0,
+                    },
+                    requires_officer_review=False,
+                )
+            )
+
+    await session.commit()
+    if new_regs:
+        print(
+            f"✅ Seeded {new_regs} registrations, {new_links} registration "
+            f"courses, {new_history} status-history rows."
+        )
+    else:
+        print("⚠️  Sample registrations already present — skipping.")
+
+
 async def seed() -> None:
     engine = create_async_engine(DATABASE_URL, echo=False)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -569,9 +732,10 @@ async def seed() -> None:
         )
         await _seed_students(session)
         await _seed_officers(session)
+        await _seed_registrations(session, term, courses_by_code)
 
     await engine.dispose()
-    print("\n🎉 Course Management Phase 0 seed complete.")
+    print("\n🎉 Course Management seed complete (Phase 0 + Track A samples).")
 
 
 if __name__ == "__main__":
