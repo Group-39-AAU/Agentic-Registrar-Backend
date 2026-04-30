@@ -12,11 +12,11 @@ dependencies = [
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "python-jose[cryptography]>=3.3.0",
-    # passlib 1.7.4 is incompatible with bcrypt 4.x — its self-detection
-    # routine triggers ValueError on a long-password probe. Pin bcrypt
-    # to <4.0 until passlib ships a fix.
-    "passlib[bcrypt]>=1.7.4",
-    "bcrypt<4.0",
+    # We talk to bcrypt directly (see app/core/security.py) rather than
+    # going through passlib, because passlib 1.7.4's bcrypt-version
+    # self-detection breaks on bcrypt 4.x. bcrypt's own API is stable
+    # across versions.
+    "bcrypt>=4.0.0",
     "python-multipart>=0.0.9",
     "email-validator>=2.0.0",
     "langgraph>=0.2.0",
