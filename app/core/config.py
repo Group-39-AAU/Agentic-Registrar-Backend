@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     # ── AI / Gemini ──────────────────────────────────────
     GEMINI_API_KEY: str = ""
 
+    # ── AI / Anthropic (advisory narrative LLM) ──────────
+    # Empty key disables LLM enrichment; AcademicAdvisoryAgent then
+    # falls back to its rule-based explanation (see app/ai/llm_client.py).
+    ANTHROPIC_API_KEY: str = ""
+    ADVISORY_LLM_MODEL: str = "claude-haiku-4-5"
+    ADVISORY_LLM_TIMEOUT_SECONDS: float = 5.0
+    ADVISORY_LLM_MAX_TOKENS: int = 600
+
     # ── Logging ──────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
