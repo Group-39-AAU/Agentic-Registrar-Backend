@@ -39,16 +39,25 @@ async def login(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Authenticate with email + password, receive a JWT token.
+    Authenticate with **email** (admission) or **UGR student ID**
+    (post-enrollment portal) plus password. Returns a JWT plus a
+    ``must_change_password`` flag — when True, the client must call
+    ``POST /auth/change-password`` before any other endpoint will
+    accept the token.
 
-    Uses OAuth2 form: 'username' field = email, 'password' field = password.
+    Uses OAuth2 form: 'username' field = identifier, 'password' field
+    = password.
     """
     svc = AuthService(db)
     try:
-        token = await svc.authenticate(form_data.username, form_data.password)
+        token, must_change = await svc.authenticate(
+            form_data.username, form_data.password,
+        )
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
-    return TokenResponse(access_token=token)
+    return TokenResponse(
+        access_token=token, must_change_password=must_change,
+    )
 
 
 @router.get("/me", response_model=UserResponse)

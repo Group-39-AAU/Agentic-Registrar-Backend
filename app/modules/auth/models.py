@@ -24,3 +24,9 @@ class User(SoftDeleteBase):
     last_name: Mapped[str] = mapped_column(String(100), nullable=False)
     role: Mapped[UserRole] = mapped_column(nullable=False, default=UserRole.STUDENT)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Set True when an officer onboards the student into the portal
+    # and emails them a temporary 4-digit PIN. Forces the next login
+    # to call POST /auth/change-password before any other endpoint.
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="false",
+    )
