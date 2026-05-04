@@ -9,6 +9,7 @@ passlib 1.7.4's bcrypt-version self-detection breaks on bcrypt 4.x
 calling it directly is the durable fix.
 """
 
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -26,6 +27,23 @@ _BCRYPT_MAX_BYTES = 72
 def _truncate_to_bcrypt_limit(password: str) -> bytes:
     """Encode and truncate to bcrypt's 72-byte payload window."""
     return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+
+
+def generate_temporary_pin(digits: int = 4) -> str:
+    """
+    Generate a cryptographically-random N-digit numeric PIN suitable
+    for one-time portal credentials. Uses ``secrets`` (not ``random``)
+    so the value cannot be predicted from process state. Leading
+    zeros are preserved — ``"0042"`` is a valid PIN.
+
+    Default 4 digits (10 000 possibilities) is acceptable *only*
+    because the PIN is single-use: ``must_change_password`` blocks
+    every endpoint until the student replaces it.
+    """
+    if digits < 4:
+        raise ValueError("PIN must be at least 4 digits")
+    upper = 10 ** digits
+    return str(secrets.randbelow(upper)).zfill(digits)
 
 
 def hash_password(password: str) -> str:

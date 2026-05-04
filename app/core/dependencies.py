@@ -23,16 +23,10 @@ from app.shared.email.service import EmailService
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: AsyncSession = Depends(get_db),
+async def _resolve_user_from_token(
+    token: str, db: AsyncSession,
 ) -> User:
-    """
-    Extracts and validates the JWT bearer token, then loads the
-    corresponding User from the database.
-
-    Raises HTTP 401 if the token is invalid or the user doesn't exist.
-    """
+    """Decode the JWT and load the matching User row. 401 on any failure."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -61,6 +55,50 @@ async def get_current_user(
         raise credentials_exception
 
     return user
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """
+    Default auth dependency — validates the JWT, loads the User, and
+    enforces the portal-credential lockout: when ``must_change_password``
+    is True (set during onboarding), every endpoint returns 403 with a
+    ``password_change_required`` code until the student calls
+    ``POST /auth/change-password``.
+
+    Use :func:`get_current_user_allow_password_change` for endpoints
+    that must remain reachable while the lockout is active (the change
+    -password endpoint itself, and the /auth/me probe so the client
+    can render the change-password screen).
+    """
+    user = await _resolve_user_from_token(token, db)
+    if user.must_change_password:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "password_change_required",
+                "message": (
+                    "Your temporary PIN is still active. Set a permanent "
+                    "password via POST /auth/change-password before using "
+                    "any other endpoint."
+                ),
+            },
+        )
+    return user
+
+
+async def get_current_user_allow_password_change(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """
+    Same as :func:`get_current_user` but does *not* enforce the
+    must_change_password lockout. Used only by the change-password
+    endpoint itself and the /auth/me profile probe.
+    """
+    return await _resolve_user_from_token(token, db)
 
 
 @lru_cache

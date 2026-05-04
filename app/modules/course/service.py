@@ -1279,9 +1279,17 @@ class AdvisoryService:
 class OnboardingService:
     """
     Bridges the undergraduate admission module's Enrollment row to a
-    course-management Student row. Without this, an admitted student
-    has a User account + an Enrollment record but no Student profile,
-    so they cannot use any of the Track A endpoints.
+    course-management Student row, then issues portal credentials:
+
+      1. Replaces the User's admission-time password with a hashed
+         single-use 4-digit PIN.
+      2. Sets ``User.must_change_password = True`` so the auth lockout
+         middleware blocks every endpoint except /auth/change-password.
+      3. Emails the student their UGR ID + the plaintext PIN.
+
+    The PIN is the only time the plaintext appears anywhere — it is
+    not stored, not logged, and not returned in the HTTP response.
+    The officer who triggers onboarding never sees it either.
 
     Phase-1 contract: officer-triggered (REGISTRAR_OFFICER or ADMIN)
     via POST /api/v1/courses/officer/students/onboard-from-enrollment.
@@ -1293,9 +1301,15 @@ class OnboardingService:
     student_id, which the router maps to 409.
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        email_service: Optional["EmailService"] = None,
+    ) -> None:
         self.db = db
         self.students = StudentRepository(db)
+        self._email_service = email_service
 
     async def onboard_student_from_enrollment(
         self,
@@ -1325,12 +1339,21 @@ class OnboardingService:
         if existing is not None:
             raise StudentAlreadyOnboardedError(existing.student_id)
 
-        # Pull display name from the User row.
+        # Pull the User row — we need it both for display name and to
+        # overwrite the password with the temporary PIN.
         from app.modules.auth.models import User
         user = await self.db.get(User, enrollment.applicant_id)
         if user is None:
             raise EntityNotFoundError("User", str(enrollment.applicant_id))
         full_name = f"{user.first_name} {user.last_name}".strip() or user.email
+
+        # Issue the portal credentials. The plaintext PIN exists only
+        # in this scope — we hash it for storage, hand it to the email
+        # template, then let it fall out of scope.
+        from app.core.security import generate_temporary_pin, hash_password
+        temporary_pin = generate_temporary_pin(digits=4)
+        user.hashed_password = hash_password(temporary_pin)
+        user.must_change_password = True
 
         student = Student(
             user_id=enrollment.applicant_id,
@@ -1354,8 +1377,31 @@ class OnboardingService:
                 "university_id": enrollment.university_id,
                 "department": enrollment.department,
                 "section": enrollment.section,
+                # PIN is intentionally omitted from the audit payload.
+                "portal_credentials_issued": True,
             },
         )
         await self.db.commit()
         await self.db.refresh(student)
+
+        # Email delivery is best-effort: an SMTP outage cannot reverse
+        # an enrollment. The officer can re-issue credentials by hand
+        # if the email never arrives.
+        if self._email_service is not None:
+            from app.shared.email import build_portal_credentials_email
+            try:
+                await self._email_service.send(
+                    build_portal_credentials_email(
+                        to_email=user.email,
+                        first_name=user.first_name,
+                        student_id=student.student_id,
+                        temporary_pin=temporary_pin,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Portal-credentials email delivery failed for %s",
+                    user.email,
+                )
+
         return student

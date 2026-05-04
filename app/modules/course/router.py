@@ -641,14 +641,19 @@ async def officer_onboard_student_from_enrollment(
     payload: StudentOnboardRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
 ):
     """
     Bridges an admission Enrollment row into a course-management
     Student row so the admitted student can use the Track A
-    endpoints. Officer-only (REGISTRAR_OFFICER or ADMIN). Idempotent:
+    endpoints. Also issues portal credentials: replaces the user's
+    password with a single-use 4-digit PIN, sets must_change_password
+    on the User row, and emails the student their UGR ID + PIN.
+
+    Officer-only (REGISTRAR_OFFICER or ADMIN). Idempotent:
     409 if a Student already exists for the Enrollment's user.
     """
-    svc = OnboardingService(db)
+    svc = OnboardingService(db, email_service=email_service)
     try:
         return await svc.onboard_student_from_enrollment(
             enrollment_id=payload.enrollment_id,
