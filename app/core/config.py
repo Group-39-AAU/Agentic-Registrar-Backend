@@ -39,14 +39,13 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     ALGORITHM: str = "HS256"
 
-    # ── AI / Gemini ──────────────────────────────────────
-    GEMINI_API_KEY: str = ""
-
-    # ── AI / Anthropic (advisory narrative LLM) ──────────
+    # ── AI / Gemini (advisory narrative LLM) ─────────────
     # Empty key disables LLM enrichment; AcademicAdvisoryAgent then
     # falls back to its rule-based explanation (see app/ai/llm_client.py).
-    ANTHROPIC_API_KEY: str = ""
-    ADVISORY_LLM_MODEL: str = "claude-haiku-4-5"
+    # gemini-2.0-flash is on Google's free tier (15 RPM / 1500 RPD)
+    # which comfortably covers final-year project demos.
+    GEMINI_API_KEY: str = ""
+    ADVISORY_LLM_MODEL: str = "gemini-2.0-flash"
     ADVISORY_LLM_TIMEOUT_SECONDS: float = 5.0
     ADVISORY_LLM_MAX_TOKENS: int = 600
 

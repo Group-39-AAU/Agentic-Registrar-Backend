@@ -1,24 +1,26 @@
 """
 Unit tests for app.ai.llm_client.LLMClient.
 
-The Anthropic SDK is never called for real here — every test injects
-a fake async client that records the request and returns a canned
+The Gemini SDK is never called for real here — every test injects a
+fake async client that records the request and returns a canned
 response (or raises). The LLMClient must:
 
-  - Forward the configured model + max_tokens.
-  - Mark the system prompt for ephemeral prompt-cache reuse.
-  - Apply the per-request hard timeout via ``with_options``.
-  - Return ``None`` (graceful fallback) on every Anthropic SDK error
-    type and on unexpected exceptions.
-  - Strip and concatenate text content blocks from the response.
+  - Forward the configured model + max_output_tokens.
+  - Pass the system prompt as ``GenerateContentConfig.system_instruction``
+    so Gemini's server-side prompt cache has its best chance.
+  - Apply the per-request hard timeout (asyncio.wait_for).
+  - Return ``None`` (graceful fallback) on every Gemini SDK error
+    type, on timeout, and on unexpected exceptions.
+  - Strip and concatenate text from the response.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import anthropic
 import pytest
+from google.genai import errors as genai_errors
 
 from app.ai.llm_client import LLMClient, build_default_llm_client
 
@@ -27,21 +29,19 @@ from app.ai.llm_client import LLMClient, build_default_llm_client
 
 
 def _make_response(text: str) -> Any:
-    """Mimic an anthropic Message with a single text content block."""
-    block = MagicMock()
-    block.text = text
+    """Mimic a GenerateContentResponse with a top-level .text accessor."""
     response = MagicMock()
-    response.content = [block]
+    response.text = text
     return response
 
 
-class FakeAnthropic:
+class FakeGenAIClient:
     """
-    Minimal stand-in for ``AsyncAnthropic``.
+    Minimal stand-in for ``google.genai.Client``.
 
-    Captures the kwargs passed to ``messages.create`` so tests can
-    assert on the wire-level shape, and lets each test choose what
-    ``create`` returns or raises.
+    Captures the kwargs passed to ``aio.models.generate_content`` so
+    tests can assert on the wire-level shape, and lets each test
+    choose what ``generate_content`` returns or raises.
     """
 
     def __init__(
@@ -49,33 +49,35 @@ class FakeAnthropic:
         *,
         return_value: Any = None,
         raise_exc: BaseException | None = None,
+        delay_seconds: float = 0.0,
     ):
         self.return_value = return_value
         self.raise_exc = raise_exc
-        self.last_create_kwargs: dict[str, Any] | None = None
-        self.with_options_calls: list[dict[str, Any]] = []
+        self.delay_seconds = delay_seconds
+        self.last_kwargs: dict[str, Any] | None = None
 
-        async def _create(**kwargs):
-            self.last_create_kwargs = kwargs
+        async def _generate(**kwargs):
+            self.last_kwargs = kwargs
+            if self.delay_seconds:
+                await asyncio.sleep(self.delay_seconds)
             if self.raise_exc is not None:
                 raise self.raise_exc
             return self.return_value
 
-        self.messages = MagicMock()
-        self.messages.create = AsyncMock(side_effect=_create)
-
-    def with_options(self, **kwargs):
-        self.with_options_calls.append(kwargs)
-        return self
+        models = MagicMock()
+        models.generate_content = AsyncMock(side_effect=_generate)
+        aio = MagicMock()
+        aio.models = models
+        self.aio = aio
 
 
 # ── Helpers ──────────────────────────────────────────────────────
 
 
-def _make_llm(fake: FakeAnthropic, **overrides: Any) -> LLMClient:
+def _make_llm(fake: FakeGenAIClient, **overrides: Any) -> LLMClient:
     return LLMClient(
-        client=fake,  # type: ignore[arg-type]
-        model=overrides.get("model", "claude-haiku-4-5"),
+        client=fake,
+        model=overrides.get("model", "gemini-2.0-flash"),
         timeout_seconds=overrides.get("timeout_seconds", 5.0),
         max_tokens=overrides.get("max_tokens", 600),
     )
@@ -103,7 +105,7 @@ _STUDENT = {
 
 
 async def test_narrate_advisory_returns_text_on_success():
-    fake = FakeAnthropic(return_value=_make_response(
+    fake = FakeGenAIClient(return_value=_make_response(
         "You're holding a solid 3.1 CGPA — a 16-credit load is reasonable."
     ))
     llm = _make_llm(fake)
@@ -112,56 +114,56 @@ async def test_narrate_advisory_returns_text_on_success():
 
     assert text is not None
     assert "3.1" in text
-    fake.messages.create.assert_awaited_once()
+    fake.aio.models.generate_content.assert_awaited_once()
 
 
 async def test_request_uses_configured_model_and_token_cap():
-    fake = FakeAnthropic(return_value=_make_response("ok"))
-    llm = _make_llm(fake, model="claude-haiku-4-5", max_tokens=400)
+    fake = FakeGenAIClient(return_value=_make_response("ok"))
+    llm = _make_llm(fake, model="gemini-2.0-flash", max_tokens=400)
 
     await llm.narrate_advisory(_ADVICE, _STUDENT)
 
-    kwargs = fake.last_create_kwargs
+    kwargs = fake.last_kwargs
     assert kwargs is not None
-    assert kwargs["model"] == "claude-haiku-4-5"
-    assert kwargs["max_tokens"] == 400
+    assert kwargs["model"] == "gemini-2.0-flash"
+    assert kwargs["config"].max_output_tokens == 400
 
 
-async def test_system_prompt_is_marked_for_ephemeral_cache():
-    """SDS-aligned cost optimisation: stable system prompt must be cached."""
-    fake = FakeAnthropic(return_value=_make_response("ok"))
+async def test_system_prompt_is_passed_via_system_instruction():
+    """Lets Gemini cache the static system prompt server-side."""
+    fake = FakeGenAIClient(return_value=_make_response("ok"))
     llm = _make_llm(fake)
 
     await llm.narrate_advisory(_ADVICE, _STUDENT)
 
-    system_blocks = fake.last_create_kwargs["system"]
-    assert isinstance(system_blocks, list) and len(system_blocks) == 1
-    assert system_blocks[0]["type"] == "text"
-    assert system_blocks[0]["cache_control"] == {"type": "ephemeral"}
+    config = fake.last_kwargs["config"]
+    assert config.system_instruction
+    assert "Addis Ababa University" in config.system_instruction
 
 
-async def test_user_message_carries_serialised_payload():
-    fake = FakeAnthropic(return_value=_make_response("ok"))
+async def test_user_payload_carries_serialised_inputs():
+    fake = FakeGenAIClient(return_value=_make_response("ok"))
     llm = _make_llm(fake)
 
     await llm.narrate_advisory(_ADVICE, _STUDENT)
 
-    messages = fake.last_create_kwargs["messages"]
-    assert len(messages) == 1
-    assert messages[0]["role"] == "user"
-    payload = messages[0]["content"]
-    # JSON-encoded so model receives a clean structured input
-    assert "UGR/0001/14" in payload
-    assert "MEDIUM" in payload
+    contents = fake.last_kwargs["contents"]
+    # Single JSON-encoded string keeps the prompt boundary clean
+    assert isinstance(contents, str)
+    assert "UGR/0001/14" in contents
+    assert "MEDIUM" in contents
 
 
-async def test_hard_timeout_is_applied_via_with_options():
-    fake = FakeAnthropic(return_value=_make_response("ok"))
-    llm = _make_llm(fake, timeout_seconds=2.5)
+async def test_hard_timeout_is_enforced():
+    """A slow LLM must not block the caller past the configured cap."""
+    fake = FakeGenAIClient(
+        return_value=_make_response("late"), delay_seconds=2.0,
+    )
+    llm = _make_llm(fake, timeout_seconds=0.05)
 
-    await llm.narrate_advisory(_ADVICE, _STUDENT)
+    text = await llm.narrate_advisory(_ADVICE, _STUDENT)
 
-    assert fake.with_options_calls == [{"timeout": 2.5}]
+    assert text is None  # timeout → fallback
 
 
 # ── Failure modes — every one of these must yield None ──────────
@@ -170,20 +172,19 @@ async def test_hard_timeout_is_applied_via_with_options():
 @pytest.mark.parametrize(
     "exc",
     [
-        anthropic.APITimeoutError(request=MagicMock()),
-        anthropic.APIConnectionError(request=MagicMock()),
-        # APIStatusError needs a response object; build one with the
-        # fields the SDK reads (status_code, headers).
-        anthropic.APIStatusError(
-            "boom",
-            response=MagicMock(status_code=500, headers={}),
-            body=None,
+        genai_errors.ClientError(
+            code=400,
+            response_json={"error": {"message": "bad input"}},
+        ),
+        genai_errors.ServerError(
+            code=500,
+            response_json={"error": {"message": "boom"}},
         ),
         RuntimeError("totally unexpected"),
     ],
 )
 async def test_narrate_advisory_returns_none_on_sdk_errors(exc):
-    fake = FakeAnthropic(raise_exc=exc)
+    fake = FakeGenAIClient(raise_exc=exc)
     llm = _make_llm(fake)
 
     text = await llm.narrate_advisory(_ADVICE, _STUDENT)
@@ -191,22 +192,27 @@ async def test_narrate_advisory_returns_none_on_sdk_errors(exc):
     assert text is None
 
 
-async def test_narrate_advisory_returns_none_on_empty_content():
+async def test_narrate_advisory_returns_none_on_empty_text():
     """An empty/whitespace response is treated as a fallback signal."""
     empty = MagicMock()
-    empty.content = []
-    fake = FakeAnthropic(return_value=empty)
+    empty.text = ""
+    empty.candidates = []
+    fake = FakeGenAIClient(return_value=empty)
     llm = _make_llm(fake)
 
     assert await llm.narrate_advisory(_ADVICE, _STUDENT) is None
 
 
-async def test_narrate_advisory_concatenates_multiple_text_blocks():
-    block_a = MagicMock(); block_a.text = "Part one. "
-    block_b = MagicMock(); block_b.text = "Part two."
+async def test_narrate_advisory_falls_back_to_candidates_when_text_missing():
+    """Some response shapes only expose text via candidates[].content.parts[]."""
     response = MagicMock()
-    response.content = [block_a, block_b]
-    fake = FakeAnthropic(return_value=response)
+    response.text = None
+    part_a = MagicMock(); part_a.text = "Part one. "
+    part_b = MagicMock(); part_b.text = "Part two."
+    content = MagicMock(); content.parts = [part_a, part_b]
+    candidate = MagicMock(); candidate.content = content
+    response.candidates = [candidate]
+    fake = FakeGenAIClient(return_value=response)
     llm = _make_llm(fake)
 
     text = await llm.narrate_advisory(_ADVICE, _STUDENT)
@@ -219,22 +225,24 @@ async def test_narrate_advisory_concatenates_multiple_text_blocks():
 
 def test_build_default_llm_client_returns_none_without_api_key(monkeypatch):
     from app.ai import llm_client as mod
-    monkeypatch.setattr(mod.settings, "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(mod.settings, "GEMINI_API_KEY", "")
     assert build_default_llm_client() is None
 
 
 def test_build_default_llm_client_constructs_client_with_api_key(monkeypatch):
     from app.ai import llm_client as mod
-    monkeypatch.setattr(mod.settings, "ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr(mod.settings, "GEMINI_API_KEY", "AIza-test")
 
     captured: dict[str, Any] = {}
 
-    class _StubAsync:
-        def __init__(self, *, api_key: str):
+    class _StubGenaiNamespace:
+        @staticmethod
+        def Client(*, api_key: str):
             captured["api_key"] = api_key
+            return MagicMock()
 
-    monkeypatch.setattr(mod, "AsyncAnthropic", _StubAsync)
+    monkeypatch.setattr(mod, "genai", _StubGenaiNamespace)
 
     client = build_default_llm_client()
     assert isinstance(client, LLMClient)
-    assert captured["api_key"] == "sk-test"
+    assert captured["api_key"] == "AIza-test"

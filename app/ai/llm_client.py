@@ -1,33 +1,33 @@
 """
-Thin async wrapper around the Anthropic Messages API.
+Thin async wrapper around the Google Gemini Generative AI API.
 
 Consumed by :class:`AcademicAdvisoryAgent` (and any future agent that
 wants short-form narrative generation). Designed so the rest of the
-codebase never imports the ``anthropic`` package directly:
+codebase never imports ``google.genai`` directly:
 
-  - ``LLMClient`` is constructible with an explicit ``AsyncAnthropic``
+  - ``LLMClient`` is constructible with an explicit ``genai.Client``
     instance, which keeps tests deterministic (inject a fake) and lets
     the production wiring share a single client across requests.
   - When no API key is configured, :func:`build_default_llm_client`
     returns ``None`` so callers can short-circuit without try/except.
-  - Any Anthropic SDK error (rate limit, timeout, 5xx, connection
-    failure) is caught and turned into ``None`` from
-    :meth:`LLMClient.narrate_advisory`. The agent layer falls back to
-    its rule-based explanation, so the LLM is strictly additive.
+  - Any Gemini SDK error or wall-clock timeout is caught and turned
+    into ``None`` from :meth:`LLMClient.narrate_advisory`. The agent
+    layer falls back to its rule-based explanation, so the LLM is
+    strictly additive.
 
 Performance notes:
-  - Model defaults to ``claude-haiku-4-5`` (cheap + fast; 200K context
-    is far more than the advisory prompt needs).
-  - The system prompt is marked with ``cache_control={"type":
-    "ephemeral"}`` so repeated advisory calls within the 5-minute TTL
-    only pay the prefix cost once.
-  - ``with_options(timeout=...)`` enforces a hard wall-clock cap; the
-    default 5s is comfortable for Haiku and short enough that a stuck
-    request never blocks a user-facing /advisory/evaluate response.
+  - Model defaults to ``gemini-2.0-flash`` (free-tier eligible: 15
+    RPM / 1500 RPD; ample for a demo).
+  - Wall-clock cap enforced via ``asyncio.wait_for`` rather than the
+    SDK's transport options — keeps the timeout contract identical
+    regardless of which transport google-genai is currently using.
+  - The system prompt is a static module constant, which gives Gemini
+    its best opportunity to apply implicit prompt caching server-side.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Optional
 
@@ -37,18 +37,19 @@ from app.core.logging import get_logger
 logger = get_logger("app.ai.llm_client")
 
 try:  # pragma: no cover - import guard
-    import anthropic
-    from anthropic import AsyncAnthropic
+    from google import genai
+    from google.genai import errors as genai_errors
+    from google.genai import types as genai_types
 except ImportError:  # pragma: no cover - SDK is a hard dep, but keep
     # the module importable in environments that haven't installed it
     # yet (e.g. lint pass before `pip install -e .`).
-    anthropic = None  # type: ignore[assignment]
-    AsyncAnthropic = None  # type: ignore[assignment,misc]
+    genai = None  # type: ignore[assignment]
+    genai_errors = None  # type: ignore[assignment]
+    genai_types = None  # type: ignore[assignment]
 
 
-# System prompt is intentionally stable across calls so the prompt
-# cache hit rate stays high. Anything per-request goes in the user
-# message, not here.
+# System prompt is a static module constant so Gemini's server-side
+# prompt cache (when active) can hit on it across calls.
 _ADVISORY_SYSTEM_PROMPT = (
     "You are an academic advisor at Addis Ababa University writing "
     "short, plain-English guidance for an undergraduate registrar "
@@ -70,19 +71,19 @@ _ADVISORY_SYSTEM_PROMPT = (
 
 class LLMClient:
     """
-    Async narrative generator backed by the Anthropic Messages API.
+    Async narrative generator backed by the Gemini Generative AI API.
 
     Construct via :func:`build_default_llm_client` for production wiring,
     or pass an explicit ``client`` in tests:
 
-        fake = FakeAnthropic(...)
+        fake = FakeGenAIClient(...)
         llm = LLMClient(client=fake)
     """
 
     def __init__(
         self,
         *,
-        client: "AsyncAnthropic",
+        client: Any,
         model: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -103,35 +104,40 @@ class LLMClient:
         """
         Turn the agent's structured advisory verdict into a short
         student-facing paragraph. Returns ``None`` on any SDK failure
-        so the caller can fall back to its rule-based explanation.
+        or timeout so the caller can fall back to its rule-based
+        explanation.
         """
-        if anthropic is None:  # pragma: no cover - import guard
+        if genai is None:  # pragma: no cover - import guard
             return None
 
-        user_payload = {
-            "student": student_context,
-            "advice": structured_advice,
-        }
+        user_payload = json.dumps(
+            {"student": student_context, "advice": structured_advice},
+            default=str,
+        )
+        config = genai_types.GenerateContentConfig(
+            system_instruction=_ADVISORY_SYSTEM_PROMPT,
+            max_output_tokens=self._max_tokens,
+            temperature=0.7,
+        )
         try:
-            scoped = self._client.with_options(timeout=self._timeout)
-            response = await scoped.messages.create(
-                model=self._model,
-                max_tokens=self._max_tokens,
-                system=[
-                    {
-                        "type": "text",
-                        "text": _ADVISORY_SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=[
-                    {
-                        "role": "user",
-                        "content": json.dumps(user_payload, default=str),
-                    }
-                ],
+            response = await asyncio.wait_for(
+                self._client.aio.models.generate_content(
+                    model=self._model,
+                    contents=user_payload,
+                    config=config,
+                ),
+                timeout=self._timeout,
             )
-        except anthropic.APIError as exc:
+        except asyncio.TimeoutError:
+            logger.warning(
+                "advisory_llm_timeout",
+                extra={
+                    "agent_layer": "advisory",
+                    "timeout_seconds": self._timeout,
+                },
+            )
+            return None
+        except genai_errors.APIError as exc:
             logger.warning(
                 "advisory_llm_failed",
                 extra={
@@ -156,13 +162,23 @@ class LLMClient:
 
 
 def _extract_text(response: Any) -> Optional[str]:
-    """Pull the first text block out of a Messages API response."""
-    blocks = getattr(response, "content", None) or []
+    """
+    Pull text out of a GenerateContentResponse. ``response.text`` is
+    a convenience accessor in google-genai that flattens all text
+    parts; falls back to walking candidates if absent.
+    """
+    text = getattr(response, "text", None)
+    if text:
+        return text.strip() or None
+
+    candidates = getattr(response, "candidates", None) or []
     parts: list[str] = []
-    for block in blocks:
-        text = getattr(block, "text", None)
-        if text:
-            parts.append(text)
+    for cand in candidates:
+        content = getattr(cand, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            t = getattr(part, "text", None)
+            if t:
+                parts.append(t)
     joined = "".join(parts).strip()
     return joined or None
 
@@ -170,13 +186,13 @@ def _extract_text(response: Any) -> Optional[str]:
 def build_default_llm_client() -> Optional[LLMClient]:
     """
     Construct the production :class:`LLMClient` from settings, or
-    ``None`` when ``ANTHROPIC_API_KEY`` is unset. Returning ``None``
+    ``None`` when ``GEMINI_API_KEY`` is unset. Returning ``None``
     is the documented "LLM disabled" signal — agents must accept it
     and degrade to rule-based output.
     """
-    if not settings.ANTHROPIC_API_KEY:
+    if not settings.GEMINI_API_KEY:
         return None
-    if AsyncAnthropic is None:  # pragma: no cover - import guard
+    if genai is None:  # pragma: no cover - import guard
         return None
-    raw_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+    raw_client = genai.Client(api_key=settings.GEMINI_API_KEY)
     return LLMClient(client=raw_client)
