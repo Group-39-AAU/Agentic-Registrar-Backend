@@ -1076,7 +1076,7 @@ class AdvisoryService:
         self.students = StudentRepository(db)
         # Production wiring: if no agent is injected, build one with
         # the default LLM client (which itself returns None when
-        # ANTHROPIC_API_KEY is unset, so the agent stays rule-only).
+        # GEMINI_API_KEY is unset, so the agent stays rule-only).
         if advisory_agent is None:
             from app.ai.llm_client import build_default_llm_client
             advisory_agent = AcademicAdvisoryAgent(
