@@ -12,17 +12,21 @@ Realises SDS Tables 67–69:
         + approveCourseLoad(studentID): Boolean
         + flagRiskLevel(studentID): RiskStatus
 
-The agent is rule-based in Phase 1: ``suggestionEngine`` is left as
-a stub field for the Phase-2 LLM wiring described in SRS §3.7.
-The CGPA thresholds and "heavy load" cut-off are class-level
-constants so tests can override them without touching the
-singleton.
+Rule engine is the source of truth for risk + recommendations; an
+optional :class:`~app.ai.llm_client.LLMClient` is asked to rewrite the
+explanation paragraph in plain English. When the LLM is unavailable or
+errors out, the rule-based explanation is used unchanged. The CGPA
+thresholds and "heavy load" cut-off are class-level constants so tests
+can override them without touching the singleton.
 
 Hard rules (SDS Table 68 invariants):
   - The suggestion engine must prioritise mandatory core courses
     over electives.
   - Approve-course-load must escalate HIGH-risk verdicts to the
     CourseManagementOfficer rather than silently auto-approving.
+  - LLM output is strictly additive: the structured verdict
+    (risk_status, recommended_courses, requires_officer_review)
+    must never be derived from the LLM.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.llm_client import LLMClient
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
 from app.modules.course.models import Course
 from app.shared.enums import RiskStatus
@@ -101,6 +106,7 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
         high_risk_cgpa: Optional[float] = None,
         medium_risk_cgpa: Optional[float] = None,
         high_load_threshold: Optional[int] = None,
+        llm_client: Optional[LLMClient] = None,
     ) -> None:
         super().__init__(agent_id=agent_id or f"{self.AGENT_ID_PREFIX}DEFAULT")
         self._high_risk_cgpa = (
@@ -115,6 +121,8 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
             high_load_threshold if high_load_threshold is not None
             else self.HIGH_LOAD_THRESHOLD_ECTS
         )
+        # Optional. None ⇒ the rule-based explanation is final.
+        self._llm_client = llm_client
 
     # ── flag_risk_level (SDS Table 69) ───────────────────────────
 
@@ -292,10 +300,63 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
         else:
             explanation_parts.append("LOW risk — load is approvable.")
 
+        rule_explanation = " ".join(explanation_parts)
+
+        # LLM enrichment is strictly additive: rule engine owns the
+        # verdict (risk_status, recommendations, escalation flag); the
+        # LLM only rewrites the prose. ``narrate_advisory`` returns
+        # None on any SDK failure, so the rule explanation survives.
+        explanation = await self._maybe_narrate(
+            rule_explanation=rule_explanation,
+            risk=risk,
+            recs=recs,
+            gap=gap,
+            cgpa=cgpa,
+            total_credits=total_credits,
+            department=department,
+            current_semester=current_semester,
+            requires_officer_review=not approvable,
+        )
+
         return Advice(
             risk_status=risk,
             recommended_courses=recs,
             gap_analysis=gap,
-            explanation=" ".join(explanation_parts),
+            explanation=explanation,
             requires_officer_review=not approvable,
         )
+
+    async def _maybe_narrate(
+        self,
+        *,
+        rule_explanation: str,
+        risk: RiskStatus,
+        recs: list[dict[str, Any]],
+        gap: GapAnalysis,
+        cgpa: float,
+        total_credits: int,
+        department: str,
+        current_semester: int,
+        requires_officer_review: bool,
+    ) -> str:
+        """Ask the LLM for a friendlier paragraph; fall back on miss."""
+        if self._llm_client is None:
+            return rule_explanation
+
+        structured_advice = {
+            "risk_status": risk.value,
+            "recommended_courses": recs,
+            "gap_analysis": gap.to_dict(),
+            "rule_explanation": rule_explanation,
+            "requires_officer_review": requires_officer_review,
+        }
+        student_context = {
+            "department": department,
+            "current_semester": current_semester,
+            "cgpa": cgpa,
+            "proposed_credits": total_credits,
+        }
+        narrative = await self._llm_client.narrate_advisory(
+            structured_advice, student_context,
+        )
+        return narrative or rule_explanation
