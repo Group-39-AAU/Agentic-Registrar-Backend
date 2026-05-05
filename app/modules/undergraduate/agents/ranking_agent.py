@@ -48,7 +48,7 @@ class ApplicantData:
 @dataclass
 class RankingState:
     """Mutable state passed through LangGraph nodes."""
-    batch_id: str = ""
+    run_label: str = ""
 
     # Raw data
     applicants: list[ApplicantData] = field(default_factory=list)
@@ -238,14 +238,14 @@ def finalize(state: RankingState) -> RankingState:
     state.traces.append({
         "step_name": "finalize",
         "reasoning_log": (
-            f"Ranking complete. Batch: {state.batch_id}\n"
+            f"Ranking complete. Run: {state.run_label}\n"
             f"Total: {len(all_applicants)}, Assigned: {assigned}, Unassigned: {unassigned}"
         ),
         "result": "OK",
     })
     logger.info(
-        "Ranking finalized: batch=%s, total=%d, assigned=%d, unassigned=%d",
-        state.batch_id, len(all_applicants), assigned, unassigned,
+        "Ranking finalized: run=%s, total=%d, assigned=%d, unassigned=%d",
+        state.run_label, len(all_applicants), assigned, unassigned,
     )
     return state
 
