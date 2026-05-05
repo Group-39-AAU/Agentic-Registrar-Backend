@@ -357,9 +357,11 @@ class ApplicationService:
         return built[0]
 
     async def list_applications(
-        self, *, limit: int = 50, offset: int = 0
+        self, *, limit: int = 50, offset: int = 0, term_id: uuid.UUID
     ) -> tuple[list[ApplicationResponse], int]:
-        items, total = await self._app_repo.get_all(limit=limit, offset=offset)
+        items, total = await self._app_repo.get_all(
+            limit=limit, offset=offset, admission_term_id=term_id
+        )
         enriched = await self._build_application_responses(items)
         return enriched, total
 

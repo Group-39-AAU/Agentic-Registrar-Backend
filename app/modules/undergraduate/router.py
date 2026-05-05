@@ -122,13 +122,14 @@ async def submit_application(
 async def list_applications(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    term_id: uuid.UUID = Query(..., description="Admission term ID to filter by"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List all applications (registrar/admin view)."""
     _officer_admin_only(current_user)
     svc = ApplicationService(db)
-    items, total = await svc.list_applications(limit=limit, offset=offset)
+    items, total = await svc.list_applications(limit=limit, offset=offset, term_id=term_id)
     return ApplicationListResponse(items=items, total=total)
 
 
