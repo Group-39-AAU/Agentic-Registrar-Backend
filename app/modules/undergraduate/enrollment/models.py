@@ -33,6 +33,12 @@ class Enrollment(Base):
         ForeignKey("users.id"),
         index=True, nullable=False,
     )
+    admission_term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("undergraduate_admission_terms.id"),
+        index=True,
+        nullable=False,
+    )
 
     # ── University Credentials ──
     university_id: Mapped[str] = mapped_column(

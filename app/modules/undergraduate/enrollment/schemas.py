@@ -16,6 +16,7 @@ class EnrollmentResponse(BaseModel):
     id: uuid.UUID
     application_id: uuid.UUID
     applicant_id: uuid.UUID
+    admission_term_id: uuid.UUID
     university_id: str
     portal_password: str
     program_id: Optional[uuid.UUID] = None

@@ -27,6 +27,7 @@ class AdmittedStudent:
     """One admitted student to be enrolled."""
     application_id: Any  # uuid.UUID
     applicant_id: Any
+    admission_term_id: Any
     admission_number: str
     admission_term: str
     sponsorship_type: str
@@ -60,6 +61,10 @@ class EnrollmentState(dict):
         return self.get("year_suffix", "26")
 
     @property
+    def term_id(self) -> Any:
+        return self.get("term_id")
+
+    @property
     def section_capacity(self) -> int:
         return self.get("section_capacity", 50)
 
@@ -76,9 +81,13 @@ def gather_admitted(state: dict) -> dict:
     """Node 1: Validate the list of admitted students."""
     students = state.get("students", [])
     traces = state.get("traces", [])
+    term_id = state.get("term_id")
     traces.append({
         "step_name": "gather_admitted",
-        "reasoning_log": f"Received {len(students)} admitted students for enrollment.",
+        "reasoning_log": (
+            f"Received {len(students)} admitted students for enrollment. "
+            f"term_id={term_id}."
+        ),
     })
     return {**state, "traces": traces}
 
