@@ -42,9 +42,11 @@ class RankingResult(Base):
     """
     __tablename__ = "ranking_results"
 
-    ranking_batch_id: Mapped[str] = mapped_column(
-        String(50), index=True, nullable=False
+    ranking_batch_id: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    admission_term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("undergraduate_admission_terms.id"), nullable=False, index=True
     )
+    ranking_run_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     application_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("undergraduate_applications.id"),

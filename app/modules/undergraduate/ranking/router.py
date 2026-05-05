@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_user
@@ -17,6 +17,7 @@ from app.modules.auth.models import User
 from app.modules.moe.models import MoeStudentRecord
 from app.modules.programs.models import AcademicProgram
 from app.modules.undergraduate.ranking.models import RankingResult, StreamQuota
+from app.modules.undergraduate.ranking.service import RankingService
 from app.modules.undergraduate.ranking.schemas import (
     ProgramCutoffResponse,
     RankingResultResponse,
@@ -119,7 +120,11 @@ async def run_ranking(
         if st.value not in stream_quotas:
             stream_quotas[st.value] = 2500  # Default
 
-    # ── 6. Build applicant data ──
+    # ── 6. Resolve run number ──
+    ranking_service = RankingService(db)
+    run_number = await ranking_service.get_next_run_number(admission_term_id)
+
+    # ── 7. Build applicant data ──
     from app.modules.undergraduate.agents.ranking_agent import ApplicantData, AGENT_VERSION, RankingState, build_ranking_graph
 
     applicant_list = []
@@ -148,11 +153,11 @@ async def run_ranking(
     if not applicant_list:
         raise HTTPException(400, f"No applicants with complete data. Skipped: {skipped}")
 
-    # ── 7. Run the ranking agent ──
+    # ── 8. Run the ranking agent ──
     batch_id = f"RANK-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     initial_state = RankingState(
-        batch_id=batch_id,
+        run_label=f"term={admission_term_id} run={run_number}",
         applicants=applicant_list,
         program_capacities=program_capacities,
         program_info=program_info,
@@ -162,7 +167,18 @@ async def run_ranking(
     compiled_graph = build_ranking_graph()
     final_state = compiled_graph.invoke(initial_state)
 
-    # ── 8. Persist results ──
+    # Re-runs use first run's cutoffs to assign applicants.
+    if run_number > 1:
+        try:
+            await ranking_service.apply_first_run_cutoffs_for_rerun(
+                term_id=admission_term_id,
+                final_state=final_state,
+                program_info=program_info,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    # ── 9. Persist results ──
     all_ranked = final_state["self_sponsored"] + final_state["government"]
     assigned_count = 0
     unassigned_count = 0
@@ -173,6 +189,8 @@ async def run_ranking(
         # Write RankingResult
         result_row = RankingResult(
             ranking_batch_id=batch_id,
+            admission_term_id=admission_term_id,
+            ranking_run_number=run_number,
             application_id=a.application_id,
             grade12_score=a.grade12_score,
             uat_score=a.uat_score,
@@ -198,8 +216,11 @@ async def run_ranking(
                 a.application_id,
                 StatusUpd(
                     new_status=ApplicationStatus.PENDING_REVIEW,
-                    trigger_reason=f"Ranking batch {batch_id}: score={a.final_score}, rank={a.rank_position}, "
-                                   f"{'assigned' if a.is_assigned else 'unassigned'}",
+                    trigger_reason=(
+                        f"Ranking run {run_number} for term {admission_term_id}: "
+                        f"score={a.final_score}, rank={a.rank_position}, "
+                        f"{'assigned' if a.is_assigned else 'unassigned'}"
+                    ),
                 ),
                 actor_id=current_user.id,
                 actor_role=UserRole.AGENT,
@@ -211,7 +232,7 @@ async def run_ranking(
                 "Failed to transition app %s: %s", a.application_id, e
             )
 
-    # ── 9. Update program cutoff scores ──
+    # ── 10. Update program cutoff scores ──
     for prog in programs:
         # Find the lowest final_score among assigned self-sponsored students for this program
         assigned_to_prog = [
@@ -222,7 +243,7 @@ async def run_ranking(
             cutoff = min(a.final_score for a in assigned_to_prog)
             prog.cut_off_score = cutoff
 
-    # ── 10. Write AIEvaluation ──
+    # ── 11. Write AIEvaluation ──
     from app.ai.models import AIEvaluation, AIExecutionTrace
     from app.shared.enums import DecisionType
 
@@ -237,7 +258,7 @@ async def run_ranking(
             confidence_score=min(a.final_score / 100, 1.0),
             is_overridden=False,
             summary_reasoning=(
-                f"Ranking batch {batch_id} | Score: {a.final_score} | "
+                f"Ranking run {run_number} for term {admission_term_id} | Score: {a.final_score} | "
                 f"Rank: {a.rank_position} | {a.assignment_detail}"
             ),
         )
@@ -255,60 +276,72 @@ async def run_ranking(
     await db.commit()
 
     return RankingRunResponse(
-        batch_id=batch_id,
+        term_id=admission_term_id,
+        run_number=run_number,
         total_processed=len(all_ranked),
         self_sponsored_count=len(final_state["self_sponsored"]),
         government_count=len(final_state["government"]),
         assigned_count=assigned_count,
         unassigned_count=unassigned_count,
-        message=f"Ranking batch {batch_id} complete. {assigned_count} assigned, {unassigned_count} unassigned.",
+        message=(
+            f"Ranking run {run_number} for term {admission_term_id} complete. "
+            f"{assigned_count} assigned, {unassigned_count} unassigned."
+        ),
     )
 
 
 # ══════════════════════════════════════════════════════════════
-#  GET /ranking/results/{batch_id} — View ranked list
+#  GET /ranking/results/{term_id} — View ranked list
 # ══════════════════════════════════════════════════════════════
 
-@router.get("/results/{batch_id}", response_model=list[RankingResultResponse])
+@router.get("/results/{term_id}", response_model=list[RankingResultResponse])
 async def get_ranking_results(
-    batch_id: str,
+    term_id: uuid.UUID,
     category: str = Query(None, description="Filter by SELF_SPONSORED or GOVERNMENT"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get the full ranked list for a batch, optionally filtered by category."""
-    query = select(RankingResult).where(RankingResult.ranking_batch_id == batch_id)
+    """Get all ranking rows for an admission term, optionally filtered by category."""
+    query = select(RankingResult).where(
+        RankingResult.admission_term_id == term_id,
+    )
 
     if category:
         query = query.where(RankingResult.category == category.upper())
 
-    query = query.order_by(RankingResult.category, RankingResult.rank_position)
+    query = query.order_by(
+        RankingResult.ranking_run_number,
+        RankingResult.category,
+        RankingResult.rank_position,
+    )
 
     result = await db.execute(query)
     items = result.scalars().all()
 
     if not items:
-        raise HTTPException(404, f"No results found for batch: {batch_id}")
+        raise HTTPException(404, f"No results found for term: {term_id}")
 
     return items
 
 
 # ══════════════════════════════════════════════════════════════
-#  GET /ranking/results/{batch_id}/summary — Cutoffs + stats
+#  GET /ranking/results/{term_id}/summary — Cutoffs + stats
 # ══════════════════════════════════════════════════════════════
 
-@router.get("/results/{batch_id}/summary", response_model=RankingSummaryResponse)
+@router.get("/results/{term_id}/summary", response_model=RankingSummaryResponse)
 async def get_ranking_summary(
-    batch_id: str,
+    term_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get the ranking summary with program and stream cutoff scores."""
-    # Fetch all results for this batch
+    """Get ranking summary aggregated across all runs for an admission term."""
+    # Fetch all results for this term
     result = await db.execute(
-        select(RankingResult).where(RankingResult.ranking_batch_id == batch_id)
+        select(RankingResult).where(
+            RankingResult.admission_term_id == term_id,
+        )
     )
     results = result.scalars().all()
     if not results:
-        raise HTTPException(404, f"No results found for batch: {batch_id}")
+        raise HTTPException(404, f"No results found for term: {term_id}")
 
     # Program cutoffs (self-sponsored)
     prog_result = await db.execute(
@@ -340,7 +373,10 @@ async def get_ranking_summary(
 
     # Stream cutoffs (government)
     quota_result = await db.execute(
-        select(StreamQuota).where(StreamQuota.is_deleted == False)  # noqa: E712
+        select(StreamQuota).where(
+            StreamQuota.is_deleted == False,  # noqa: E712
+            StreamQuota.admission_term_id == term_id,
+        )
     )
     quotas = {q.stream.value: q.max_capacity for q in quota_result.scalars().all()}
 
@@ -363,7 +399,7 @@ async def get_ranking_summary(
     total_unassigned = sum(1 for r in results if not r.is_assigned)
 
     return RankingSummaryResponse(
-        batch_id=batch_id,
+        term_id=term_id,
         program_cutoffs=program_cutoffs,
         stream_cutoffs=stream_cutoffs,
         total_assigned=total_assigned,
