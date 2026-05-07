@@ -253,8 +253,39 @@ async def list_enrollments(
     )
     items = result.scalars().all()
 
+    application_ids = [item.application_id for item in items]
+    app_result = await db.execute(
+        select(UndergraduateApplication).where(UndergraduateApplication.id.in_(application_ids))
+    )
+    applications = {app.id: app for app in app_result.scalars().all()}
+
+    applicant_ids = [app.applicant_id for app in applications.values()]
+    user_result = await db.execute(select(User).where(User.id.in_(applicant_ids)))
+    users = {user.id: user for user in user_result.scalars().all()}
+
     return EnrollmentListResponse(
-        items=[EnrollmentResponse.model_validate(e) for e in items],
+        items=[
+            {
+                "id": item.id,
+                "application_id": item.application_id,
+                "applicant_id": item.applicant_id,
+                "student_full_name": (
+                    f"{users[applications[item.application_id].applicant_id].first_name} "
+                    f"{users[applications[item.application_id].applicant_id].last_name}"
+                    if applications.get(item.application_id)
+                    and users.get(applications[item.application_id].applicant_id)
+                    else None
+                ),
+                "admission_term_id": item.admission_term_id,
+                "university_id": item.university_id,
+                "program_id": item.program_id,
+                "department": item.department,
+                "section": item.section,
+                "enrollment_term": item.enrollment_term,
+                "created_at": item.created_at,
+            }
+            for item in items
+        ],
         total=total,
         page=page,
         page_size=page_size,
