@@ -1,35 +1,51 @@
 """
-Academic Scheduling Agent.
+Academic Scheduling Agent — cohort-based.
 
-Realises SDS Tables 82–84:
+Replaces the per-CourseOffering "section" model with a cohort model:
 
-    Class AcademicSchedulingAgent
-        - instructorSchedule: Map
-        - roomInventory: List<Room>
-        - timeSlots: List<String>
+    A Section is a (term, department, semester) group of students who
+    attend every course of that semester together in the same room.
+    A ClassScheduleSlot pins one weekly meeting of one course inside
+    that section.
 
-        + allocateSections(studentList: List<Student>): void
-        + generateTimetable(departmentID: String): Schedule
-        + resolveRoomConflict(courseID: String, slot: String): Boolean
-        + assignInstructor(courseID: String, instructorID: String): void
-        + getAvailableRooms(capacityReq: Integer, time: String): List<Room>
+The agent runs in two phases (the service composes them via
+``process_task``):
 
-The agent is rule-based in Phase 1: it greedily places students into
-sections by free capacity, then post-validates the resulting weekly
-schedule for room and instructor double-bookings. Anything it cannot
-resolve via :meth:`resolve_room_conflict` is recorded as a
-:class:`ScheduleConflict` row for the human-visible report listed in
-the Track A implementation checklist.
+  1. allocate_sections(term_id)
+     - Group REGISTERED registrations by (Student.department,
+       Student.current_semester).
+     - For each group, split the students into cohorts whose size is
+       bounded by the largest available room. Idempotent: students
+       already pinned to a section are left alone; new students fill
+       remaining capacity in existing sections, then spill into
+       freshly-created sections. Section codes are global (A, B, C,
+       … unique per term) to keep their on-screen identity simple.
+     - Pin the room from a fixed inventory (SDS Table 83).
 
-Room inventory and the standard university teaching window
-(08:30–17:30, SDS Table 83) are class-level defaults so tests can
-inject smaller / larger inventories without touching the singleton.
+  2. generate_schedule(term_id)
+     - For every Section, look up the curriculum for that semester
+       (every Course where ``semester == section.semester``) and lay
+       out ClassScheduleSlot rows. Each course gets exactly
+       ``course.credit_hours`` hours of slots per week.
+     - Slots are placed in 1-hour blocks in the standard university
+       teaching window (08:30–17:30 MON–FRI). The placement is
+       conflict-aware: a slot is rejected if either the section's
+       room or the chosen instructor is already booked at that time
+       across the whole term.
+     - Anything that cannot be placed in the available window is
+       recorded as a :class:`ScheduleConflict` row for the officer.
+
+The agent owns no database session or term identity of its own —
+each public method takes everything it needs as a parameter, so it
+is trivially testable in isolation.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import time
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -37,8 +53,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
 from app.modules.course.models import (
-    Course, CourseOffering, InstructorAssignment, Registration,
-    ScheduleConflict, Section,
+    ClassScheduleSlot, Course, InstructorAssignment, Registration,
+    ScheduleConflict, Section, Student,
 )
 from app.shared.enums import (
     RegistrationStatus, ScheduleConflictStatus, ScheduleConflictType,
@@ -51,18 +67,16 @@ from app.shared.enums import (
 @dataclass
 class AllocationResult:
     """Outcome of :meth:`allocate_sections` for one term."""
-    allocated: list[dict[str, str]] = field(default_factory=list)
+    sections_created: list[dict[str, Any]] = field(default_factory=list)
+    students_placed: list[dict[str, str]] = field(default_factory=list)
     failed: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
 class ScheduleArtefact:
-    """
-    Snapshot of the per-department weekly schedule plus any
-    :class:`ScheduleConflict` rows the agent had to write.
-    """
-    department: str
-    term_id: uuid.UUID
+    """Outcome of :meth:`generate_schedule` for one term."""
+    slots_created: int = 0
+    section_count: int = 0
     sections: list[dict[str, Any]] = field(default_factory=list)
     conflict_ids: list[uuid.UUID] = field(default_factory=list)
 
@@ -70,24 +84,34 @@ class ScheduleArtefact:
 # ── Agent ────────────────────────────────────────────────────────
 
 
+# A teaching day is split into nine 1-hour blocks: 08:30–17:30 with a
+# lunch break implicitly available because we only place classes when
+# a course's credit_hours requires that many filled hours.
+_DAYS = ("MON", "TUE", "WED", "THU", "FRI")
+_HOUR_BLOCKS: list[tuple[time, time]] = [
+    (time(8, 30),  time(9, 30)),
+    (time(9, 30),  time(10, 30)),
+    (time(10, 30), time(11, 30)),
+    (time(11, 30), time(12, 30)),
+    (time(13, 30), time(14, 30)),
+    (time(14, 30), time(15, 30)),
+    (time(15, 30), time(16, 30)),
+    (time(16, 30), time(17, 30)),
+]
+
+
 class AcademicSchedulingAgent(CourseBaseAgent):
-    """SDS §3.1.3 + §5.3 Tables 82–84."""
+    """SDS §3.1.3 + §5.3 Tables 82–84 — cohort-based reimplementation."""
 
     AGENT_ID_PREFIX = "AGENT_ASA_"
 
-    # SDS Table 83 invariants — kept identical to the seeded sandbox
-    # so tests against seeded data have a coherent baseline.
+    # SDS Table 83 invariant — room inventory. Capacities determine how
+    # large a single cohort may grow.
     DEFAULT_ROOM_INVENTORY: list[tuple[str, int]] = [
-        ("NB-101", 40), ("NB-102", 40),
-        ("NB-203", 35), ("NB-204", 35), ("NB-305", 30),
-        ("FBE-12", 50), ("FBE-14", 50),
-    ]
-    DEFAULT_TIME_SLOTS: list[str] = [
-        "MON 08:30-10:00, WED 08:30-10:00",
-        "MON 10:30-12:00, WED 10:30-12:00",
-        "TUE 13:30-15:00, THU 13:30-15:00",
-        "TUE 15:30-17:00, THU 15:30-17:00",
-        "FRI 08:30-11:30",
+        ("NB-101", 60), ("NB-102", 60),
+        ("NB-203", 50), ("NB-204", 50),
+        ("NB-305", 40),
+        ("FBE-12", 80), ("FBE-14", 80),
     ]
 
     def __init__(
@@ -95,358 +119,365 @@ class AcademicSchedulingAgent(CourseBaseAgent):
         agent_id: Optional[str] = None,
         *,
         room_inventory: Optional[list[tuple[str, int]]] = None,
-        time_slots: Optional[list[str]] = None,
     ) -> None:
         super().__init__(agent_id=agent_id or f"{self.AGENT_ID_PREFIX}DEFAULT")
         self._rooms: list[tuple[str, int]] = list(
             room_inventory or self.DEFAULT_ROOM_INVENTORY
         )
-        self._slots: list[str] = list(time_slots or self.DEFAULT_TIME_SLOTS)
+        # Sort rooms largest-first so allocation prefers fewer, fuller
+        # cohorts over many small ones.
+        self._rooms.sort(key=lambda r: -r[1])
 
-    # ── allocate_sections (SDS Table 84) ─────────────────────────
+    # ── Phase 1: allocate_sections ────────────────────────────────
 
     async def allocate_sections(
         self, session: AsyncSession, term_id: uuid.UUID,
     ) -> AllocationResult:
         """
-        Place every REGISTERED student's chosen courses into a
-        section with free capacity. Idempotent — courses already
-        allocated (``section_id`` set) are left alone, so the
-        officer can re-run scheduling after late drops without
-        churning previously-placed students.
+        Group REGISTERED students for ``term_id`` by (department,
+        current_semester) and pin each to a cohort Section. Idempotent
+        on re-runs: a student whose Registration already has
+        ``section_id`` set is skipped.
         """
         result = AllocationResult()
 
-        registrations = (
+        # Pre-load existing sections in this term keyed by (dept, sem)
+        # so re-runs can fill remaining capacity instead of creating
+        # duplicates.
+        existing_sections = (
             await session.execute(
-                select(Registration).where(
+                select(Section).where(
+                    Section.term_id == term_id,
+                    Section.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalars().all()
+        sections_by_group: dict[tuple[str, int], list[Section]] = defaultdict(list)
+        for sec in existing_sections:
+            sections_by_group[(sec.department, sec.semester)].append(sec)
+
+        # Existing global section codes (A, B, C, …) so newly-created
+        # sections in this term don't collide.
+        used_codes: set[str] = {sec.section_code for sec in existing_sections}
+
+        # Pull REGISTERED students for this term and skip ones already
+        # placed.
+        rows = (
+            await session.execute(
+                select(Registration, Student).join(
+                    Student, Registration.student_id == Student.id,
+                ).where(
                     Registration.term_id == term_id,
                     Registration.status == RegistrationStatus.REGISTERED,
                     Registration.is_deleted == False,  # noqa: E712
                 )
             )
-        ).scalars().all()
+        ).all()
 
-        for reg in registrations:
-            await session.refresh(reg, attribute_names=["courses"])
-            for rc in reg.courses:
-                if rc.is_dropped or rc.section_id is not None:
-                    continue
+        students_by_group: dict[tuple[str, int], list[tuple[Registration, Student]]] = (
+            defaultdict(list)
+        )
+        for reg, stu in rows:
+            if reg.section_id is not None:
+                # Already placed — counts toward capacity in its
+                # existing section but doesn't need re-placement.
+                continue
+            if not stu.department:
+                result.failed.append({
+                    "student_id": str(stu.id),
+                    "reason": "student has no department recorded",
+                })
+                continue
+            students_by_group[(stu.department, stu.current_semester)].append(
+                (reg, stu),
+            )
 
-                offering = (
-                    await session.execute(
-                        select(CourseOffering).where(
-                            CourseOffering.course_id == rc.course_id,
-                            CourseOffering.term_id == term_id,
-                            CourseOffering.is_deleted == False,  # noqa: E712
-                        )
-                    )
-                ).scalar_one_or_none()
-                if offering is None:
-                    result.failed.append({
-                        "student_id": str(reg.student_id),
-                        "course_id": str(rc.course_id),
-                        "reason": "no offering for course in this term",
+        for (dept, sem), unplaced in students_by_group.items():
+            sections_for_group = sections_by_group[(dept, sem)]
+
+            # Step 1: top up existing sections that still have capacity.
+            for sec in sections_for_group:
+                while unplaced and sec.enrolled_count < sec.capacity:
+                    reg, stu = unplaced.pop(0)
+                    reg.section_id = sec.id
+                    sec.enrolled_count += 1
+                    result.students_placed.append({
+                        "student_id": str(stu.id),
+                        "section_id": str(sec.id),
+                        "section_code": sec.section_code,
                     })
-                    continue
 
-                sections = (
-                    await session.execute(
-                        select(Section).where(
-                            Section.offering_id == offering.id,
-                            Section.is_deleted == False,  # noqa: E712
-                        )
-                    )
-                ).scalars().all()
+            # Step 2: spill remaining students into fresh sections.
+            while unplaced:
+                # Pick the largest room not already double-booked at
+                # this slot (room re-use across sections is fine —
+                # they meet at different schedule slots).
+                # Pick the largest single room available; cohort size
+                # is capped at that room's capacity.
+                cohort_capacity = max(cap for _, cap in self._rooms)
+                cohort_room = next(
+                    name for name, cap in self._rooms if cap == cohort_capacity
+                )
+                cohort_size = min(len(unplaced), cohort_capacity)
 
-                placed = False
-                for sec in sections:
-                    if sec.enrolled_count < sec.capacity:
-                        rc.section_id = sec.id
-                        sec.enrolled_count += 1
-                        result.allocated.append({
-                            "student_id": str(reg.student_id),
-                            "course_id": str(rc.course_id),
-                            "section_id": str(sec.id),
-                        })
-                        placed = True
-                        break
+                section_code = _next_section_code(used_codes)
+                used_codes.add(section_code)
 
-                if not placed:
-                    result.failed.append({
-                        "student_id": str(reg.student_id),
-                        "course_id": str(rc.course_id),
-                        "reason": "all sections full",
+                section = Section(
+                    term_id=term_id,
+                    department=dept,
+                    semester=sem,
+                    section_code=section_code,
+                    room=cohort_room,
+                    capacity=cohort_capacity,
+                    enrolled_count=0,
+                )
+                session.add(section)
+                await session.flush()
+                sections_for_group.append(section)
+                result.sections_created.append({
+                    "section_id": str(section.id),
+                    "section_code": section_code,
+                    "department": dept,
+                    "semester": sem,
+                    "room": cohort_room,
+                    "capacity": cohort_capacity,
+                })
+
+                for _ in range(cohort_size):
+                    reg, stu = unplaced.pop(0)
+                    reg.section_id = section.id
+                    section.enrolled_count += 1
+                    result.students_placed.append({
+                        "student_id": str(stu.id),
+                        "section_id": str(section.id),
+                        "section_code": section.section_code,
                     })
 
         await session.flush()
         return result
 
-    # ── generate_timetable (SDS Table 84) ────────────────────────
+    # ── Phase 2: generate_schedule ────────────────────────────────
 
-    async def generate_timetable(
-        self,
-        session: AsyncSession,
-        term_id: uuid.UUID,
-        department: str,
+    async def generate_schedule(
+        self, session: AsyncSession, term_id: uuid.UUID,
     ) -> ScheduleArtefact:
         """
-        Produces a conflict-free weekly schedule for the given
-        department. Tries to auto-resolve room clashes via
-        :meth:`resolve_room_conflict`; everything else (notably
-        instructor double-bookings) is surfaced as a
-        :class:`ScheduleConflict` for the officer's report.
+        Build a weekly schedule for every Section in ``term_id``.
+
+        For each section:
+            curriculum = courses where Course.semester == section.semester
+            for each course:
+                place ``course.credit_hours`` hour-blocks,
+                avoiding (room, slot) and (instructor, slot) conflicts
+                that already exist in this term.
+
+        Re-runs are idempotent: existing slots are dropped before
+        rebuilding for the section so the schedule reflects the
+        latest student placements.
         """
-        artefact = ScheduleArtefact(department=department, term_id=term_id)
+        artefact = ScheduleArtefact()
 
-        rows = (
+        sections = (
             await session.execute(
-                select(Section, Course).join(
-                    CourseOffering, Section.offering_id == CourseOffering.id,
-                ).join(
-                    Course, CourseOffering.course_id == Course.id,
-                ).where(
-                    CourseOffering.term_id == term_id,
-                    Course.department == department,
+                select(Section).where(
+                    Section.term_id == term_id,
                     Section.is_deleted == False,  # noqa: E712
-                )
+                ).order_by(Section.section_code.asc())
             )
-        ).all()
-        sections = [(s, c) for s, c in rows]
+        ).scalars().all()
+        artefact.section_count = len(sections)
 
-        # Build clash maps.
-        room_at_slot: dict[tuple[str, str], list[Section]] = {}
-        instructor_at_slot: dict[tuple[str, uuid.UUID], list[Section]] = {}
-        for sec, _course in sections:
-            if sec.time_slot and sec.room:
-                room_at_slot.setdefault((sec.time_slot, sec.room), []).append(sec)
-            if sec.time_slot and sec.instructor_id:
-                instructor_at_slot.setdefault(
-                    (sec.time_slot, sec.instructor_id), [],
-                ).append(sec)
-
-        # Room clashes — try auto-resolve first.
-        for (slot, room), clashing_sections in room_at_slot.items():
-            if len(clashing_sections) <= 1:
-                continue
-            for clashing in clashing_sections[1:]:
-                resolved = await self.resolve_room_conflict(session, clashing.id)
-                if not resolved:
-                    conflict = await self._record_conflict(
-                        session,
-                        term_id=term_id,
-                        department=department,
-                        conflict_type=ScheduleConflictType.ROOM_DOUBLE_BOOKED,
-                        section=clashing,
-                        other_section=clashing_sections[0],
-                        time_slot=slot,
-                        room=room,
-                        description=(
-                            f"Room {room} double-booked at {slot} "
-                            f"by sections {clashing.section_code} and "
-                            f"{clashing_sections[0].section_code}."
-                        ),
+        # Wipe any existing slots for the term so we rebuild cleanly.
+        existing_slot_ids = (
+            await session.execute(
+                select(ClassScheduleSlot.id)
+                .join(Section, Section.id == ClassScheduleSlot.section_id)
+                .where(Section.term_id == term_id)
+            )
+        ).scalars().all()
+        if existing_slot_ids:
+            for slot in (
+                await session.execute(
+                    select(ClassScheduleSlot).where(
+                        ClassScheduleSlot.id.in_(existing_slot_ids),
                     )
+                )
+            ).scalars().all():
+                await session.delete(slot)
+            await session.flush()
+
+        # Term-wide conflict bookkeeping. Each entry is a (day, start)
+        # tuple → set of room names / instructor ids in use.
+        room_busy: dict[tuple[str, time], set[str]] = defaultdict(set)
+        instructor_busy: dict[tuple[str, time], set[uuid.UUID]] = defaultdict(set)
+
+        for sec in sections:
+            curriculum = (
+                await session.execute(
+                    select(Course).where(
+                        Course.semester == sec.semester,
+                        Course.is_deleted == False,  # noqa: E712
+                    ).order_by(Course.code.asc())
+                )
+            ).scalars().all()
+
+            sec_slots: list[dict[str, Any]] = []
+
+            for course in curriculum:
+                instructor_id = await self._pick_instructor(
+                    session, course_id=course.id, term_id=term_id,
+                )
+
+                placed_count = 0
+                for day in _DAYS:
+                    if placed_count == course.credit_hours:
+                        break
+                    for start, end in _HOUR_BLOCKS:
+                        if placed_count == course.credit_hours:
+                            break
+                        # Room collision: different section, same room,
+                        # same slot.
+                        if sec.room and sec.room in room_busy[(day, start)]:
+                            continue
+                        # Instructor collision: same instructor already
+                        # teaching another section/course at this slot.
+                        if (
+                            instructor_id
+                            and instructor_id in instructor_busy[(day, start)]
+                        ):
+                            continue
+                        slot = ClassScheduleSlot(
+                            section_id=sec.id,
+                            course_id=course.id,
+                            instructor_id=instructor_id,
+                            day_of_week=day,
+                            start_time=start,
+                            end_time=end,
+                        )
+                        session.add(slot)
+                        sec_slots.append({
+                            "course_code": course.code,
+                            "course_title": course.title,
+                            "day_of_week": day,
+                            "start_time": start.isoformat(timespec="minutes"),
+                            "end_time": end.isoformat(timespec="minutes"),
+                            "instructor_id": (
+                                str(instructor_id) if instructor_id else None
+                            ),
+                        })
+                        if sec.room:
+                            room_busy[(day, start)].add(sec.room)
+                        if instructor_id:
+                            instructor_busy[(day, start)].add(instructor_id)
+                        placed_count += 1
+                        artefact.slots_created += 1
+
+                if placed_count < course.credit_hours:
+                    conflict = ScheduleConflict(
+                        term_id=term_id,
+                        department=sec.department,
+                        conflict_type=ScheduleConflictType.ROOM_DOUBLE_BOOKED,
+                        section_id=sec.id,
+                        instructor_id=instructor_id,
+                        time_slot=None,
+                        room=sec.room,
+                        description=(
+                            f"Could not place all {course.credit_hours} "
+                            f"weekly hours for {course.code} in section "
+                            f"{sec.section_code}: only {placed_count} "
+                            "block(s) fit before the teaching window or "
+                            "instructor availability ran out."
+                        ),
+                        detected_by_agent_id=self.agent_id,
+                        status=ScheduleConflictStatus.OPEN,
+                    )
+                    session.add(conflict)
+                    await session.flush()
                     artefact.conflict_ids.append(conflict.id)
 
-        # Instructor clashes — no auto-resolve, surface for officer.
-        for (slot, instructor_id), clashing_sections in instructor_at_slot.items():
-            if len(clashing_sections) <= 1:
-                continue
-            for clashing in clashing_sections[1:]:
-                conflict = await self._record_conflict(
-                    session,
-                    term_id=term_id,
-                    department=department,
-                    conflict_type=ScheduleConflictType.INSTRUCTOR_DOUBLE_BOOKED,
-                    section=clashing,
-                    other_section=clashing_sections[0],
-                    time_slot=slot,
-                    instructor_id=instructor_id,
-                    description=(
-                        f"Instructor double-booked at {slot} across two "
-                        "sections in this department."
-                    ),
-                )
-                artefact.conflict_ids.append(conflict.id)
-
-        for sec, course in sections:
             artefact.sections.append({
                 "section_id": str(sec.id),
-                "course_code": course.code,
                 "section_code": sec.section_code,
+                "department": sec.department,
+                "semester": sec.semester,
                 "room": sec.room,
-                "time_slot": sec.time_slot,
-                "instructor_id": str(sec.instructor_id) if sec.instructor_id else None,
                 "capacity": sec.capacity,
                 "enrolled_count": sec.enrolled_count,
+                "slots": sec_slots,
             })
 
+        await session.flush()
         return artefact
 
-    async def _record_conflict(
+    # ── Helpers ───────────────────────────────────────────────────
+
+    async def _pick_instructor(
         self,
         session: AsyncSession,
         *,
+        course_id: uuid.UUID,
         term_id: uuid.UUID,
-        department: str,
-        conflict_type: ScheduleConflictType,
-        section: Section,
-        other_section: Optional[Section] = None,
-        time_slot: Optional[str] = None,
-        room: Optional[str] = None,
-        instructor_id: Optional[uuid.UUID] = None,
-        description: str,
-    ) -> ScheduleConflict:
-        conflict = ScheduleConflict(
-            term_id=term_id,
-            department=department,
-            conflict_type=conflict_type,
-            section_id=section.id,
-            other_section_id=other_section.id if other_section else None,
-            instructor_id=instructor_id,
-            time_slot=time_slot,
-            room=room,
-            description=description,
-            detected_by_agent_id=self.agent_id,
-            status=ScheduleConflictStatus.OPEN,
-        )
-        session.add(conflict)
-        await session.flush()
-        return conflict
-
-    # ── resolve_room_conflict (SDS Table 84) ─────────────────────
-
-    async def resolve_room_conflict(
-        self, session: AsyncSession, section_id: uuid.UUID,
-    ) -> bool:
-        """
-        Try to swap ``section`` to an alternative room with capacity
-        ≥ ``section.capacity`` not used by any other section at the
-        same time slot. Returns True on a successful swap.
-        """
-        section = await session.get(Section, section_id)
-        if section is None or section.time_slot is None:
-            return False
-
-        occupied_rows = (
-            await session.execute(
-                select(Section.room).where(
-                    Section.time_slot == section.time_slot,
-                    Section.id != section.id,
-                    Section.is_deleted == False,  # noqa: E712
-                )
-            )
-        ).scalars().all()
-        occupied = {r for r in occupied_rows if r}
-
-        for room_name, room_capacity in self._rooms:
-            if room_name == section.room:
-                continue
-            if room_capacity < section.capacity:
-                continue
-            if room_name in occupied:
-                continue
-            section.room = room_name
-            await session.flush()
-            return True
-        return False
-
-    # ── assign_instructor (SDS Table 84) ─────────────────────────
-
-    async def assign_instructor(
-        self,
-        session: AsyncSession,
-        section_id: uuid.UUID,
-        instructor_id: uuid.UUID,
-        term_id: uuid.UUID,
-    ) -> None:
-        """
-        Pin ``instructor_id`` onto the section and ensure the
-        InstructorAssignment row exists for the (instructor, course,
-        term) tuple. Idempotent.
-        """
-        section = await session.get(Section, section_id)
-        if section is None:
-            raise ValueError(f"Section {section_id} not found.")
-        offering = await session.get(CourseOffering, section.offering_id)
-        if offering is None:
-            raise ValueError(
-                f"Offering {section.offering_id} for section {section_id} not found."
-            )
-
-        section.instructor_id = instructor_id
-
-        existing = (
+    ) -> Optional[uuid.UUID]:
+        """Pick the first InstructorAssignment for (course, term)."""
+        row = (
             await session.execute(
                 select(InstructorAssignment).where(
-                    InstructorAssignment.instructor_id == instructor_id,
-                    InstructorAssignment.course_id == offering.course_id,
+                    InstructorAssignment.course_id == course_id,
                     InstructorAssignment.term_id == term_id,
-                )
+                ).order_by(InstructorAssignment.created_at.asc())
             )
-        ).scalar_one_or_none()
-        if existing is None:
-            session.add(InstructorAssignment(
-                instructor_id=instructor_id,
-                course_id=offering.course_id,
-                term_id=term_id,
-            ))
-        await session.flush()
+        ).scalars().first()
+        return row.instructor_id if row else None
 
-    # ── get_available_rooms (SDS Table 84) ───────────────────────
-
-    def get_available_rooms(
-        self,
-        capacity_req: int,
-        occupied_rooms: set[str],
-    ) -> list[tuple[str, int]]:
-        """
-        Pure function: rooms in this agent's inventory whose capacity
-        meets ``capacity_req`` and which are not in ``occupied_rooms``.
-        Mirrors the SDS Table 84 signature; callers pass an
-        already-resolved occupancy set so the function is trivially
-        unit-testable.
-        """
-        return [
-            (name, cap) for name, cap in self._rooms
-            if cap >= capacity_req and name not in occupied_rooms
-        ]
-
-    # ── BaseAgent: process_task aggregates the pipeline ──────────
+    # ── BaseAgent contract ────────────────────────────────────────
 
     async def process_task(
         self, input_data: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Run the full scheduling pipeline for a (term, department):
+        Run both phases for a term:
 
-            1. allocate_sections (term-wide)
-            2. generate_timetable (per department)
-
-        Returns a structured payload the service layer drops into the
-        audit-log metadata column.
+            1. allocate_sections — assigns every REGISTERED student
+               in the term to a Section.
+            2. generate_schedule — builds ClassScheduleSlot rows
+               sized to each course's credit_hours.
         """
         session: AsyncSession = input_data["session"]
         term_id: uuid.UUID = input_data["term_id"]
-        department: str = input_data["department"]
 
         allocation = await self.allocate_sections(session, term_id)
-        artefact = await self.generate_timetable(session, term_id, department)
+        artefact = await self.generate_schedule(session, term_id)
 
         return {
             "allocation": {
-                "allocated_count": len(allocation.allocated),
-                "failed_count": len(allocation.failed),
-                "allocated": allocation.allocated,
+                "sections_created": allocation.sections_created,
+                "students_placed_count": len(allocation.students_placed),
+                "students_placed": allocation.students_placed,
                 "failed": allocation.failed,
             },
             "schedule": {
-                "department": artefact.department,
-                "term_id": str(artefact.term_id),
-                "section_count": len(artefact.sections),
+                "term_id": str(term_id),
+                "section_count": artefact.section_count,
+                "slots_created": artefact.slots_created,
                 "sections": artefact.sections,
                 "conflict_count": len(artefact.conflict_ids),
                 "conflict_ids": [str(cid) for cid in artefact.conflict_ids],
             },
         }
+
+
+def _next_section_code(used: set[str]) -> str:
+    """A, B, ..., Z, AA, AB, ..."""
+    n = 1
+    while True:
+        # Convert n to a base-26 string using A-Z digits.
+        x = n
+        chars: list[str] = []
+        while x:
+            x, r = divmod(x - 1, 26)
+            chars.append(chr(ord("A") + r))
+        candidate = "".join(reversed(chars))
+        if candidate not in used:
+            return candidate
+        n += 1

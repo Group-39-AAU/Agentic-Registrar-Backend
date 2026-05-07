@@ -22,12 +22,12 @@ Tables 55–84 (detailed design).
 """
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Optional
 
 from sqlalchemy import (
     JSON, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer,
-    String, Text, UniqueConstraint,
+    String, Text, Time, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -198,54 +198,110 @@ class CourseOffering(SoftDeleteBase):
 
 class Section(SoftDeleteBase):
     """
-    A concrete section under a :class:`CourseOffering` — assigned to
-    a specific room and weekly time slot, taught by a single
-    instructor, with its own seat capacity and running enrollment
-    count.
+    A class **cohort** for a single (term, department, semester) tuple:
+    a group of students at the same point in their program who attend
+    every course of that semester together in the same room.
 
-    Time slots must fall within the standard university lecture hours
-    (08:30–17:30) per the SDS ``timeSlots`` invariant on the
-    AcademicScheduling Agent (Table 83). The format itself is stored
-    as free text (e.g. "MON 08:30-10:00, WED 08:30-10:00") so any
-    weekly recurrence rule the timetable agent picks fits.
+    Section codes are globally unique within a term (A, B, C, … across
+    every department/semester). Capacity is the room capacity; the
+    Academic Scheduling Agent splits a (term, department, semester)
+    student population into as many sections as the largest eligible
+    room can absorb.
 
-    The instructor FK is forward-declared as a string so this commit
-    compiles before the Instructor model lands in D2.
+    Per-class meetings (which course meets when, with which instructor,
+    in which fixed slot of the section's weekly schedule) live on
+    :class:`ClassScheduleSlot`.
     """
 
     __tablename__ = "sections"
 
-    offering_id: Mapped[uuid.UUID] = mapped_column(
+    term_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("course_offerings.id"),
-        nullable=False,
-        index=True,
+        ForeignKey("academic_terms.id"),
+        nullable=False, index=True,
+    )
+    department: Mapped[str] = mapped_column(
+        String(100), nullable=False, index=True,
+    )
+    semester: Mapped[int] = mapped_column(
+        Integer, nullable=False, index=True,
     )
     section_code: Mapped[str] = mapped_column(String(10), nullable=False)
     room: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    time_slot: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    instructor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("instructors.id"),
-        nullable=True,
-        index=True,
-    )
     capacity: Mapped[int] = mapped_column(Integer, nullable=False)
     enrolled_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0
+        Integer, nullable=False, default=0,
     )
 
-    offering: Mapped["CourseOffering"] = relationship(lazy="selectin")
+    term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
 
     __table_args__ = (
         UniqueConstraint(
-            "offering_id", "section_code",
-            name="uq_section_code_per_offering",
+            "term_id", "section_code",
+            name="uq_section_code_per_term",
+        ),
+        CheckConstraint(
+            "semester BETWEEN 1 AND 12",
+            name="ck_sections_semester_range",
         ),
         CheckConstraint("capacity > 0", name="ck_section_capacity_positive"),
         CheckConstraint(
             "enrolled_count >= 0 AND enrolled_count <= capacity",
             name="ck_section_enrolled_within_capacity",
+        ),
+    )
+
+
+class ClassScheduleSlot(Base):
+    """
+    One weekly meeting of a course inside a Section's schedule. Each
+    course attended by a section gets ``course.credit_hours`` hours of
+    these slots per week, so a 3-credit course → three 1-hour slots
+    (or one 3-hour block, depending on what the agent picks). The
+    section's room is fixed across all its slots.
+
+    Append-only: regenerating the schedule deletes and re-inserts.
+    """
+
+    __tablename__ = "class_schedule_slots"
+
+    section_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sections.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False, index=True,
+    )
+    instructor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("instructors.id"),
+        nullable=True, index=True,
+    )
+    day_of_week: Mapped[str] = mapped_column(
+        String(3), nullable=False,
+        comment="MON / TUE / WED / THU / FRI",
+    )
+    start_time: Mapped[time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[time] = mapped_column(Time, nullable=False)
+
+    section: Mapped["Section"] = relationship(lazy="selectin")
+    course: Mapped["Course"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "section_id", "day_of_week", "start_time",
+            name="uq_section_slot_per_day_start",
+        ),
+        CheckConstraint(
+            "day_of_week IN ('MON','TUE','WED','THU','FRI')",
+            name="ck_schedule_slot_day_of_week",
+        ),
+        CheckConstraint(
+            "end_time > start_time",
+            name="ck_schedule_slot_end_after_start",
         ),
     )
 
@@ -285,6 +341,20 @@ class Student(SoftDeleteBase):
     )
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     current_semester: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Denormalised from Enrollment.department at onboarding time so
+    # the curriculum filter doesn't need a cross-module join. Nullable
+    # for backward compat with rows seeded before this column existed;
+    # OnboardingService always populates it on new rows.
+    department: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+    )
+    # Denormalised from UndergraduateApplication.sponsorship_type at
+    # onboarding time. The student doesn't choose this per-registration
+    # — it's determined by the admission process. Nullable for legacy
+    # rows; OnboardingService always populates it on new rows.
+    sponsorship_type: Mapped[Optional[SponsorshipType]] = mapped_column(
+        nullable=True,
+    )
     enrollment_status: Mapped[EnrollmentStatus] = mapped_column(
         nullable=False, default=EnrollmentStatus.ACTIVE, index=True
     )
@@ -456,9 +526,19 @@ class Registration(SoftDeleteBase):
     finalised_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Cohort assignment — null until the AcademicSchedulingAgent has
+    # placed this student into a Section for the term. Once set, every
+    # course on the registration is attended in this Section's room
+    # at the times listed in ClassScheduleSlot rows.
+    section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sections.id"),
+        nullable=True, index=True,
+    )
 
     student: Mapped["Student"] = relationship(lazy="selectin")
     term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
+    section: Mapped[Optional["Section"]] = relationship(lazy="selectin")
     courses: Mapped[list["RegistrationCourse"]] = relationship(
         back_populates="registration", lazy="selectin",
     )
@@ -477,10 +557,9 @@ class Registration(SoftDeleteBase):
 
 class RegistrationCourse(Base):
     """
-    Junction recording which courses a registration includes. The
-    ``section_id`` is null until the Academic Scheduling Agent has
-    placed the student into a section; thereafter it pins which
-    section the student attends.
+    Junction recording which courses a registration includes. Section
+    assignment is on :class:`Registration` (one cohort per term); this
+    table just records "this student takes this course this term".
 
     Append-only (inherits :class:`Base`) — drops are surfaced as
     AddDropRequest rows rather than mutations of this table, so the
@@ -499,12 +578,6 @@ class RegistrationCourse(Base):
         UUID(as_uuid=True),
         ForeignKey("courses.id"),
         nullable=False,
-        index=True,
-    )
-    section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("sections.id"),
-        nullable=True,
         index=True,
     )
     is_dropped: Mapped[bool] = mapped_column(
@@ -592,11 +665,6 @@ class AddDropRequest(SoftDeleteBase):
         ForeignKey("courses.id"),
         nullable=False,
         index=True,
-    )
-    target_section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("sections.id"),
-        nullable=True,
     )
     action: Mapped[AddDropAction] = mapped_column(nullable=False)
     deadline_snapshot: Mapped[date] = mapped_column(Date, nullable=False)

@@ -97,10 +97,12 @@ async def test_offering_capacity_must_be_positive(
 
 
 async def test_section_enrolled_cannot_exceed_capacity(
-    async_session, seeded_offering,
+    async_session, seeded_term,
 ):
     bad = Section(
-        offering_id=seeded_offering.id,
+        term_id=seeded_term.id,
+        department="Computer Science",
+        semester=1,
         section_code="OVERFLOW",
         capacity=10,
         enrolled_count=11,      # CHECK: enrolled <= capacity

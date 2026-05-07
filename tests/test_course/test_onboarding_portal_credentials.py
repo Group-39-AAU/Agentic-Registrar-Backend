@@ -109,9 +109,7 @@ async def enrollment(async_session, applicant) -> Enrollment:
         application_id=app_row.id,
         applicant_id=applicant.id,
         university_id="UGR/0042/14",
-        portal_password="legacy-unused",
         department="Computer Science",
-        section="A",
         enrollment_term="2025/2026",
     )
     async_session.add(enrollment)

@@ -37,17 +37,27 @@ def _load_seed_module():
 
 
 async def _run_seed_helpers(session, seed):
-    term = await seed._seed_term(session)
+    terms = await seed._seed_terms(session)
     courses = await seed._seed_courses(session)
     await seed._seed_prerequisites(session, courses)
     instructors = await seed._seed_instructors(session)
-    await seed._seed_offerings_and_sections(session, term, courses, instructors)
+    # Each term gets its own offerings + sections so a Fall-registered
+    # student can't accidentally end up in a Spring section.
+    for term in terms:
+        await seed._seed_offerings_and_sections(
+            session, term, courses, instructors,
+        )
     await seed._seed_students(session)
     await seed._seed_officers(session)
 
 
 def _row_counts(session):
-    """Return a coroutine that snapshots row counts of every Phase-0 table."""
+    """
+    Snapshot row counts of every Phase-0 table that the seed touches.
+    Section is intentionally excluded — under the cohort model, sections
+    are emitted by the AcademicSchedulingAgent at allocation time, not
+    at seed time, so the seed legitimately produces zero of them.
+    """
     async def _inner():
         out = {}
         for name, model in (
@@ -56,7 +66,6 @@ def _row_counts(session):
             ("prereqs", CoursePrerequisite),
             ("instructors", Instructor),
             ("offerings", CourseOffering),
-            ("sections", Section),
             ("assignments", InstructorAssignment),
             ("students", Student),
             ("officers", CourseManagementOfficer),
@@ -106,14 +115,18 @@ async def test_seeded_prereq_count_matches_module_constant(async_session):
     assert len(rows) == len(seed.PREREQUISITES)
 
 
-async def test_seeded_section_count_is_courses_times_sections_per_course(
-    async_session,
-):
+async def test_seed_does_not_create_sections(async_session):
+    """
+    Under the cohort-section model, sections are created by the
+    AcademicSchedulingAgent at allocation time (when the officer runs
+    /courses/officer/schedule/generate). The seed only sets up the
+    catalog + offerings + students; cohort sections appear later.
+    """
     seed = _load_seed_module()
     await _run_seed_helpers(async_session, seed)
 
     sections = (await async_session.execute(select(Section))).scalars().all()
-    assert len(sections) == len(seed.COURSES) * seed.SECTIONS_PER_COURSE
+    assert len(sections) == 0
 
 
 async def test_seeded_officer_roles_include_a_department_head(async_session):

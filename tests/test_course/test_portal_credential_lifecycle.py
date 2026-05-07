@@ -114,9 +114,7 @@ async def admission_user_with_enrollment(async_session) -> tuple[User, Enrollmen
         application_id=app_row.id,
         applicant_id=user.id,
         university_id="UGR/0042/14",
-        portal_password="legacy-unused",
         department="Computer Science",
-        section="A",
         enrollment_term="2025/2026",
     )
     async_session.add(enrollment)

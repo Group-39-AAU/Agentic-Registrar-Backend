@@ -97,13 +97,11 @@ async def registration_with_courses(
 def _build_request(
     *, registration_id: uuid.UUID, course_id: uuid.UUID,
     action: AddDropAction, deadline: date,
-    target_section_id: uuid.UUID | None = None,
 ) -> AddDropRequest:
     """Helper: build an AddDropRequest object without committing it."""
     return AddDropRequest(
         registration_id=registration_id,
         course_id=course_id,
-        target_section_id=target_section_id,
         action=action,
         deadline_snapshot=deadline,
         status=AddDropRequestStatus.PENDING,

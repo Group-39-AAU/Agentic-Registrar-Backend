@@ -95,14 +95,21 @@ async def seeded_offering(
 
 @pytest_asyncio.fixture
 async def seeded_section(
-    async_session, seeded_offering, seeded_instructor,
+    async_session, seeded_term, seeded_course, seeded_instructor,
 ) -> Section:
+    """
+    A cohort Section under the new model: keyed by (term, department,
+    semester) rather than per-CourseOffering. The seeded_course's
+    department/semester are reused so any test that wants to register
+    students into this section finds curriculum that lines up.
+    """
+    del seeded_instructor  # legacy parameter — instructors live on slots now
     section = Section(
-        offering_id=seeded_offering.id,
+        term_id=seeded_term.id,
+        department=seeded_course.department,
+        semester=seeded_course.semester,
         section_code="A",
         room="NB-101",
-        time_slot="MON 08:30-10:00, WED 08:30-10:00",
-        instructor_id=seeded_instructor.id,
         capacity=30,
         enrolled_count=0,
     )

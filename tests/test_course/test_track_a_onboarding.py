@@ -89,9 +89,7 @@ async def admission_enrollment(
         application_id=admission_application.id,
         applicant_id=admitted_user.id,
         university_id="UGR/9001/14",
-        portal_password="temp-bcrypt-hash",
         department="Computer Science",
-        section="A",
         enrollment_term="Fall 2026",
     )
     async_session.add(enrollment)
@@ -221,9 +219,7 @@ async def test_onboard_handles_missing_user_name_gracefully(
         application_id=app.id,
         applicant_id=user.id,
         university_id="UGR/9999/14",
-        portal_password="x",
         department="Computer Science",
-        section="A",
         enrollment_term="Fall 2026",
     )
     async_session.add(enrollment)

@@ -63,15 +63,47 @@ class RegistrationDraftCreate(BaseModel):
     Request: student creates a draft registration for a term.
 
     The endpoint resolves the calling student from get_current_user,
-    so student_id is not in the payload.
+    so student_id is not in the payload. ``sponsorship_type`` is
+    inherited from the student's admission record (denormalised onto
+    Student.sponsorship_type at onboarding time) — the student does
+    not pick it per registration.
     """
     term_id: uuid.UUID
-    sponsorship_type: SponsorshipType
 
 
 class RegistrationCourseAdd(BaseModel):
     """Request: add a course to an existing draft."""
     course_id: uuid.UUID
+
+
+class RegistrationPaymentInitiateResponse(BaseModel):
+    """Response from /payment/initiate — what a real gateway page would consume."""
+    registration_id: uuid.UUID
+    payment_reference: str
+    payment_url: str
+
+
+class RegistrationPaymentCallbackRequest(BaseModel):
+    """
+    Body for the simulated bursar-gateway callback. In production this
+    would carry the gateway's signed payload; in the mock we just echo
+    back the payment_reference returned by /initiate.
+    """
+    payment_reference: str = Field(..., min_length=1, max_length=64)
+
+
+class CostSharingFormResponse(BaseModel):
+    """
+    Response from POST /registrations/{id}/cost-sharing-form.
+    Government-sponsored students sign a single form covering every
+    course they registered for; the response echoes which courses
+    were marked as covered so the portal can confirm coverage to
+    the student.
+    """
+    registration_id: uuid.UUID
+    sponsorship_type: str
+    course_count: int
+    marked_paid_course_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class RegistrationCourseRead(BaseModel):
@@ -125,26 +157,60 @@ class RegistrationSubmitResponse(BaseModel):
 
 
 class ScheduleGenerateRequest(BaseModel):
-    """Officer payload for ``POST /officer/schedule/generate``."""
+    """
+    Officer payload for ``POST /officer/schedule/generate``. Department
+    is no longer a parameter — every (department, semester) cohort in
+    the term is processed in one call.
+    """
     term_id: uuid.UUID
-    department: str = Field(..., min_length=1, max_length=100)
 
 
-class SectionTimetableEntry(BaseModel):
-    """One row in a student's or instructor's timetable view."""
+class SectionRead(BaseModel):
+    """Cohort section header (without slots)."""
     section_id: uuid.UUID
+    section_code: str
+    department: str
+    semester: int
+    room: Optional[str] = None
+    capacity: int
+    enrolled_count: int
+
+
+class ClassScheduleSlotRead(BaseModel):
+    """One weekly meeting in a section's schedule."""
     course_code: str
     course_title: str
-    section_code: str
-    room: Optional[str] = None
-    time_slot: Optional[str] = None
+    day_of_week: str
+    start_time: str
+    end_time: str
     instructor_id: Optional[uuid.UUID] = None
 
 
-class TimetableResponse(BaseModel):
-    """Read-only timetable for a single actor."""
+class SectionScheduleResponse(BaseModel):
+    """
+    Schedule view for a single section. Returned by /me/schedule (after
+    resolving the caller's section), /students/{id}/schedule, and
+    /sections/{id}/schedule. ``section`` is null when the caller has no
+    cohort assignment yet (e.g. officer hasn't run scheduling).
+    """
     term_id: uuid.UUID
-    entries: list[SectionTimetableEntry] = Field(default_factory=list)
+    student_id: Optional[uuid.UUID] = None
+    section: Optional[SectionRead] = None
+    slots: list[ClassScheduleSlotRead] = Field(default_factory=list)
+
+
+class InstructorScheduleEntry(BaseModel):
+    """One row in an instructor's per-term schedule view."""
+    section_id: uuid.UUID
+    section_code: str
+    department: str
+    semester: int
+    room: Optional[str] = None
+    course_code: str
+    course_title: str
+    day_of_week: str
+    start_time: str
+    end_time: str
 
 
 class ScheduleConflictRead(BaseModel):
@@ -182,7 +248,6 @@ class AddDropRequestCreate(BaseModel):
     course_id: uuid.UUID
     action: AddDropAction
     deadline: date
-    target_section_id: Optional[uuid.UUID] = None
 
 
 class AddDropRequestResponse(BaseModel):
@@ -192,7 +257,6 @@ class AddDropRequestResponse(BaseModel):
     id: uuid.UUID
     registration_id: uuid.UUID
     course_id: uuid.UUID
-    target_section_id: Optional[uuid.UUID] = None
     action: AddDropAction
     deadline_snapshot: date
     status: AddDropRequestStatus
@@ -293,3 +357,55 @@ class PrerequisiteOverrideResponse(BaseModel):
     course_id: uuid.UUID
     granted_by_id: uuid.UUID
     justification: str
+
+
+# ══════════════════════════════════════════════════════════════
+#  Instructor management (Department-Head endpoints)
+# ══════════════════════════════════════════════════════════════
+
+
+class InstructorCreateRequest(BaseModel):
+    """
+    Department-Head payload for ``POST /officer/instructors``. The
+    portal generates a 4-digit PIN, hashes it onto a fresh User row,
+    and emails the staff_id + PIN to the instructor — same lifecycle
+    as student onboarding.
+    """
+    staff_id: str = Field(..., min_length=3, max_length=20,
+                          examples=["STAFF/0042/14"])
+    email: str = Field(..., min_length=3, max_length=255)
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    department: str = Field(..., min_length=1, max_length=100)
+
+
+class InstructorResponse(BaseModel):
+    """Read view of an Instructor row."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    user_id: uuid.UUID
+    instructor_id: str
+    department: str
+
+
+class InstructorAssignmentCreate(BaseModel):
+    """
+    Department-Head payload for ``POST /officer/instructor-assignments``.
+    Reposting with a different instructor for the same (course, term)
+    silently rebinds — the service guarantees one active assignment
+    per (course, term).
+    """
+    instructor_id: uuid.UUID
+    course_id: uuid.UUID
+    term_id: uuid.UUID
+
+
+class InstructorAssignmentResponse(BaseModel):
+    """Read view of an InstructorAssignment row."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    instructor_id: uuid.UUID
+    course_id: uuid.UUID
+    term_id: uuid.UUID

@@ -25,6 +25,7 @@ and the service then resolves the matching Student row.
 from __future__ import annotations
 
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,7 +54,13 @@ from app.modules.course.schemas import (
     AdvisoryRecommendationRead,
     AdvisoryReviewCloseRequest,
     ComplianceResultResponse,
+    CostSharingFormResponse,
     CourseResponse,
+    InstructorAssignmentCreate,
+    InstructorAssignmentResponse,
+    InstructorCreateRequest,
+    InstructorResponse,
+    InstructorScheduleEntry,
     RegistrationCourseAdd,
     RegistrationDraftCreate,
     RegistrationResponse,
@@ -61,16 +68,17 @@ from app.modules.course.schemas import (
     ScheduleConflictRead,
     ScheduleGenerateRequest,
     ScheduleGenerateResponse,
-    SectionTimetableEntry,
+    SectionScheduleResponse,
     PrerequisiteOverrideRequest,
     PrerequisiteOverrideResponse,
+    RegistrationPaymentCallbackRequest,
+    RegistrationPaymentInitiateResponse,
     StudentOnboardRequest,
     StudentResponse,
-    TimetableResponse,
 )
 from app.modules.course.service import (
-    AddDropService, AdvisoryService, OnboardingService, RegistrationService,
-    SchedulingService, TermService,
+    AddDropService, AdvisoryService, InstructorService, OnboardingService,
+    RegistrationService, SchedulingService, TermService,
 )
 from app.shared.email.service import EmailService
 from app.shared.enums import UserRole
@@ -169,9 +177,7 @@ async def create_registration_draft(
     student = await _resolve_student(db, current_user)
     svc = RegistrationService(db)
     try:
-        return await svc.create_draft(
-            student.id, payload.term_id, payload.sponsorship_type,
-        )
+        return await svc.create_draft(student.id, payload.term_id)
     except RegistrationWindowClosedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     except DuplicateRegistrationError as exc:
@@ -290,11 +296,15 @@ async def officer_generate_schedule(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Officer-only: allocate every REGISTERED student in the term to a
+    cohort Section, then build the per-section weekly schedule. Runs
+    across all departments at once (cohort allocation is term-wide).
+    """
     svc = SchedulingService(db)
     try:
         result = await svc.generate_schedule(
             term_id=payload.term_id,
-            department=payload.department,
             officer_role=current_user.role,
             officer_id=current_user.id,
         )
@@ -328,46 +338,69 @@ async def officer_list_conflicts(
 
 
 @router.get(
-    "/me/timetable",
-    response_model=TimetableResponse,
+    "/me/schedule",
+    response_model=SectionScheduleResponse,
+    summary="Calling student's section schedule for a term",
 )
-async def get_my_timetable(
+async def get_my_schedule(
     term_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Return the calling student's class schedule for ``term_id``.
+    Resolves the student → registration → section → slots. ``section``
+    is null and ``slots`` is empty when the student has not been
+    placed into a section yet (officer hasn't run scheduling).
+    """
     student = await _resolve_student(db, current_user)
     svc = SchedulingService(db)
-    rows = await svc.get_student_timetable(student.id, term_id)
-    return TimetableResponse(
-        term_id=term_id,
-        entries=[SectionTimetableEntry(**r) for r in rows],
-    )
+    return await svc.get_student_schedule(student.id, term_id)
 
 
 @router.get(
-    "/instructors/{instructor_id}/timetable",
-    response_model=TimetableResponse,
+    "/students/{student_id}/schedule",
+    response_model=SectionScheduleResponse,
+    summary="Look up any student's section schedule (officer/admin)",
 )
-async def get_instructor_timetable(
+async def get_student_schedule_by_id(
+    student_id: uuid.UUID,
+    term_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer/admin endpoint to query any student's class schedule by
+    student_id. Distinct from /me/schedule which resolves the caller
+    automatically.
+    """
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only registrar officers or admins may look up other students' schedules.",
+        )
+    svc = SchedulingService(db)
+    return await svc.get_student_schedule(student_id, term_id)
+
+
+@router.get(
+    "/instructors/{instructor_id}/schedule",
+    response_model=list[InstructorScheduleEntry],
+)
+async def get_instructor_schedule(
     instructor_id: uuid.UUID,
     term_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Read-only instructor timetable. Authorisation is permissive in
-    Phase 1: any authenticated user can view any instructor's
-    timetable. Tighten when role-aware instructor identity wiring
-    lands later.
+    Read-only instructor schedule, flattened across sections. Any
+    authenticated user can view any instructor's schedule
+    (consistent with the previous timetable endpoint's policy).
     """
-    del current_user  # auth confirmed by Depends; no role gate yet
+    del current_user  # auth confirmed by Depends; no role gate
     svc = SchedulingService(db)
-    rows = await svc.get_instructor_timetable(instructor_id, term_id)
-    return TimetableResponse(
-        term_id=term_id,
-        entries=[SectionTimetableEntry(**r) for r in rows],
-    )
+    return await svc.get_instructor_schedule(instructor_id, term_id)
 
 
 # ── Add/Drop endpoints ───────────────────────────────────────────
@@ -401,7 +434,6 @@ async def submit_add_drop_request(
             action=payload.action,
             deadline=payload.deadline,
             student_user_id=current_user.id,
-            target_section_id=payload.target_section_id,
         )
     except AdjustmentDeniedError as exc:
         # 422 carries the agent verdict so the portal can show
@@ -692,3 +724,263 @@ async def officer_close_advisory_review(
         raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+# ── Mock payment (mirrors /undergraduate/applications/.../payment/*) ─
+#
+# Two-step shape, identical to admission's mock:
+#   1. Student calls /payment/initiate to mint a payment_reference
+#      and get a (fake) gateway URL.
+#   2. The "gateway" — i.e. you, in Swagger, until a real bursar is
+#      wired up — POSTs that reference back to /payment/callback,
+#      which marks every course in the draft as paid in the in-memory
+#      PayMock. After the callback, /submit will clear the payment
+#      check and reach REGISTERED.
+#
+# /initiate is student-only and ownership-checked; /callback is PUBLIC
+# because in production it'd be hit by the bursar's webhook.
+
+
+@router.post(
+    "/registrations/{registration_id}/payment/initiate",
+    response_model=RegistrationPaymentInitiateResponse,
+)
+async def initiate_registration_payment(
+    registration_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Student initiates payment for their own draft registration.
+    Returns a simulated gateway URL + the payment_reference that the
+    callback will need to echo back. Idempotent: re-calling on a
+    registration with an existing reference returns the same one.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = RegistrationService(db)
+    try:
+        registration = await svc.initiate_payment(
+            registration_id, student_user_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except InvalidStateTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+
+    # Defensive: should never happen since _resolve_student would have
+    # raised, but keeps the type-checker happy.
+    if registration.student_id != student.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your registration.")
+
+    return RegistrationPaymentInitiateResponse(
+        registration_id=registration.id,
+        payment_reference=registration.payment_reference,
+        payment_url=(
+            f"https://pay.registrar.example.com/checkout/"
+            f"{registration.payment_reference}"
+        ),
+    )
+
+
+@router.post(
+    "/registrations/{registration_id}/payment/callback",
+    response_model=RegistrationResponse,
+)
+async def registration_payment_callback(
+    registration_id: uuid.UUID,
+    payload: RegistrationPaymentCallbackRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Simulated bursar-gateway callback. PUBLIC so it can be invoked
+    without a JWT (mirrors admission's /payment/callback). Marks every
+    course in the registration as paid in the in-memory PayMock.
+    """
+    svc = RegistrationService(db)
+    try:
+        return await svc.complete_payment(
+            registration_id, payload.payment_reference,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except InvalidStateTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, exc.detail)
+
+
+@router.post(
+    "/registrations/{registration_id}/cost-sharing-form",
+    response_model=CostSharingFormResponse,
+    summary="Submit the cost-sharing form (government-sponsored only)",
+)
+async def submit_cost_sharing_form(
+    registration_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Government-sponsored students settle the term's tuition by
+    signing a single cost-sharing form rather than paying course-
+    by-course. Submitting the form marks every active course on the
+    registration as paid in the bursar-mock and clears any active
+    PAYMENT_HOLD so the student can /submit again.
+
+    Self-sponsored students should use /payment/initiate +
+    /payment/callback instead — calling this endpoint on a
+    self-sponsored registration returns 409.
+    """
+    svc = RegistrationService(db)
+    try:
+        return await svc.submit_cost_sharing_form(
+            registration_id=registration_id,
+            student_user_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except InvalidStateTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+
+
+# ── Instructor management (Department-Head endpoints) ──────────
+
+
+@router.post(
+    "/officer/instructors",
+    response_model=InstructorResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="[Department Head] Create a new instructor",
+)
+async def officer_add_instructor(
+    payload: InstructorCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """
+    Create a new instructor profile + portal credentials. Generates a
+    4-digit PIN, sets ``must_change_password=True``, and emails the
+    instructor their staff_id + PIN. The PIN is never returned in the
+    HTTP response.
+
+    Department Head or ADMIN only.
+    """
+    svc = InstructorService(db, email_service=email_service)
+    try:
+        instructor, _pin = await svc.add_instructor(
+            staff_id=payload.staff_id,
+            email=payload.email,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            department=payload.department,
+            officer_user_id=current_user.id,
+        )
+        return instructor
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+
+
+@router.get(
+    "/officer/instructors",
+    response_model=list[InstructorResponse],
+    summary="List instructors (filterable by department)",
+)
+async def officer_list_instructors(
+    department: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List instructors. Open to any logged-in user (officers,
+    instructors browsing peers, etc.). Filter by department via
+    query param to narrow the view.
+    """
+    del current_user  # auth confirmed; no role gate on read
+    svc = InstructorService(db)
+    return await svc.list_instructors(department=department)
+
+
+@router.post(
+    "/officer/instructor-assignments",
+    response_model=InstructorAssignmentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="[Department Head] Assign instructor to a course in a term",
+)
+async def officer_assign_instructor(
+    payload: InstructorAssignmentCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Bind an instructor to a (course, term). Re-posting with a
+    different instructor for the same (course, term) silently
+    rebinds — at most one active assignment per (course, term).
+
+    Department Head or ADMIN only.
+    """
+    svc = InstructorService(db)
+    try:
+        return await svc.assign_to_course(
+            instructor_id=payload.instructor_id,
+            course_id=payload.course_id,
+            term_id=payload.term_id,
+            officer_user_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.get(
+    "/officer/instructor-assignments",
+    response_model=list[InstructorAssignmentResponse],
+    summary="List instructor assignments (filter by term/course/instructor)",
+)
+async def officer_list_instructor_assignments(
+    term_id: Optional[uuid.UUID] = None,
+    course_id: Optional[uuid.UUID] = None,
+    instructor_id: Optional[uuid.UUID] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List instructor assignments — readable by any logged-in user."""
+    del current_user
+    svc = InstructorService(db)
+    return await svc.list_assignments(
+        term_id=term_id,
+        course_id=course_id,
+        instructor_id=instructor_id,
+    )
+
+
+@router.delete(
+    "/officer/instructor-assignments/{assignment_id}",
+    status_code=204,
+    summary="[Department Head] Remove an instructor assignment",
+)
+async def officer_unassign_instructor(
+    assignment_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove an InstructorAssignment row. Department Head or ADMIN only."""
+    svc = InstructorService(db)
+    try:
+        await svc.unassign(
+            assignment_id=assignment_id,
+            officer_user_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    return None

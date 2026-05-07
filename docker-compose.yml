@@ -18,6 +18,12 @@ services:
       - db
     env_file:
       - .env
+    environment:
+      # Override DATABASE_URL from .env: inside the container,
+      # 'localhost' points at the container itself, not the db
+      # service. Local uvicorn keeps using the .env value (localhost
+      # works there because Postgres' port is exposed on the host).
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/registrar_db
     volumes:
       - .:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

@@ -45,9 +45,10 @@ from app.modules.course.exceptions import (
 )
 from app.modules.course.models import (
     AcademicTerm, AddDropRequest, AdvisoryRecommendation,
-    CourseManagementOfficer, Course, CourseOffering, Instructor,
-    PrerequisiteOverride, Registration, RegistrationCourse,
-    RegistrationStatusHistory, ScheduleConflict, Section, Student,
+    ClassScheduleSlot, CourseManagementOfficer, Course, CourseOffering,
+    Instructor, InstructorAssignment, PrerequisiteOverride, Registration,
+    RegistrationCourse, RegistrationStatusHistory, ScheduleConflict, Section,
+    Student,
 )
 from app.modules.course.repository import (
     AcademicTermRepository, AddDropRequestRepository,
@@ -85,6 +86,7 @@ _ALLOWED_TRANSITIONS: dict[RegistrationStatus, set[RegistrationStatus]] = {
     },
     RegistrationStatus.PAYMENT_HOLD: {
         RegistrationStatus.CHECKING_PAYMENT,
+        RegistrationStatus.REGISTRATION_OPEN,    # bursar callback cleared the hold
         RegistrationStatus.CANCELLED,
     },
     RegistrationStatus.VALIDATION_SUCCESS: {
@@ -229,11 +231,21 @@ class RegistrationService:
         self, student_id: uuid.UUID,
     ) -> list[Course]:
         """
-        Return the courses the calling student is allowed to see in
-        the portal. Phase-1 simplification: every course in the
-        catalog. The full SRS Course-FR-01 curriculum filter
-        (program-aligned, semester-aligned) lands in Track A.5 with
-        the AcademicAdvisoryAgent.
+        Return the courses the calling student can register for in
+        the current term. The filter is strict:
+
+            course.department == student.department
+            AND course.semester == student.current_semester
+
+        Each engineering department owns its own version of every
+        foundational course (its own Calculus I, its own Discrete
+        Math, etc.), so a Software Engineering student in semester 3
+        only sees the four SE-tagged semester-3 courses — never a CE
+        or BME course at the same level.
+
+        If the student row predates the Student.department migration
+        and was never reconciled, the filter falls back to the
+        semester-only view so we don't show an empty curriculum.
         """
         student = (
             await self.db.execute(
@@ -242,10 +254,20 @@ class RegistrationService:
         ).scalar_one_or_none()
         if student is None:
             raise EntityNotFoundError("Student", str(student_id))
+
+        filters = [
+            Course.semester == student.current_semester,
+            Course.is_deleted == False,  # noqa: E712
+        ]
+        if student.department is not None:
+            filters.append(Course.department == student.department)
+
         return list(
             (
                 await self.db.execute(
-                    select(Course).where(Course.is_deleted == False)  # noqa: E712
+                    select(Course)
+                    .where(*filters)
+                    .order_by(Course.code.asc())
                 )
             ).scalars().all()
         )
@@ -256,8 +278,14 @@ class RegistrationService:
         self,
         student_id: uuid.UUID,
         term_id: uuid.UUID,
-        sponsorship_type: SponsorshipType,
+        sponsorship_type: Optional[SponsorshipType] = None,
     ) -> Registration:
+        """
+        Create a draft registration. ``sponsorship_type`` is normally
+        inherited from ``Student.sponsorship_type`` (set at onboarding
+        from the admission record) — callers shouldn't supply it. The
+        explicit override stays for tests / officer-driven flows.
+        """
         term = await self.terms.get(term_id)
         if term is None:
             raise EntityNotFoundError("AcademicTerm", str(term_id))
@@ -269,6 +297,22 @@ class RegistrationService:
         )
         if existing is not None:
             raise DuplicateRegistrationError(str(student_id), str(term_id))
+
+        if sponsorship_type is None:
+            student = (
+                await self.db.execute(
+                    select(Student).where(Student.id == student_id)
+                )
+            ).scalar_one_or_none()
+            if student is None:
+                raise EntityNotFoundError("Student", str(student_id))
+            if student.sponsorship_type is None:
+                raise EntityNotFoundError(
+                    "Student.sponsorship_type",
+                    f"missing for student {student_id} — onboarding "
+                    "should have set it from the admission record",
+                )
+            sponsorship_type = student.sponsorship_type
 
         registration = Registration(
             student_id=student_id,
@@ -345,6 +389,241 @@ class RegistrationService:
                 registration.status.value, "draft mutation",
             )
         return registration
+
+    # ── Mock payment (mirrors the admission module's pattern) ────
+    #
+    # Two-step shape, identical to /undergraduate/applications/{id}/payment/*:
+    #   1. Student calls /initiate to mint a payment_reference.
+    #   2. The "gateway" (us, manually, until a real bursar is wired up)
+    #      calls /callback with that reference. The callback marks every
+    #      course in the draft as paid in the in-memory PayMock so the
+    #      compliance agent will let /submit through.
+
+    _PAYMENT_INITIATE_STATES = {
+        RegistrationStatus.REGISTRATION_OPEN,
+        RegistrationStatus.ADVISOR_REVIEW,
+        RegistrationStatus.PAYMENT_HOLD,         # retry after a /submit bounce
+    }
+
+    async def initiate_payment(
+        self,
+        registration_id: uuid.UUID,
+        student_user_id: uuid.UUID,
+    ) -> Registration:
+        """
+        Generate a simulated payment reference for a registration that
+        the caller owns. Allowed from REGISTRATION_OPEN, ADVISOR_REVIEW,
+        or PAYMENT_HOLD (so a student can retry after a bounce).
+
+        Idempotent: if a reference already exists on the row it's
+        returned unchanged.
+        """
+        registration = await self.registrations.get(registration_id)
+        if registration is None:
+            raise EntityNotFoundError("Registration", str(registration_id))
+        if registration.status not in self._PAYMENT_INITIATE_STATES:
+            raise InvalidStateTransitionError(
+                registration.status.value, "initiate payment",
+            )
+        await self._assert_owner(registration, student_user_id)
+
+        if not registration.payment_reference:
+            registration.payment_reference = (
+                f"COURSE-PAY-{uuid.uuid4().hex[:12].upper()}"
+            )
+            await self.db.commit()
+            await self.db.refresh(registration, attribute_names=["courses"])
+        return registration
+
+    async def complete_payment(
+        self,
+        registration_id: uuid.UUID,
+        payment_reference: str,
+    ) -> Registration:
+        """
+        Simulated bursar-gateway callback. Validates the reference,
+        then marks every course in the draft as paid in pay_mock so
+        ``/submit`` can clear the payment check.
+        """
+        registration = await self.registrations.get(registration_id)
+        if registration is None:
+            raise EntityNotFoundError("Registration", str(registration_id))
+        if registration.status not in {
+            RegistrationStatus.REGISTRATION_OPEN,
+            RegistrationStatus.ADVISOR_REVIEW,
+            RegistrationStatus.PAYMENT_HOLD,
+        }:
+            raise InvalidStateTransitionError(
+                registration.status.value, "payment callback",
+            )
+        if not registration.payment_reference:
+            raise InvalidAdjustmentRequestError(
+                "No payment_reference on this registration; call "
+                "/payment/initiate before the gateway callback."
+            )
+        if registration.payment_reference != payment_reference:
+            raise InvalidAdjustmentRequestError(
+                "Payment reference does not match the registration."
+            )
+
+        from app.modules.course.services import pay_mock as _pay_mock
+        await self.db.refresh(registration, attribute_names=["courses"])
+        marked = 0
+        for rc in registration.courses:
+            if rc.is_dropped:
+                continue
+            _pay_mock.set_payment_status(
+                registration.student_id, rc.course_id, paid=True,
+            )
+            marked += 1
+
+        # If the registration was sitting in PAYMENT_HOLD waiting for
+        # the gateway, clear the hold so /submit can run again. For
+        # drafts that haven't been submitted yet, leave the status
+        # alone — payment can be initiated and completed before the
+        # first /submit call.
+        if registration.status == RegistrationStatus.PAYMENT_HOLD:
+            await self._transition(
+                registration,
+                RegistrationStatus.REGISTRATION_OPEN,
+                changed_by_id=None,
+                reason="Payment gateway callback cleared the hold",
+            )
+
+        write_audit_log(
+            action="course.registration.payment_completed",
+            actor_role=UserRole.STUDENT.value,
+            actor_id=None,
+            resource_type="Registration",
+            resource_id=registration.id,
+            decision="paid",
+            metadata={
+                "payment_reference": payment_reference,
+                "courses_marked_paid": marked,
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(registration, attribute_names=["courses"])
+        return registration
+
+    # ── Government cost-sharing form ─────────────────────────────
+    #
+    # Government-sponsored students don't pay per-course; the
+    # university bursar's office accepts a single "cost-sharing form"
+    # signed by the student that covers every registered course in the
+    # term. Submitting the form is treated as the equivalent of the
+    # bursar callback for self-sponsored students: every non-dropped
+    # course on the registration gets pay_mock.set_payment_status(...,
+    # paid=True), and a PAYMENT_HOLD registration is moved back to
+    # REGISTRATION_OPEN so /submit can clear.
+
+    _COST_SHARING_STATES = {
+        RegistrationStatus.REGISTRATION_OPEN,
+        RegistrationStatus.ADVISOR_REVIEW,
+        RegistrationStatus.PAYMENT_HOLD,
+    }
+
+    async def submit_cost_sharing_form(
+        self,
+        registration_id: uuid.UUID,
+        student_user_id: uuid.UUID,
+    ) -> dict:
+        """
+        Materialise a cost-sharing form for a GOVERNMENT-sponsored
+        registration. Idempotent on re-runs (re-marking already-paid
+        courses is a no-op).
+
+        Raises
+        ------
+        EntityNotFoundError
+            The registration does not exist.
+        UnauthorizedActorError
+            The caller is not the owner of the registration.
+        InvalidAdjustmentRequestError
+            The registration is self-sponsored (form is gov-only) or
+            it has no active courses to cover.
+        InvalidStateTransitionError
+            The registration is past the point where payment status
+            can still be settled (REGISTERED / ADD_DROP_WINDOW /
+            CANCELLED).
+        """
+        registration = await self.registrations.get(registration_id)
+        if registration is None:
+            raise EntityNotFoundError("Registration", str(registration_id))
+        await self._assert_owner(registration, student_user_id)
+
+        if registration.sponsorship_type != SponsorshipType.GOVERNMENT:
+            raise InvalidAdjustmentRequestError(
+                "Cost-sharing form is only available for government-"
+                "sponsored registrations. Self-sponsored students must "
+                "complete payment via /payment/initiate + /payment/callback."
+            )
+        if registration.status not in self._COST_SHARING_STATES:
+            raise InvalidStateTransitionError(
+                registration.status.value, "submit cost-sharing form",
+            )
+
+        await self.db.refresh(registration, attribute_names=["courses"])
+        active_course_ids = [
+            rc.course_id for rc in registration.courses if not rc.is_dropped
+        ]
+        if not active_course_ids:
+            raise InvalidAdjustmentRequestError(
+                "Cannot submit a cost-sharing form for a registration "
+                "with no active courses."
+            )
+
+        from app.modules.course.services import pay_mock as _pay_mock
+        for cid in active_course_ids:
+            _pay_mock.set_payment_status(
+                registration.student_id, cid, paid=True,
+            )
+
+        # If the registration was bouncing on PAYMENT_HOLD, the form
+        # clears it back to REGISTRATION_OPEN so the student can
+        # re-submit. Drafts that haven't been submitted yet stay put.
+        if registration.status == RegistrationStatus.PAYMENT_HOLD:
+            await self._transition(
+                registration,
+                RegistrationStatus.REGISTRATION_OPEN,
+                changed_by_id=None,
+                reason="Cost-sharing form cleared the payment hold",
+            )
+
+        write_audit_log(
+            action="course.registration.cost_sharing_form_submitted",
+            actor_role=UserRole.STUDENT.value,
+            actor_id=None,
+            resource_type="Registration",
+            resource_id=registration.id,
+            decision="cost_sharing_acknowledged",
+            metadata={
+                "course_count": len(active_course_ids),
+                "marked_paid_course_ids": [str(c) for c in active_course_ids],
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(registration, attribute_names=["courses"])
+        return {
+            "registration_id": str(registration.id),
+            "sponsorship_type": registration.sponsorship_type.value,
+            "course_count": len(active_course_ids),
+            "marked_paid_course_ids": [str(c) for c in active_course_ids],
+        }
+
+    async def _assert_owner(
+        self, registration: Registration, student_user_id: uuid.UUID,
+    ) -> None:
+        """Raise UnauthorizedActorError if the registration is not the caller's."""
+        student = (
+            await self.db.execute(
+                select(Student).where(Student.id == registration.student_id)
+            )
+        ).scalar_one_or_none()
+        if student is None or student.user_id != student_user_id:
+            raise UnauthorizedActorError(
+                "This registration does not belong to the calling user."
+            )
 
     # ── Submit (the spine) ───────────────────────────────────────
 
@@ -583,13 +862,17 @@ class SchedulingService:
     async def generate_schedule(
         self,
         term_id: uuid.UUID,
-        department: str,
         officer_role: UserRole,
         officer_id: uuid.UUID,
     ) -> dict:
         """
-        Run the full scheduling pipeline (allocate + timetable) for
-        a (term, department) pair. Officer-only.
+        Run the full scheduling pipeline (cohort allocation + per-
+        section weekly slots) for the entire term. Officer-only.
+
+        Department is no longer a parameter — every (department,
+        semester) cohort in the term is processed in one call so
+        cross-department conflicts on shared rooms or instructors are
+        detected globally.
         """
         if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
             raise UnauthorizedActorError(
@@ -602,7 +885,6 @@ class SchedulingService:
         payload = await self.scheduling_agent.process_task({
             "session": self.db,
             "term_id": term_id,
-            "department": department,
         })
         await self.db.commit()
 
@@ -614,9 +896,9 @@ class SchedulingService:
             resource_id=term_id,
             decision="ok",
             metadata={
-                "department": department,
-                "allocated": payload["allocation"]["allocated_count"],
-                "failed": payload["allocation"]["failed_count"],
+                "students_placed": payload["allocation"]["students_placed_count"],
+                "sections_created": len(payload["allocation"]["sections_created"]),
+                "slots_created": payload["schedule"]["slots_created"],
                 "conflicts": payload["schedule"]["conflict_count"],
             },
         )
@@ -624,74 +906,151 @@ class SchedulingService:
 
     # ── Read views ───────────────────────────────────────────────
 
-    async def get_student_timetable(
+    async def get_student_schedule(
         self,
         student_id: uuid.UUID,
         term_id: uuid.UUID,
-    ) -> list[dict]:
+    ) -> dict:
         """
-        Return the student's per-section schedule for the term: only
-        rows whose section_id is set (i.e. allocate_sections has run)
-        and whose registration is not cancelled.
+        Schedule for a single student: resolves the student's
+        Registration for the term, finds its Section, and returns
+        every ClassScheduleSlot for that section. Empty
+        ``slots`` ⇒ the student has not been allocated yet (officer
+        hasn't run scheduling) or has no registration in this term.
         """
-        rows = (
+        registration = (
             await self.db.execute(
-                select(RegistrationCourse, Section, Course)
-                .join(Section, RegistrationCourse.section_id == Section.id)
-                .join(CourseOffering, Section.offering_id == CourseOffering.id)
-                .join(Course, CourseOffering.course_id == Course.id)
-                .join(Registration, RegistrationCourse.registration_id == Registration.id)
-                .where(
+                select(Registration).where(
                     Registration.student_id == student_id,
                     Registration.term_id == term_id,
                     Registration.is_deleted == False,  # noqa: E712
-                    RegistrationCourse.is_dropped == False,  # noqa: E712
-                    RegistrationCourse.section_id.is_not(None),
+                )
+            )
+        ).scalar_one_or_none()
+
+        if registration is None or registration.section_id is None:
+            return {
+                "term_id": str(term_id),
+                "student_id": str(student_id),
+                "section": None,
+                "slots": [],
+            }
+
+        return await self._section_schedule_payload(
+            section_id=registration.section_id,
+            term_id=term_id,
+            student_id=student_id,
+        )
+
+    async def get_section_schedule(
+        self,
+        section_id: uuid.UUID,
+    ) -> dict:
+        """
+        Schedule for a Section regardless of who's asking. Used by
+        ``GET /me/schedule`` (after resolving the caller's section)
+        and ``GET /sections/{id}/schedule``.
+        """
+        return await self._section_schedule_payload(
+            section_id=section_id, term_id=None, student_id=None,
+        )
+
+    async def _section_schedule_payload(
+        self,
+        *,
+        section_id: uuid.UUID,
+        term_id: Optional[uuid.UUID],
+        student_id: Optional[uuid.UUID],
+    ) -> dict:
+        section = (
+            await self.db.execute(
+                select(Section).where(
+                    Section.id == section_id,
+                    Section.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if section is None:
+            raise EntityNotFoundError("Section", str(section_id))
+
+        slot_rows = (
+            await self.db.execute(
+                select(ClassScheduleSlot, Course).join(
+                    Course, Course.id == ClassScheduleSlot.course_id,
+                ).where(
+                    ClassScheduleSlot.section_id == section_id,
+                ).order_by(
+                    ClassScheduleSlot.day_of_week.asc(),
+                    ClassScheduleSlot.start_time.asc(),
                 )
             )
         ).all()
-        return [
-            {
-                "section_id": sec.id,
-                "course_code": course.code,
-                "course_title": course.title,
-                "section_code": sec.section_code,
-                "room": sec.room,
-                "time_slot": sec.time_slot,
-                "instructor_id": sec.instructor_id,
-            }
-            for _rc, sec, course in rows
-        ]
 
-    async def get_instructor_timetable(
+        return {
+            "term_id": str(term_id) if term_id else str(section.term_id),
+            "student_id": str(student_id) if student_id else None,
+            "section": {
+                "section_id": str(section.id),
+                "section_code": section.section_code,
+                "department": section.department,
+                "semester": section.semester,
+                "room": section.room,
+                "capacity": section.capacity,
+                "enrolled_count": section.enrolled_count,
+            },
+            "slots": [
+                {
+                    "course_code": course.code,
+                    "course_title": course.title,
+                    "day_of_week": slot.day_of_week,
+                    "start_time": slot.start_time.isoformat(timespec="minutes"),
+                    "end_time": slot.end_time.isoformat(timespec="minutes"),
+                    "instructor_id": (
+                        str(slot.instructor_id) if slot.instructor_id else None
+                    ),
+                }
+                for slot, course in slot_rows
+            ],
+        }
+
+    async def get_instructor_schedule(
         self,
         instructor_id: uuid.UUID,
         term_id: uuid.UUID,
     ) -> list[dict]:
-        """Return every section assigned to this instructor for the term."""
+        """
+        Every ClassScheduleSlot taught by this instructor in the term,
+        flattened across sections.
+        """
         rows = (
             await self.db.execute(
-                select(Section, Course)
-                .join(CourseOffering, Section.offering_id == CourseOffering.id)
-                .join(Course, CourseOffering.course_id == Course.id)
-                .where(
-                    CourseOffering.term_id == term_id,
-                    Section.instructor_id == instructor_id,
-                    Section.is_deleted == False,  # noqa: E712
+                select(ClassScheduleSlot, Course, Section).join(
+                    Course, Course.id == ClassScheduleSlot.course_id,
+                ).join(
+                    Section, Section.id == ClassScheduleSlot.section_id,
+                ).where(
+                    Section.term_id == term_id,
+                    ClassScheduleSlot.instructor_id == instructor_id,
+                ).order_by(
+                    ClassScheduleSlot.day_of_week.asc(),
+                    ClassScheduleSlot.start_time.asc(),
                 )
             )
         ).all()
         return [
             {
-                "section_id": sec.id,
+                "section_id": str(sec.id),
+                "section_code": sec.section_code,
+                "department": sec.department,
+                "semester": sec.semester,
+                "room": sec.room,
                 "course_code": course.code,
                 "course_title": course.title,
-                "section_code": sec.section_code,
-                "room": sec.room,
-                "time_slot": sec.time_slot,
-                "instructor_id": sec.instructor_id,
+                "day_of_week": slot.day_of_week,
+                "start_time": slot.start_time.isoformat(timespec="minutes"),
+                "end_time": slot.end_time.isoformat(timespec="minutes"),
             }
-            for sec, course in rows
+            for slot, course, sec in rows
         ]
 
     async def list_open_conflicts(
@@ -751,7 +1110,6 @@ class AddDropService:
         action: AddDropAction,
         deadline: date,
         student_user_id: uuid.UUID,
-        target_section_id: Optional[uuid.UUID] = None,
     ) -> AddDropRequest:
         """
         Persist a new AddDropRequest, run the agent, and either:
@@ -774,7 +1132,6 @@ class AddDropService:
         request = AddDropRequest(
             registration_id=registration_id,
             course_id=course_id,
-            target_section_id=target_section_id,
             action=action,
             deadline_snapshot=deadline,
             status=AddDropRequestStatus.PENDING,
@@ -849,53 +1206,13 @@ class AddDropService:
     async def _apply_add(
         self, request: AddDropRequest, registration: Registration,
     ) -> None:
-        # Find an offering for this course in the term.
-        offering = (
-            await self.db.execute(
-                select(CourseOffering).where(
-                    CourseOffering.course_id == request.course_id,
-                    CourseOffering.term_id == registration.term_id,
-                    CourseOffering.is_deleted == False,  # noqa: E712
-                )
-            )
-        ).scalar_one_or_none()
-        if offering is None:
-            raise InvalidAdjustmentRequestError(
-                f"Course {request.course_id} has no offering for term "
-                f"{registration.term_id}."
-            )
-
-        # Pick a section: caller-specified target_section_id wins, else
-        # any section under the offering with free capacity.
-        section: Optional[Section] = None
-        if request.target_section_id is not None:
-            section = await self.db.get(Section, request.target_section_id)
-            if section is None or section.offering_id != offering.id:
-                raise InvalidAdjustmentRequestError(
-                    "target_section_id does not belong to this course's offering."
-                )
-        else:
-            sections = (
-                await self.db.execute(
-                    select(Section).where(
-                        Section.offering_id == offering.id,
-                        Section.is_deleted == False,  # noqa: E712
-                    )
-                )
-            ).scalars().all()
-            for s in sections:
-                if s.enrolled_count < s.capacity:
-                    section = s
-                    break
-            if section is None:
-                raise InvalidAdjustmentRequestError(
-                    "All sections of this course are at capacity."
-                )
-
-        await self.agent.update_section_capacity(
-            self.db, section.id, AddDropAction.ADD,
-        )
-
+        """
+        Materialise an ADD: insert (or un-drop) the
+        ``RegistrationCourse`` row. The student's cohort
+        ``Registration.section_id`` is unchanged — the cohort's
+        weekly schedule is rebuilt the next time the officer runs
+        scheduling.
+        """
         existing_link = (
             await self.db.execute(
                 select(RegistrationCourse).where(
@@ -908,16 +1225,20 @@ class AddDropService:
             self.db.add(RegistrationCourse(
                 registration_id=registration.id,
                 course_id=request.course_id,
-                section_id=section.id,
                 is_dropped=False,
             ))
         else:
-            existing_link.section_id = section.id
             existing_link.is_dropped = False
 
     async def _apply_drop(
         self, request: AddDropRequest, registration: Registration,
     ) -> None:
+        """
+        Materialise a DROP: flip ``is_dropped=True`` on the existing
+        ``RegistrationCourse`` row. Section/cohort assignment is
+        unaffected — only the per-course slots regenerate next
+        scheduling run.
+        """
         link = (
             await self.db.execute(
                 select(RegistrationCourse).where(
@@ -929,10 +1250,6 @@ class AddDropService:
         if link is None:
             raise InvalidAdjustmentRequestError(
                 "Cannot drop a course the student is not registered for."
-            )
-        if link.section_id is not None:
-            await self.agent.update_section_capacity(
-                self.db, link.section_id, AddDropAction.DROP,
             )
         link.is_dropped = True
 
@@ -1347,6 +1664,19 @@ class OnboardingService:
             raise EntityNotFoundError("User", str(enrollment.applicant_id))
         full_name = f"{user.first_name} {user.last_name}".strip() or user.email
 
+        # Denormalise sponsorship_type from the admission record so
+        # the student doesn't have to re-state it on every
+        # registration. Falls back to None if the application can't
+        # be resolved (e.g. test fixtures that build Enrollment rows
+        # without a real Application).
+        from app.modules.undergraduate.models import UndergraduateApplication
+        application = await self.db.get(
+            UndergraduateApplication, enrollment.application_id,
+        )
+        sponsorship = (
+            application.sponsorship_type if application is not None else None
+        )
+
         # Issue the portal credentials. The plaintext PIN exists only
         # in this scope — we hash it for storage, hand it to the email
         # template, then let it fall out of scope.
@@ -1360,6 +1690,8 @@ class OnboardingService:
             student_id=enrollment.university_id,
             full_name=full_name,
             current_semester=1,                    # fresh admit
+            department=enrollment.department,      # denormalised for curriculum filter
+            sponsorship_type=sponsorship,          # denormalised from admission
             enrollment_status=EnrollmentStatus.ACTIVE,
         )
         self.db.add(student)
@@ -1376,7 +1708,6 @@ class OnboardingService:
                 "enrollment_id": str(enrollment_id),
                 "university_id": enrollment.university_id,
                 "department": enrollment.department,
-                "section": enrollment.section,
                 # PIN is intentionally omitted from the audit payload.
                 "portal_credentials_issued": True,
             },
@@ -1405,3 +1736,319 @@ class OnboardingService:
                 )
 
         return student
+
+
+# ════════════════════════════════════════════════════════════════
+#  InstructorService — Department-Head-driven instructor management
+# ════════════════════════════════════════════════════════════════
+
+
+class InstructorService:
+    """
+    Department-Head-driven instructor lifecycle. Three main flows:
+
+      1. add_instructor: create the User + Instructor rows, generate
+         a 4-digit PIN, set must_change_password=True, and email the
+         credentials. Mirrors OnboardingService's PIN flow exactly so
+         instructors and students share one auth contract.
+      2. assign_to_course: upsert the (instructor, course, term)
+         InstructorAssignment row. Reposting with a new instructor
+         silently rebinds — every (course, term) pair has at most one
+         active instructor.
+      3. unassign: delete an InstructorAssignment row.
+
+    All write methods are gated to ``OfficerRole.DEPARTMENT_HEAD`` (or
+    user-level ``UserRole.ADMIN`` as an escape hatch); read methods
+    accept any logged-in user.
+    """
+
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        email_service: Optional["EmailService"] = None,
+    ) -> None:
+        self.db = db
+        self._email_service = email_service
+
+    # ── Authorisation helper ─────────────────────────────────────
+
+    async def _require_dh_or_admin(
+        self,
+        officer_user_id: uuid.UUID,
+    ) -> tuple[Optional[CourseManagementOfficer], UserRole]:
+        """
+        Resolve the calling user; raise UnauthorizedActorError unless
+        they are an ADMIN user OR have a DEPARTMENT_HEAD officer row.
+        Returns (officer_row_or_None, user_role).
+        """
+        from app.modules.auth.models import User
+        user = await self.db.get(User, officer_user_id)
+        if user is None:
+            raise UnauthorizedActorError(
+                "Calling user not found."
+            )
+        if user.role == UserRole.ADMIN:
+            return None, UserRole.ADMIN
+        officer = (
+            await self.db.execute(
+                select(CourseManagementOfficer).where(
+                    CourseManagementOfficer.user_id == officer_user_id,
+                    CourseManagementOfficer.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
+            raise UnauthorizedActorError(
+                "Only a Department Head (or ADMIN) may manage instructors "
+                "and instructor assignments."
+            )
+        return officer, user.role
+
+    # ── add_instructor ──────────────────────────────────────────
+
+    async def add_instructor(
+        self,
+        *,
+        staff_id: str,
+        email: str,
+        first_name: str,
+        last_name: str,
+        department: str,
+        officer_user_id: uuid.UUID,
+    ) -> tuple[Instructor, str]:
+        """
+        Create a new instructor profile + portal credentials.
+
+        Returns ``(instructor_row, plaintext_pin)`` so callers can
+        log/email the PIN; the row never persists the plaintext.
+        """
+        await self._require_dh_or_admin(officer_user_id)
+
+        if not staff_id.strip() or not email.strip():
+            raise InvalidAdjustmentRequestError(
+                "staff_id and email are required."
+            )
+
+        # Idempotency: if an Instructor with this staff_id already
+        # exists, surface it as a 409.
+        existing = (
+            await self.db.execute(
+                select(Instructor).where(
+                    Instructor.instructor_id == staff_id.strip(),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            raise InvalidAdjustmentRequestError(
+                f"Instructor {staff_id} already exists."
+            )
+
+        from app.core.security import generate_temporary_pin, hash_password
+        from app.modules.auth.models import User
+
+        # Email uniqueness — a User row may already exist if this
+        # person previously held a different role.
+        existing_user = (
+            await self.db.execute(
+                select(User).where(User.email == email.strip())
+            )
+        ).scalar_one_or_none()
+        if existing_user is not None:
+            raise InvalidAdjustmentRequestError(
+                f"A user with email {email} already exists."
+            )
+
+        pin = generate_temporary_pin(digits=4)
+        user = User(
+            email=email.strip(),
+            first_name=first_name.strip(),
+            last_name=last_name.strip(),
+            hashed_password=hash_password(pin),
+            role=UserRole.INSTRUCTOR,
+            is_active=True,
+            must_change_password=True,
+        )
+        self.db.add(user)
+        await self.db.flush()
+
+        instructor = Instructor(
+            user_id=user.id,
+            instructor_id=staff_id.strip(),
+            department=department.strip(),
+        )
+        self.db.add(instructor)
+        await self.db.flush()
+
+        write_audit_log(
+            action="course.instructor.created",
+            actor_role=UserRole.AGENT.value,    # service action
+            actor_id=officer_user_id,
+            resource_type="Instructor",
+            resource_id=instructor.id,
+            decision="created",
+            metadata={
+                "staff_id": staff_id.strip(),
+                "department": department.strip(),
+                "portal_credentials_issued": True,
+                # PIN deliberately omitted from audit metadata.
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(instructor)
+
+        # Best-effort email — same pattern as OnboardingService.
+        if self._email_service is not None:
+            from app.shared.email import build_portal_credentials_email
+            try:
+                await self._email_service.send(
+                    build_portal_credentials_email(
+                        to_email=user.email,
+                        first_name=user.first_name,
+                        student_id=instructor.instructor_id,
+                        temporary_pin=pin,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Portal-credentials email delivery failed for instructor %s",
+                    user.email,
+                )
+
+        return instructor, pin
+
+    # ── list_instructors (read; any logged-in user) ─────────────
+
+    async def list_instructors(
+        self,
+        *,
+        department: Optional[str] = None,
+    ) -> list[Instructor]:
+        stmt = select(Instructor).where(
+            Instructor.is_deleted == False,  # noqa: E712
+        )
+        if department:
+            stmt = stmt.where(Instructor.department == department)
+        stmt = stmt.order_by(Instructor.instructor_id.asc())
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    # ── assign_to_course (DH or ADMIN; upsert) ──────────────────
+
+    async def assign_to_course(
+        self,
+        *,
+        instructor_id: uuid.UUID,
+        course_id: uuid.UUID,
+        term_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
+    ) -> InstructorAssignment:
+        """
+        Bind an instructor to a (course, term). At most one active
+        assignment per (course, term) — re-posting with a different
+        instructor silently rebinds.
+        """
+        await self._require_dh_or_admin(officer_user_id)
+
+        # Resolve all three refs so 404s are clean
+        instructor = await self.db.get(Instructor, instructor_id)
+        if instructor is None or instructor.is_deleted:
+            raise EntityNotFoundError("Instructor", str(instructor_id))
+        course = await self.db.get(Course, course_id)
+        if course is None or course.is_deleted:
+            raise EntityNotFoundError("Course", str(course_id))
+        term = await self.db.get(AcademicTerm, term_id)
+        if term is None:
+            raise EntityNotFoundError("AcademicTerm", str(term_id))
+
+        existing = (
+            await self.db.execute(
+                select(InstructorAssignment).where(
+                    InstructorAssignment.course_id == course_id,
+                    InstructorAssignment.term_id == term_id,
+                ).order_by(InstructorAssignment.created_at.desc())
+            )
+        ).scalars().first()
+
+        action = "course.instructor_assignment.created"
+        if existing is None:
+            assignment = InstructorAssignment(
+                instructor_id=instructor_id,
+                course_id=course_id,
+                term_id=term_id,
+            )
+            self.db.add(assignment)
+            await self.db.flush()
+        else:
+            previous_instructor_id = existing.instructor_id
+            existing.instructor_id = instructor_id
+            assignment = existing
+            await self.db.flush()
+            action = "course.instructor_assignment.updated"
+
+        write_audit_log(
+            action=action,
+            actor_role=UserRole.AGENT.value,
+            actor_id=officer_user_id,
+            resource_type="InstructorAssignment",
+            resource_id=assignment.id,
+            decision="ok",
+            metadata={
+                "instructor_id": str(instructor_id),
+                "course_id": str(course_id),
+                "term_id": str(term_id),
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(assignment)
+        return assignment
+
+    # ── list_assignments (read; any logged-in user) ─────────────
+
+    async def list_assignments(
+        self,
+        *,
+        term_id: Optional[uuid.UUID] = None,
+        course_id: Optional[uuid.UUID] = None,
+        instructor_id: Optional[uuid.UUID] = None,
+    ) -> list[InstructorAssignment]:
+        stmt = select(InstructorAssignment)
+        if term_id:
+            stmt = stmt.where(InstructorAssignment.term_id == term_id)
+        if course_id:
+            stmt = stmt.where(InstructorAssignment.course_id == course_id)
+        if instructor_id:
+            stmt = stmt.where(
+                InstructorAssignment.instructor_id == instructor_id,
+            )
+        stmt = stmt.order_by(InstructorAssignment.created_at.asc())
+        return list((await self.db.execute(stmt)).scalars().all())
+
+    # ── unassign ───────────────────────────────────────────────
+
+    async def unassign(
+        self,
+        *,
+        assignment_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
+    ) -> None:
+        await self._require_dh_or_admin(officer_user_id)
+        assignment = await self.db.get(InstructorAssignment, assignment_id)
+        if assignment is None:
+            raise EntityNotFoundError(
+                "InstructorAssignment", str(assignment_id),
+            )
+        write_audit_log(
+            action="course.instructor_assignment.removed",
+            actor_role=UserRole.AGENT.value,
+            actor_id=officer_user_id,
+            resource_type="InstructorAssignment",
+            resource_id=assignment.id,
+            decision="removed",
+            metadata={
+                "instructor_id": str(assignment.instructor_id),
+                "course_id": str(assignment.course_id),
+                "term_id": str(assignment.term_id),
+            },
+        )
+        await self.db.delete(assignment)
+        await self.db.commit()

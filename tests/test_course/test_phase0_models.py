@@ -50,16 +50,22 @@ async def test_offering_resolves_course_and_term(
     assert fetched.term.term_name == seeded_term.term_name
 
 
-async def test_section_resolves_offering(
-    async_session, seeded_section, seeded_offering, seeded_instructor,
+async def test_section_resolves_term(
+    async_session, seeded_section, seeded_term,
 ):
+    """
+    Sections are now (term, department, semester) cohorts; the
+    relationship under test moved from Section.offering to
+    Section.term.
+    """
     fetched = (
         await async_session.execute(
             select(Section).where(Section.id == seeded_section.id)
         )
     ).scalar_one()
-    assert fetched.offering.id == seeded_offering.id
-    assert fetched.instructor_id == seeded_instructor.id
+    assert fetched.term.id == seeded_term.id
+    assert fetched.semester >= 1
+    assert fetched.department
 
 
 async def test_prerequisite_resolves_both_endpoints(

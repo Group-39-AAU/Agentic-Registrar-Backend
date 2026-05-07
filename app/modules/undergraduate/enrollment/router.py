@@ -143,7 +143,6 @@ async def run_enrollment(
         "students": student_list,
         "id_counter_start": counter_start,
         "year_suffix": year_suffix,
-        "section_capacity": 50,
         "traces": [],
     }
 
@@ -159,21 +158,24 @@ async def run_enrollment(
             application_id=s.application_id,
             applicant_id=s.applicant_id,
             university_id=s.university_id,
-            portal_password=s.portal_password,
             program_id=s.assigned_program_id,
             department=s.assigned_department or s.stream,
-            section=s.section,
             enrollment_term=s.admission_term,
         )
         db.add(enrollment)
 
-        # Transition to ENROLLED
+        # Transition to ENROLLED. Cohort section assignment now lives
+        # entirely in course-management (see AcademicSchedulingAgent),
+        # so the trigger reason no longer carries a section letter.
         try:
             await svc.change_status(
                 s.application_id,
                 ApplicationStatusUpdate(
                     new_status=ApplicationStatus.ENROLLED,
-                    trigger_reason=f"Enrolled as {s.university_id} — {s.assigned_department or s.stream} Section {s.section}",
+                    trigger_reason=(
+                        f"Enrolled as {s.university_id} "
+                        f"— {s.assigned_department or s.stream}"
+                    ),
                 ),
                 actor_id=current_user.id,
                 actor_role=UserRole.AGENT,

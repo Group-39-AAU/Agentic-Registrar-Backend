@@ -77,6 +77,7 @@ class DecisionType(str, Enum):
 class UserRole(str, Enum):
     """System-wide user roles."""
     STUDENT = "STUDENT"
+    INSTRUCTOR = "INSTRUCTOR"
     REGISTRAR_OFFICER = "REGISTRAR_OFFICER"
     ADMIN = "ADMIN"
     SYSTEM = "SYSTEM"   # Automated background jobs
