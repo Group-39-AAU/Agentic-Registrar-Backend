@@ -272,6 +272,90 @@ class RegistrationService:
             ).scalars().all()
         )
 
+    # ── Student dashboard read ───────────────────────────────────
+
+    async def get_student_dashboard(
+        self, student_id: uuid.UUID,
+    ) -> dict:
+        """
+        Consolidated read for the student's portal home: identity
+        attributes (name, UGR id, department, semester, sponsorship)
+        plus the current-term context (open AcademicTerm + the cohort
+        Section the student is allocated to, if scheduling has run).
+
+        ``current_term`` is null when no term is currently open.
+        Inside ``current_term``, ``section`` is null when the student
+        has not yet been allocated to a cohort (officer hasn't run
+        scheduling, or the student didn't register for that term).
+        """
+        student = (
+            await self.db.execute(
+                select(Student).where(Student.id == student_id)
+            )
+        ).scalar_one_or_none()
+        if student is None:
+            raise EntityNotFoundError("Student", str(student_id))
+
+        # Pull email + display name from the User row — Student.full_name
+        # is a denormalised display string; the auth identity lives on
+        # User.
+        from app.modules.auth.models import User
+        user = await self.db.get(User, student.user_id)
+
+        current_term_payload = None
+        open_term = (
+            await self.db.execute(
+                select(AcademicTerm).where(
+                    AcademicTerm.is_open == True,    # noqa: E712
+                ).order_by(AcademicTerm.start_date.asc())
+            )
+        ).scalars().first()
+
+        if open_term is not None:
+            registration = (
+                await self.db.execute(
+                    select(Registration).where(
+                        Registration.student_id == student_id,
+                        Registration.term_id == open_term.id,
+                        Registration.is_deleted == False,  # noqa: E712
+                    )
+                )
+            ).scalar_one_or_none()
+
+            section_payload = None
+            if registration is not None and registration.section_id is not None:
+                section = await self.db.get(Section, registration.section_id)
+                if section is not None and not section.is_deleted:
+                    section_payload = {
+                        "section_id": section.id,
+                        "section_code": section.section_code,
+                        "room": section.room,
+                        "capacity": section.capacity,
+                        "enrolled_count": section.enrolled_count,
+                    }
+
+            current_term_payload = {
+                "term_id": open_term.id,
+                "term_name": open_term.term_name,
+                "start_date": open_term.start_date,
+                "end_date": open_term.end_date,
+                "registration_status": (
+                    registration.status if registration else None
+                ),
+                "section": section_payload,
+            }
+
+        return {
+            "student_id": student.student_id,
+            "full_name": student.full_name,
+            "email": user.email if user else None,
+            "department": student.department,
+            "current_semester": student.current_semester,
+            "sponsorship_type": student.sponsorship_type,
+            "enrollment_status": student.enrollment_status,
+            "current_term": current_term_payload,
+        }
+
     # ── Draft management ─────────────────────────────────────────
 
     async def create_draft(

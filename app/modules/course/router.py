@@ -73,6 +73,7 @@ from app.modules.course.schemas import (
     PrerequisiteOverrideResponse,
     RegistrationPaymentCallbackRequest,
     RegistrationPaymentInitiateResponse,
+    StudentDashboardResponse,
     StudentOnboardRequest,
     StudentResponse,
 )
@@ -152,6 +153,29 @@ async def _resolve_student(db: AsyncSession, user: User):
             "Calling user has no student profile.",
         )
     return student
+
+
+@router.get(
+    "/me",
+    response_model=StudentDashboardResponse,
+    summary="Student dashboard — name, UGR id, department, term, section",
+)
+async def get_my_dashboard(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Consolidated identity + current-term context for the calling
+    student: full_name, email, UGR id, department, semester,
+    sponsorship_type, enrollment_status, and (when a term is open)
+    the term_name + cohort section.
+
+    ``current_term.section`` is null until the officer has run
+    ``POST /officer/schedule/generate`` for the term.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = RegistrationService(db)
+    return await svc.get_student_dashboard(student.id)
 
 
 @router.get("/me/curriculum", response_model=list[CourseResponse])

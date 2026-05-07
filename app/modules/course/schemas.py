@@ -334,6 +334,43 @@ class StudentResponse(BaseModel):
     enrollment_status: EnrollmentStatus
 
 
+class DashboardSection(BaseModel):
+    """Cohort section the student is allocated to in the current term."""
+    section_id: uuid.UUID
+    section_code: str
+    room: Optional[str] = None
+    capacity: int
+    enrolled_count: int
+
+
+class DashboardCurrentTerm(BaseModel):
+    """The currently-open AcademicTerm + the student's status in it."""
+    term_id: uuid.UUID
+    term_name: str
+    start_date: date
+    end_date: date
+    registration_status: Optional[RegistrationStatus] = None
+    section: Optional[DashboardSection] = None
+
+
+class StudentDashboardResponse(BaseModel):
+    """
+    Consolidated payload for ``GET /api/v1/courses/me`` — everything
+    a student needs on their portal home: identity (name, email, UGR
+    id), academic context (department, semester, sponsorship,
+    enrollment status), and the current-term context (term name +
+    cohort section). ``current_term`` is null if no term is open.
+    """
+    student_id: str
+    full_name: str
+    email: Optional[str] = None
+    department: Optional[str] = None
+    current_semester: int
+    sponsorship_type: Optional[SponsorshipType] = None
+    enrollment_status: EnrollmentStatus
+    current_term: Optional[DashboardCurrentTerm] = None
+
+
 # ══════════════════════════════════════════════════════════════
 #  Department-Head prerequisite override (SRS §3.5)
 # ══════════════════════════════════════════════════════════════
