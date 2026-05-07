@@ -21,12 +21,14 @@ class RankingResultResponse(BaseModel):
     admission_term_id: uuid.UUID
     ranking_run_number: int
     application_id: uuid.UUID
+    applicant_full_name: Optional[str] = None
     grade12_score: float
     uat_score: float
     final_score: float
     category: str
     rank_position: int
     assigned_program_id: Optional[uuid.UUID] = None
+    assigned_program_department: Optional[str] = None
     assigned_stream: Optional[StreamType] = None
     is_assigned: bool
     assignment_detail: Optional[str] = None

@@ -320,7 +320,51 @@ async def get_ranking_results(
     if not items:
         raise HTTPException(404, f"No results found for term: {term_id}")
 
-    return items
+    application_ids = [item.application_id for item in items]
+    app_result = await db.execute(
+        select(UndergraduateApplication).where(UndergraduateApplication.id.in_(application_ids))
+    )
+    applications = {app.id: app for app in app_result.scalars().all()}
+
+    applicant_ids = [app.applicant_id for app in applications.values()]
+    user_result = await db.execute(select(User).where(User.id.in_(applicant_ids)))
+    users = {user.id: user for user in user_result.scalars().all()}
+
+    program_ids = [item.assigned_program_id for item in items if item.assigned_program_id is not None]
+    program_result = await db.execute(select(AcademicProgram).where(AcademicProgram.id.in_(program_ids)))
+    programs = {program.id: program for program in program_result.scalars().all()}
+
+    return [
+        {
+            "id": item.id,
+            "admission_term_id": item.admission_term_id,
+            "ranking_run_number": item.ranking_run_number,
+            "application_id": item.application_id,
+            "applicant_full_name": (
+                f"{users[applications[item.application_id].applicant_id].first_name} "
+                f"{users[applications[item.application_id].applicant_id].last_name}"
+                if applications.get(item.application_id)
+                and users.get(applications[item.application_id].applicant_id)
+                else None
+            ),
+            "grade12_score": item.grade12_score,
+            "uat_score": item.uat_score,
+            "final_score": item.final_score,
+            "category": item.category,
+            "rank_position": item.rank_position,
+            "assigned_program_id": item.assigned_program_id,
+            "assigned_program_department": (
+                programs[item.assigned_program_id].department
+                if item.assigned_program_id and programs.get(item.assigned_program_id)
+                else None
+            ),
+            "assigned_stream": item.assigned_stream,
+            "is_assigned": item.is_assigned,
+            "assignment_detail": item.assignment_detail,
+            "created_at": item.created_at,
+        }
+        for item in items
+    ]
 
 
 # ══════════════════════════════════════════════════════════════
