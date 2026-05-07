@@ -37,9 +37,10 @@ from app.core.config import settings
 from app.core.security import hash_password
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    AcademicTerm, AdvisoryRecommendation, Course, CoursePrerequisite,
-    Instructor, InstructorAssignment, Registration, RegistrationCourse,
-    RegistrationStatusHistory, Student, CourseManagementOfficer,
+    AcademicTerm, AdvisoryRecommendation, Classroom, Course,
+    CoursePrerequisite, Instructor, InstructorAssignment, Registration,
+    RegistrationCourse, RegistrationStatusHistory, Student,
+    CourseManagementOfficer,
 )
 from app.shared.enums import (
     EnrollmentStatus, OfficerRole, RegistrationStatus, RiskStatus,
@@ -298,11 +299,47 @@ INSTRUCTORS = [
 ]
 
 
-# Per-course classroom inventory was previously seeded here as
-# OFFERING_CAPACITY / SECTIONS_PER_COURSE / TIME_SLOTS / ROOMS, but
-# none of that survives the cohort migration: rooms + time slots are
-# the AcademicSchedulingAgent's responsibility, and section count is
-# determined at allocation time by enrolment volume vs. room size.
+# ══════════════════════════════════════════════════════════════
+#  Classrooms (per-department physical room inventory)
+# ══════════════════════════════════════════════════════════════
+# Three rooms per department: a big lecture hall, a mid-size room,
+# and a small lab. Software Engineering's biggest hall (SE-101) is
+# 80 seats so the bulk SE-sem-1 cohort (72 students) fits in one
+# room rather than splitting. Other departments don't have that
+# volume yet so 60-seat lectures suffice.
+
+# (name, capacity, department)
+CLASSROOMS = [
+    # ── Software Engineering ────────────────────────────
+    ("SE-101",   80, "Software Engineering"),
+    ("SE-201",   60, "Software Engineering"),
+    ("SE-LAB-1", 30, "Software Engineering"),
+
+    # ── Electrical Engineering ──────────────────────────
+    ("EE-101",   60, "Electrical Engineering"),
+    ("EE-201",   50, "Electrical Engineering"),
+    ("EE-LAB-1", 30, "Electrical Engineering"),
+
+    # ── Chemical Engineering ────────────────────────────
+    ("ChE-101",   60, "Chemical Engineering"),
+    ("ChE-201",   50, "Chemical Engineering"),
+    ("ChE-LAB-1", 30, "Chemical Engineering"),
+
+    # ── Civil Engineering ───────────────────────────────
+    ("CE-101",   60, "Civil Engineering"),
+    ("CE-201",   50, "Civil Engineering"),
+    ("CE-LAB-1", 30, "Civil Engineering"),
+
+    # ── Mechanical Engineering ──────────────────────────
+    ("ME-101",   60, "Mechanical Engineering"),
+    ("ME-201",   50, "Mechanical Engineering"),
+    ("ME-LAB-1", 30, "Mechanical Engineering"),
+
+    # ── Bio Medical Engineering ─────────────────────────
+    ("BME-101",   60, "Bio Medical Engineering"),
+    ("BME-201",   50, "Bio Medical Engineering"),
+    ("BME-LAB-1", 30, "Bio Medical Engineering"),
+]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -504,6 +541,41 @@ async def _ensure_user(
     session.add(user)
     await session.flush()
     return user
+
+
+async def _seed_classrooms(session: AsyncSession) -> dict[str, Classroom]:
+    """
+    Seed the per-department classroom inventory. Idempotent:
+    re-running reuses any classroom whose ``name`` already exists,
+    even if its capacity or owning department drifts (those are
+    operational decisions the registrar makes by hand).
+    """
+    rows = (await session.execute(select(Classroom))).scalars().all()
+    by_name: dict[str, Classroom] = {c.name: c for c in rows}
+
+    new_count = 0
+    for name, capacity, department in CLASSROOMS:
+        if name in by_name:
+            continue
+        room = Classroom(
+            id=_uid("classroom", name),
+            name=name,
+            capacity=capacity,
+            department=department,
+        )
+        session.add(room)
+        by_name[name] = room
+        new_count += 1
+
+    await session.commit()
+    if new_count:
+        print(
+            f"✅ Seeded {new_count} classrooms "
+            f"(catalog total: {len(by_name)})."
+        )
+    else:
+        print(f"⚠️  All {len(by_name)} classrooms already present — skipping.")
+    return by_name
 
 
 async def _seed_instructors(
@@ -1054,6 +1126,7 @@ async def seed() -> None:
         terms = await _seed_terms(session)
         courses_by_code = await _seed_courses(session)
         await _seed_prerequisites(session, courses_by_code)
+        await _seed_classrooms(session)
         instructors = await _seed_instructors(session)
         # Each term gets its own offerings + sections — a student
         # registered in Fall 2026 cannot accidentally sit in a Spring

@@ -71,6 +71,17 @@ class RegistrationDraftCreate(BaseModel):
     term_id: uuid.UUID
 
 
+class SelectCoursesAndSubmitRequest(BaseModel):
+    """
+    Request: student picks the exact set of courses they want to take
+    in a term and submits — all in one call. The service finds (or
+    creates) the term's draft registration, reconciles its course
+    list to ``course_ids`` exactly, then runs the compliance pipeline.
+    """
+    term_id: uuid.UUID
+    course_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
 class RegistrationCourseAdd(BaseModel):
     """Request: add a course to an existing draft."""
     course_id: uuid.UUID
@@ -90,6 +101,37 @@ class RegistrationPaymentCallbackRequest(BaseModel):
     back the payment_reference returned by /initiate.
     """
     payment_reference: str = Field(..., min_length=1, max_length=64)
+
+
+class InvoiceLineItem(BaseModel):
+    """One course's contribution to the tuition invoice."""
+    course_id: uuid.UUID
+    course_code: str
+    course_title: str
+    credit_hours: int
+    line_total: int
+
+
+class RegistrationInvoiceResponse(BaseModel):
+    """
+    Per-credit-hour tuition breakdown for a registration.
+
+    Self-sponsored students see ``amount_due == gross_total``;
+    government-sponsored students see ``amount_due == 0`` and the
+    same line items for transparency. ``note`` is a human-readable
+    summary the portal can show verbatim.
+    """
+    registration_id: uuid.UUID
+    sponsorship_type: SponsorshipType
+    currency: str
+    fee_per_credit_hour: int
+    lines: list[InvoiceLineItem] = Field(default_factory=list)
+    total_credit_hours: int
+    gross_total: int
+    amount_due: int
+    is_government_sponsored: bool
+    payment_required: bool
+    note: str
 
 
 class CostSharingFormResponse(BaseModel):

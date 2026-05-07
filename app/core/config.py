@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     ADVISORY_LLM_TIMEOUT_SECONDS: float = 5.0
     ADVISORY_LLM_MAX_TOKENS: int = 600
 
+    # ── Tuition / cost-sharing pricing ───────────────────
+    # Self-sponsored students pay this many birr per credit hour
+    # registered each term; government-sponsored students see the
+    # same calculation on their invoice but the bursar bills the
+    # cost-sharing programme rather than the student.
+    FEE_PER_CREDIT_HOUR_BIRR: int = 100
+    TUITION_CURRENCY: str = "ETB"
+
     # ── Logging ──────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

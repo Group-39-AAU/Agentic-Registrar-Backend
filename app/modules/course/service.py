@@ -474,6 +474,105 @@ class RegistrationService:
             )
         return registration
 
+    # ── Tuition invoice ──────────────────────────────────────────
+
+    async def get_invoice(
+        self,
+        registration_id: uuid.UUID,
+        student_user_id: uuid.UUID,
+    ) -> dict:
+        """
+        Per-credit-hour tuition breakdown for a registration. Each
+        non-dropped course contributes ``credit_hours *
+        FEE_PER_CREDIT_HOUR_BIRR`` birr to the line items; the total
+        is the sum.
+
+        Sponsorship branching:
+          - SELF_SPONSORED → ``amount_due`` is the full sum and
+            ``payment_required=True``. The student must clear via
+            /payment/initiate + /payment/callback.
+          - GOVERNMENT → the same line items are returned for record-
+            keeping, but ``amount_due=0`` and ``payment_required=False``.
+            The student covers their load via /cost-sharing-form.
+
+        Reachable in any registration status (the student wants to
+        see the bill from draft onward, and after REGISTERED for
+        their records).
+        """
+        from app.core.config import settings as _settings
+
+        registration = await self.registrations.get(registration_id)
+        if registration is None:
+            raise EntityNotFoundError("Registration", str(registration_id))
+        await self._assert_owner(registration, student_user_id)
+
+        await self.db.refresh(registration, attribute_names=["courses"])
+        active_course_ids = [
+            rc.course_id for rc in registration.courses if not rc.is_dropped
+        ]
+        courses: list[Course] = []
+        if active_course_ids:
+            courses = list(
+                (
+                    await self.db.execute(
+                        select(Course)
+                        .where(Course.id.in_(active_course_ids))
+                        .order_by(Course.code.asc())
+                    )
+                ).scalars().all()
+            )
+
+        rate = _settings.FEE_PER_CREDIT_HOUR_BIRR
+        currency = _settings.TUITION_CURRENCY
+
+        lines = [
+            {
+                "course_id": c.id,
+                "course_code": c.code,
+                "course_title": c.title,
+                "credit_hours": c.credit_hours,
+                "line_total": c.credit_hours * rate,
+            }
+            for c in courses
+        ]
+        total_credit_hours = sum(c.credit_hours for c in courses)
+        gross_total = total_credit_hours * rate
+
+        is_government = (
+            registration.sponsorship_type == SponsorshipType.GOVERNMENT
+        )
+        amount_due = 0 if is_government else gross_total
+        if not active_course_ids:
+            note = (
+                "This registration has no active courses, so there is "
+                "nothing to bill yet. Add courses and re-fetch."
+            )
+        elif is_government:
+            note = (
+                "Cost-sharing covers this load — submit the cost-"
+                "sharing form to acknowledge."
+            )
+        else:
+            note = (
+                f"Self-sponsored: {total_credit_hours} credit hours × "
+                f"{rate} {currency}/credit-hour = {gross_total} "
+                f"{currency} due. Use /payment/initiate to settle."
+            )
+
+        return {
+            "registration_id": registration.id,
+            "sponsorship_type": registration.sponsorship_type,
+            "currency": currency,
+            "fee_per_credit_hour": rate,
+            "lines": lines,
+            "total_credit_hours": total_credit_hours,
+            "gross_total": gross_total,
+            "amount_due": amount_due,
+            "is_government_sponsored": is_government,
+            "payment_required": (not is_government) and bool(active_course_ids),
+            "note": note,
+        }
+
     # ── Mock payment (mirrors the admission module's pattern) ────
     #
     # Two-step shape, identical to /undergraduate/applications/{id}/payment/*:
@@ -826,6 +925,114 @@ class RegistrationService:
         await self.db.commit()
         await self.db.refresh(registration, attribute_names=["courses"])
         return registration, compliance
+
+    # ── One-shot register (collapses draft + add + remove + submit) ─
+
+    async def select_courses_and_submit(
+        self,
+        student_id: uuid.UUID,
+        student_user_id: uuid.UUID,
+        term_id: uuid.UUID,
+        course_ids: list[uuid.UUID],
+        completed_course_ids: Optional[set[uuid.UUID]] = None,
+    ) -> tuple[Registration, dict]:
+        """
+        Collapses the four-step registration flow (create draft → add
+        course → remove course → submit) into a single call. Used by
+        ``POST /api/v1/courses/me/register``.
+
+        The student supplies the target term and the exact list of
+        course ids they want to take. The service:
+
+          1. Finds the student's existing Registration for the term,
+             or creates a fresh draft.
+          2. Reconciles ``RegistrationCourse`` rows so the registration
+             holds exactly the requested course set: adds the missing
+             ones, deletes the extras.
+          3. Runs :meth:`submit` so the registration goes through the
+             usual prereq + load + payment compliance pipeline.
+
+        Idempotent on the happy path while the registration is in
+        ``REGISTRATION_OPEN``: a retry with the same ``course_ids``
+        re-runs submit without churning the join table. A retry with
+        a different list reconciles first.
+
+        Raises
+        ------
+        InvalidStateTransitionError
+            The registration already finalised (``REGISTERED``,
+            ``ADD_DROP_WINDOW``), or sits in ``PAYMENT_HOLD`` /
+            ``CHECKING_*`` and the student must clear the hold before
+            calling this endpoint.
+        EntityNotFoundError
+            One of the supplied ``course_ids`` does not exist.
+        RegistrationWindowClosedError
+            The term's registration window is closed (raised by
+            ``create_draft`` when no existing registration exists).
+        ComplianceCheckFailedError
+            Bubbled up from :meth:`submit` when the agent rejects the
+            final list (prereq miss, load over ceiling, unpaid).
+        """
+        existing = (
+            await self.db.execute(
+                select(Registration).where(
+                    Registration.student_id == student_id,
+                    Registration.term_id == term_id,
+                    Registration.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+
+        if existing is None:
+            # No prior registration in this term — create a fresh draft.
+            # create_draft is the canonical place that checks the term
+            # window is open, so we don't duplicate that guard here.
+            registration = await self.create_draft(student_id, term_id)
+        else:
+            registration = existing
+
+        # The reconcile step only makes sense while the draft is
+        # mutable — otherwise courses are locked. Allow the caller to
+        # retry while in REGISTRATION_OPEN (post-bounce or fresh) but
+        # block PAYMENT_HOLD / REGISTERED / CHECKING_* / CANCELLED so
+        # the student can't sneak around the state machine.
+        if registration.status != RegistrationStatus.REGISTRATION_OPEN:
+            raise InvalidStateTransitionError(
+                registration.status.value,
+                "select-courses-and-submit (registration must be in REGISTRATION_OPEN)",
+            )
+
+        # Validate every course id up front so we don't half-mutate.
+        for cid in course_ids:
+            course = await self.courses.get(cid)
+            if course is None:
+                raise EntityNotFoundError("Course", str(cid))
+
+        # Reconcile to the target set.
+        await self.db.refresh(registration, attribute_names=["courses"])
+        target = set(course_ids)
+        current_links = {rc.course_id: rc for rc in registration.courses}
+        current = set(current_links.keys())
+
+        # Delete extras
+        for cid in current - target:
+            await self.db.delete(current_links[cid])
+        # Add missing
+        for cid in target - current:
+            self.db.add(RegistrationCourse(
+                registration_id=registration.id,
+                course_id=cid,
+            ))
+
+        await self.db.flush()
+
+        # Hand off to submit() — the compliance pipeline + state
+        # transitions + audit trail all happen there.
+        return await self.submit(
+            registration.id,
+            student_user_id=student_user_id,
+            completed_course_ids=completed_course_ids,
+        )
 
     # ── Department-Head prerequisite override (SRS §3.5) ─────────
 

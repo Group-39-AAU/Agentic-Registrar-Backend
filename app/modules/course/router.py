@@ -61,10 +61,12 @@ from app.modules.course.schemas import (
     InstructorCreateRequest,
     InstructorResponse,
     InstructorScheduleEntry,
+    RegistrationInvoiceResponse,
     RegistrationCourseAdd,
     RegistrationDraftCreate,
     RegistrationResponse,
     RegistrationSubmitResponse,
+    SelectCoursesAndSubmitRequest,
     ScheduleConflictRead,
     ScheduleGenerateRequest,
     ScheduleGenerateResponse,
@@ -186,6 +188,52 @@ async def list_my_curriculum(
     student = await _resolve_student(db, current_user)
     svc = RegistrationService(db)
     return await svc.list_curriculum_courses(student.id)
+
+
+@router.post(
+    "/me/register",
+    response_model=RegistrationSubmitResponse,
+    summary="Pick courses and register in one call (collapsed flow)",
+)
+async def register_me(
+    payload: SelectCoursesAndSubmitRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Single-shot registration: the student picks the term and the
+    exact set of courses they want to take, and the service does
+    every intermediate step (create draft → sync course list →
+    submit + run compliance) in one call.
+
+    Idempotent on retry while the registration is in
+    ``REGISTRATION_OPEN``: if the previous submit bounced (prereq
+    miss, payment hold) the student can fix the input and POST again.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = RegistrationService(db)
+    try:
+        registration, compliance = await svc.select_courses_and_submit(
+            student_id=student.id,
+            student_user_id=current_user.id,
+            term_id=payload.term_id,
+            course_ids=payload.course_ids,
+        )
+    except RegistrationWindowClosedError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except DuplicateRegistrationError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except InvalidStateTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except ComplianceCheckFailedError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
+        )
+    return RegistrationSubmitResponse(
+        registration=registration, compliance=compliance,
+    )
 
 
 @router.post(
@@ -763,6 +811,42 @@ async def officer_close_advisory_review(
 #
 # /initiate is student-only and ownership-checked; /callback is PUBLIC
 # because in production it'd be hit by the bursar's webhook.
+
+
+@router.get(
+    "/registrations/{registration_id}/invoice",
+    response_model=RegistrationInvoiceResponse,
+    summary="Tuition invoice — per-credit-hour breakdown",
+)
+async def get_registration_invoice(
+    registration_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Per-credit-hour tuition breakdown for the calling student's own
+    registration. Each non-dropped course contributes ``credit_hours
+    * FEE_PER_CREDIT_HOUR_BIRR`` (default 100 birr / credit hour).
+
+    Self-sponsored students see ``amount_due`` = the full sum; they
+    pay it via /payment/initiate + /payment/callback. Government-
+    sponsored students see the same line items but ``amount_due=0``
+    — cost-sharing covers it via /cost-sharing-form.
+
+    Reachable in any registration status so the student can review
+    the bill from draft, after a PAYMENT_HOLD bounce, and after
+    REGISTERED for their records.
+    """
+    svc = RegistrationService(db)
+    try:
+        return await svc.get_invoice(
+            registration_id=registration_id,
+            student_user_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
 
 
 @router.post(

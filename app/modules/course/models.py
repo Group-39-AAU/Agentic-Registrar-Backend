@@ -261,6 +261,41 @@ class ClassScheduleSlot(Base):
     )
 
 
+# ── Classroom inventory ────────────────────────────────────────
+
+
+class Classroom(SoftDeleteBase):
+    """
+    Physical lecture hall / lab / classroom owned by a department.
+
+    Each room belongs to exactly one department (its "owning"
+    department). The Academic Scheduling Agent only places a cohort
+    in rooms whose department matches the cohort's department, so
+    cross-department borrowing requires explicit reassignment of
+    the room rather than implicit sharing.
+
+    ``name`` is the human-readable identifier the registrar shows on
+    the timetable (e.g. ``SE-101``, ``EE-LAB-1``); it must be unique
+    across the whole university.
+    """
+
+    __tablename__ = "classrooms"
+
+    name: Mapped[str] = mapped_column(
+        String(50), unique=True, nullable=False, index=True,
+    )
+    capacity: Mapped[int] = mapped_column(Integer, nullable=False)
+    department: Mapped[str] = mapped_column(
+        String(100), nullable=False, index=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "capacity > 0", name="ck_classroom_capacity_positive",
+        ),
+    )
+
+
 # ── People ───────────────────────────────────────────────────────
 
 
