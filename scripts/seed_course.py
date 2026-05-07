@@ -18,7 +18,7 @@ Phase 0 seeds (this script):
     2. 240 Courses across 6 engineering departments (4 per
        (department, semester) cell, 5-year programs = 10 semesters)
     3. ~28 intra-department prerequisite edges spanning 3+ depth levels
-    4. 12 Instructors (2 per department) + CourseOfferings + InstructorAssignments
+    4. 12 Instructors (2 per department) + InstructorAssignments per term
        (cohort Section rows are emitted by the scheduling agent at
        allocation time, not at seed time)
     5. 30 Students (5 per department) across semesters 1–8
@@ -38,9 +38,8 @@ from app.core.security import hash_password
 from app.modules.auth.models import User
 from app.modules.course.models import (
     AcademicTerm, AdvisoryRecommendation, Course, CoursePrerequisite,
-    CourseOffering, Section, Instructor, InstructorAssignment,
-    Registration, RegistrationCourse, RegistrationStatusHistory,
-    Student, CourseManagementOfficer,
+    Instructor, InstructorAssignment, Registration, RegistrationCourse,
+    RegistrationStatusHistory, Student, CourseManagementOfficer,
 )
 from app.shared.enums import (
     EnrollmentStatus, OfficerRole, RegistrationStatus, RiskStatus,
@@ -299,20 +298,11 @@ INSTRUCTORS = [
 ]
 
 
-# Per-course offering capacity and section count.
-# 5 sections per course, capacity 30 per section -> 150 total seats.
-
-OFFERING_CAPACITY = 150
-SECTIONS_PER_COURSE = 5
-SECTION_CAPACITY = 30
-TIME_SLOTS = [
-    "MON 08:30-10:00, WED 08:30-10:00",
-    "MON 10:30-12:00, WED 10:30-12:00",
-    "TUE 13:30-15:00, THU 13:30-15:00",
-    "TUE 15:30-17:00, THU 15:30-17:00",
-    "FRI 08:30-11:30",
-]
-ROOMS = ["NB-101", "NB-102", "NB-203", "NB-204", "NB-305", "FBE-12", "FBE-14"]
+# Per-course classroom inventory was previously seeded here as
+# OFFERING_CAPACITY / SECTIONS_PER_COURSE / TIME_SLOTS / ROOMS, but
+# none of that survives the cohort migration: rooms + time slots are
+# the AcademicSchedulingAgent's responsibility, and section count is
+# determined at allocation time by enrolment volume vs. room size.
 
 
 # ══════════════════════════════════════════════════════════════
@@ -556,14 +546,18 @@ async def _seed_instructors(
     return by_staff_id
 
 
-async def _seed_offerings_and_sections(
+async def _seed_instructor_assignments(
     session: AsyncSession,
     term: AcademicTerm,
     courses_by_code: dict[str, Course],
     instructors_by_staff_id: dict[str, Instructor],
 ) -> None:
     """
-    Seed the per-term CourseOfferings + InstructorAssignments only.
+    Seed per-term InstructorAssignments only.
+
+    The cohort scheduling agent reads InstructorAssignment to pin a
+    teacher onto every ClassScheduleSlot it emits. Each (course, term)
+    pair gets the first instructor in the course's department.
 
     Cohort Section rows are NOT seeded — they are created on demand by
     the AcademicSchedulingAgent when an officer hits
@@ -576,67 +570,49 @@ async def _seed_offerings_and_sections(
     for ins in instructors_by_staff_id.values():
         instructors_by_dept.setdefault(ins.department, []).append(ins)
 
-    existing_offerings = (
-        await session.execute(
-            select(CourseOffering).where(CourseOffering.term_id == term.id)
-        )
-    ).scalars().all()
-    existing_offering_courses = {o.course_id for o in existing_offerings}
-
-    offering_count = 0
     assignment_count = 0
     for code, course in courses_by_code.items():
-        if course.id in existing_offering_courses:
-            continue
-
-        offering = CourseOffering(
-            id=_uid("offering", term.term_name, code),
-            course_id=course.id,
-            term_id=term.id,
-            capacity=OFFERING_CAPACITY,
-            section_count=SECTIONS_PER_COURSE,
-        )
-        session.add(offering)
-        offering_count += 1
-
         # Pin the department's first instructor as the canonical
         # teacher for this (course, term). The scheduling agent reads
         # InstructorAssignment to populate ClassScheduleSlot.
         dept_instructors = instructors_by_dept.get(course.department, [])
         instructor = dept_instructors[0] if dept_instructors else None
-        if instructor is not None:
-            existing_assn = (
-                await session.execute(
-                    select(InstructorAssignment).where(
-                        InstructorAssignment.instructor_id == instructor.id,
-                        InstructorAssignment.course_id == course.id,
-                        InstructorAssignment.term_id == term.id,
-                    )
+        if instructor is None:
+            continue
+        existing_assn = (
+            await session.execute(
+                select(InstructorAssignment).where(
+                    InstructorAssignment.instructor_id == instructor.id,
+                    InstructorAssignment.course_id == course.id,
+                    InstructorAssignment.term_id == term.id,
                 )
-            ).scalar_one_or_none()
-            if existing_assn is None:
-                session.add(
-                    InstructorAssignment(
-                        id=_uid(
-                            "assn", term.term_name,
-                            instructor.instructor_id, code,
-                        ),
-                        instructor_id=instructor.id,
-                        course_id=course.id,
-                        term_id=term.id,
-                    )
+            )
+        ).scalar_one_or_none()
+        if existing_assn is None:
+            session.add(
+                InstructorAssignment(
+                    id=_uid(
+                        "assn", term.term_name,
+                        instructor.instructor_id, code,
+                    ),
+                    instructor_id=instructor.id,
+                    course_id=course.id,
+                    term_id=term.id,
                 )
-                assignment_count += 1
+            )
+            assignment_count += 1
 
-    section_count = 0  # sections are now allocate-time
     await session.commit()
-    if offering_count or section_count:
+    if assignment_count:
         print(
-            f"✅ Seeded {offering_count} offerings, {section_count} sections, "
-            f"{assignment_count} instructor assignments."
+            f"✅ Seeded {assignment_count} instructor assignments "
+            f"for term '{term.term_name}'."
         )
     else:
-        print(f"⚠️  Offerings for term '{term.term_name}' already present — skipping.")
+        print(
+            f"⚠️  Instructor assignments for term '{term.term_name}' "
+            "already present — skipping."
+        )
 
 
 async def _seed_students(session: AsyncSession) -> None:
@@ -1083,7 +1059,7 @@ async def seed() -> None:
         # registered in Fall 2026 cannot accidentally sit in a Spring
         # 2027 section.
         for term in terms:
-            await _seed_offerings_and_sections(
+            await _seed_instructor_assignments(
                 session, term, courses_by_code, instructors,
             )
         await _seed_students(session)

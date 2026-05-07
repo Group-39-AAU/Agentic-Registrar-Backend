@@ -30,7 +30,7 @@ Layered structure (mirrors the undergraduate module):
 Phase 0 entities (this package):
     AcademicTerm
     Course, CoursePrerequisite
-    CourseOffering, Section
+    Section, ClassScheduleSlot
     Student
     Instructor, InstructorAssignment
     CourseManagementOfficer

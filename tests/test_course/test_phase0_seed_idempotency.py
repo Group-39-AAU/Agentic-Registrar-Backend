@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from app.modules.course.models import (
     AcademicTerm, Course, CoursePrerequisite, CourseManagementOfficer,
-    CourseOffering, Instructor, InstructorAssignment, Section, Student,
+    Instructor, InstructorAssignment, Section, Student,
 )
 
 
@@ -41,10 +41,11 @@ async def _run_seed_helpers(session, seed):
     courses = await seed._seed_courses(session)
     await seed._seed_prerequisites(session, courses)
     instructors = await seed._seed_instructors(session)
-    # Each term gets its own offerings + sections so a Fall-registered
-    # student can't accidentally end up in a Spring section.
+    # Each term gets its own InstructorAssignment rows so the
+    # AcademicSchedulingAgent can stamp the right teacher onto every
+    # ClassScheduleSlot at allocation time.
     for term in terms:
-        await seed._seed_offerings_and_sections(
+        await seed._seed_instructor_assignments(
             session, term, courses, instructors,
         )
     await seed._seed_students(session)
@@ -65,7 +66,6 @@ def _row_counts(session):
             ("courses", Course),
             ("prereqs", CoursePrerequisite),
             ("instructors", Instructor),
-            ("offerings", CourseOffering),
             ("assignments", InstructorAssignment),
             ("students", Student),
             ("officers", CourseManagementOfficer),

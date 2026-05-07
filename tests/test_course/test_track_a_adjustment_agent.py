@@ -21,8 +21,7 @@ from app.modules.course.agents import (
     MIN_CREDIT_LOAD_ECTS,
 )
 from app.modules.course.models import (
-    AddDropRequest, Course, CourseOffering, Registration, RegistrationCourse,
-    Section,
+    AddDropRequest, Course, Registration, RegistrationCourse,
 )
 from app.modules.course.services import PayMock
 from app.shared.enums import (

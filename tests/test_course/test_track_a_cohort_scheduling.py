@@ -23,7 +23,7 @@ from sqlalchemy import select
 
 from app.modules.course.agents import AcademicSchedulingAgent
 from app.modules.course.models import (
-    ClassScheduleSlot, Course, CourseOffering, InstructorAssignment,
+    ClassScheduleSlot, Course, InstructorAssignment,
     Registration, Section, Student,
 )
 from app.modules.auth.models import User
@@ -81,22 +81,11 @@ async def cs_sem1_course(async_session) -> Course:
     return course
 
 
-@pytest_asyncio.fixture
-async def cs_sem1_offering(async_session, cs_sem1_course, seeded_term) -> CourseOffering:
-    off = CourseOffering(
-        course_id=cs_sem1_course.id, term_id=seeded_term.id,
-        capacity=120, section_count=2,
-    )
-    async_session.add(off)
-    await async_session.flush()
-    return off
-
-
 # ── allocate_sections ────────────────────────────────────────────
 
 
 async def test_allocate_creates_one_section_when_under_capacity(
-    async_session, seeded_term, cs_sem1_course, cs_sem1_offering,
+    async_session, seeded_term, cs_sem1_course,
 ):
     s = await _add_student(
         async_session, semester=1, department="Computer Science",
@@ -121,7 +110,7 @@ async def test_allocate_creates_one_section_when_under_capacity(
 
 
 async def test_allocate_splits_when_over_largest_room_capacity(
-    async_session, seeded_term, cs_sem1_course, cs_sem1_offering,
+    async_session, seeded_term, cs_sem1_course,
 ):
     """
     With a tight room inventory, more students than fit in one room
@@ -154,7 +143,7 @@ async def test_allocate_splits_when_over_largest_room_capacity(
 
 
 async def test_allocate_groups_by_department_and_semester(
-    async_session, seeded_term, cs_sem1_course, cs_sem1_offering,
+    async_session, seeded_term, cs_sem1_course,
 ):
     cs_a = await _add_student(
         async_session, semester=1, department="Computer Science",
@@ -184,7 +173,7 @@ async def test_allocate_groups_by_department_and_semester(
 
 
 async def test_allocate_is_idempotent(
-    async_session, seeded_term, cs_sem1_course, cs_sem1_offering,
+    async_session, seeded_term, cs_sem1_course,
 ):
     """Re-running with no new students leaves everything as-is."""
     s = await _add_student(
@@ -203,7 +192,7 @@ async def test_allocate_is_idempotent(
 
 
 async def test_allocate_skips_students_with_no_department(
-    async_session, seeded_term, cs_sem1_course, cs_sem1_offering,
+    async_session, seeded_term, cs_sem1_course,
 ):
     """A Student missing a department is recorded as failed, not crashed."""
     user = User(
@@ -234,7 +223,7 @@ async def test_allocate_skips_students_with_no_department(
 
 
 async def test_generate_schedule_emits_credit_hours_worth_of_slots(
-    async_session, seeded_term, cs_sem1_course, cs_sem1_offering,
+    async_session, seeded_term, cs_sem1_course,
 ):
     """A 3-credit course should produce exactly 3 hour-blocks per section."""
     s = await _add_student(
@@ -263,7 +252,7 @@ async def test_generate_schedule_emits_credit_hours_worth_of_slots(
 
 
 async def test_generate_schedule_pins_instructor_from_assignment(
-    async_session, seeded_term, seeded_instructor, cs_sem1_course, cs_sem1_offering,
+    async_session, seeded_term, seeded_instructor, cs_sem1_course,
 ):
     """ClassScheduleSlot.instructor_id mirrors InstructorAssignment."""
     async_session.add(InstructorAssignment(
@@ -288,7 +277,7 @@ async def test_generate_schedule_pins_instructor_from_assignment(
 
 
 async def test_process_task_runs_both_phases(
-    async_session, seeded_term, cs_sem1_course, cs_sem1_offering,
+    async_session, seeded_term, cs_sem1_course,
 ):
     s = await _add_student(
         async_session, semester=1, department="Computer Science",

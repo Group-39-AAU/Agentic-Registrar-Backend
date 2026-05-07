@@ -24,7 +24,7 @@ from app.modules.testing_center.models import UATRecord            # noqa: F401
 from app.modules.undergraduate.ranking.models import StreamQuota, RankingResult  # noqa: F401
 from app.modules.undergraduate.enrollment.models import Enrollment                # noqa: F401
 from app.modules.course.models import (                                           # noqa: F401
-    AcademicTerm, Course, CoursePrerequisite, CourseOffering, Section,
+    AcademicTerm, Course, CoursePrerequisite, Section, ClassScheduleSlot,
     Student, Instructor, InstructorAssignment, CourseManagementOfficer,
     Registration, RegistrationCourse, RegistrationStatusHistory,
     AddDropRequest, AdvisoryRecommendation, PrerequisiteOverride,

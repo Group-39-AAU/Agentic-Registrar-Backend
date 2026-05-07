@@ -11,7 +11,7 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from app.modules.course.models import (
-    AcademicTerm, Course, CourseOffering, CoursePrerequisite, Instructor,
+    AcademicTerm, Course, CoursePrerequisite, Instructor,
     InstructorAssignment, Section,
 )
 
@@ -36,18 +36,6 @@ async def test_course_round_trip(async_session, seeded_course):
     assert fetched.id == seeded_course.id
     assert fetched.title == "Introduction to Programming"
     assert fetched.credit_hours == 4
-
-
-async def test_offering_resolves_course_and_term(
-    async_session, seeded_offering, seeded_course, seeded_term,
-):
-    fetched = (
-        await async_session.execute(
-            select(CourseOffering).where(CourseOffering.id == seeded_offering.id)
-        )
-    ).scalar_one()
-    assert fetched.course.code == seeded_course.code
-    assert fetched.term.term_name == seeded_term.term_name
 
 
 async def test_section_resolves_term(

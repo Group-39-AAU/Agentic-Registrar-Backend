@@ -45,7 +45,7 @@ from app.modules.course.exceptions import (
 )
 from app.modules.course.models import (
     AcademicTerm, AddDropRequest, AdvisoryRecommendation,
-    ClassScheduleSlot, CourseManagementOfficer, Course, CourseOffering,
+    ClassScheduleSlot, CourseManagementOfficer, Course,
     Instructor, InstructorAssignment, PrerequisiteOverride, Registration,
     RegistrationCourse, RegistrationStatusHistory, ScheduleConflict, Section,
     Student,

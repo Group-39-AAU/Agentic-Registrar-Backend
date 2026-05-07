@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    Course, CourseManagementOfficer, CoursePrerequisite, CourseOffering,
+    Course, CourseManagementOfficer, CoursePrerequisite,
     Section, Student,
 )
 from app.shared.enums import EnrollmentStatus, OfficerRole, UserRole
@@ -72,23 +72,6 @@ async def test_prereq_cannot_point_to_self(async_session, seeded_course):
         prerequisite_course_id=seeded_course.id,    # CHECK: <>
     )
     async_session.add(self_loop)
-    with pytest.raises(IntegrityError):
-        await async_session.flush()
-
-
-# ── CourseOffering constraints ──────────────────────────────────
-
-
-async def test_offering_capacity_must_be_positive(
-    async_session, seeded_term, seeded_course,
-):
-    bad = CourseOffering(
-        course_id=seeded_course.id,
-        term_id=seeded_term.id,
-        capacity=0,             # CHECK: > 0
-        section_count=1,
-    )
-    async_session.add(bad)
     with pytest.raises(IntegrityError):
         await async_session.flush()
 

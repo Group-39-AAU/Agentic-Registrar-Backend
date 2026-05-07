@@ -16,7 +16,7 @@ import pytest_asyncio
 
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    AcademicTerm, Course, CourseOffering, CourseManagementOfficer,
+    AcademicTerm, Course, CourseManagementOfficer,
     Instructor, Section, Student,
 )
 from app.shared.enums import EnrollmentStatus, OfficerRole, UserRole
@@ -76,21 +76,6 @@ async def seeded_instructor(async_session) -> Instructor:
     async_session.add(instructor)
     await async_session.flush()
     return instructor
-
-
-@pytest_asyncio.fixture
-async def seeded_offering(
-    async_session, seeded_term, seeded_course,
-) -> CourseOffering:
-    offering = CourseOffering(
-        course_id=seeded_course.id,
-        term_id=seeded_term.id,
-        capacity=30,
-        section_count=1,
-    )
-    async_session.add(offering)
-    await async_session.flush()
-    return offering
 
 
 @pytest_asyncio.fixture
