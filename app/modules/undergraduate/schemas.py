@@ -136,6 +136,9 @@ class ApplicationResponse(BaseModel):
 
     id: uuid.UUID
     applicant_id: uuid.UUID
+    applicant_email: Optional[str] = None
+    applicant_first_name: Optional[str] = None
+    applicant_last_name: Optional[str] = None
     sponsorship_type: SponsorshipType
     stream: StreamType
     admission_number: str
