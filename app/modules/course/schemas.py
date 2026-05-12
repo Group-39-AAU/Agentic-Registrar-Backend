@@ -200,11 +200,13 @@ class RegistrationSubmitResponse(BaseModel):
 
 class ScheduleGenerateRequest(BaseModel):
     """
-    Officer payload for ``POST /officer/schedule/generate``. Department
-    is no longer a parameter — every (department, semester) cohort in
-    the term is processed in one call.
+    Officer payload for ``POST /officer/schedule/generate``. Scheduling
+    is one department at a time — pass the term + department, and the
+    agent allocates cohorts (semesters 1-10 within that department)
+    and emits ClassScheduleSlot rows. Other departments are untouched.
     """
     term_id: uuid.UUID
+    department: str = Field(..., min_length=1, max_length=100)
 
 
 class SectionRead(BaseModel):

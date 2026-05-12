@@ -1153,17 +1153,19 @@ class SchedulingService:
     async def generate_schedule(
         self,
         term_id: uuid.UUID,
+        department: str,
         officer_role: UserRole,
         officer_id: uuid.UUID,
     ) -> dict:
         """
-        Run the full scheduling pipeline (cohort allocation + per-
-        section weekly slots) for the entire term. Officer-only.
+        Run the cohort allocation + per-section weekly-slot generator
+        for a single (term, department) pair. Officer-only.
 
-        Department is no longer a parameter — every (department,
-        semester) cohort in the term is processed in one call so
-        cross-department conflicts on shared rooms or instructors are
-        detected globally.
+        Each department is scheduled independently — rooms and
+        instructors are scoped per department under the current model
+        (see ``Classroom.department``), so a sibling department's
+        sections are untouched by this call. Run once per department
+        per term.
         """
         if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
             raise UnauthorizedActorError(
@@ -1176,6 +1178,7 @@ class SchedulingService:
         payload = await self.scheduling_agent.process_task({
             "session": self.db,
             "term_id": term_id,
+            "department": department,
         })
         await self.db.commit()
 
@@ -1187,6 +1190,7 @@ class SchedulingService:
             resource_id=term_id,
             decision="ok",
             metadata={
+                "department": department,
                 "students_placed": payload["allocation"]["students_placed_count"],
                 "sections_created": len(payload["allocation"]["sections_created"]),
                 "slots_created": payload["schedule"]["slots_created"],

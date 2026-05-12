@@ -53,8 +53,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
 from app.modules.course.models import (
-    ClassScheduleSlot, Course, InstructorAssignment, Registration,
-    ScheduleConflict, Section, Student,
+    ClassScheduleSlot, Classroom, Course, InstructorAssignment,
+    Registration, ScheduleConflict, Section, Student,
 )
 from app.shared.enums import (
     RegistrationStatus, ScheduleConflictStatus, ScheduleConflictType,
@@ -101,18 +101,27 @@ _HOUR_BLOCKS: list[tuple[time, time]] = [
 
 
 class AcademicSchedulingAgent(CourseBaseAgent):
-    """SDS §3.1.3 + §5.3 Tables 82–84 — cohort-based reimplementation."""
+    """
+    SDS §3.1.3 + §5.3 Tables 82–84 — cohort-based, department-scoped.
+
+    The scheduler runs **one department at a time**: an officer triggers
+    scheduling for "Software Engineering" and the agent allocates +
+    schedules every (semester=1..10) cohort in that department,
+    drawing rooms only from that department's :class:`Classroom`
+    inventory. Other departments are unaffected by the run.
+
+    Per-department scheduling is safe because:
+      - ``Classroom.department`` partitions room inventory by owner.
+      - ``InstructorAssignment`` rows are department-internal in the
+        seed (no cross-department teaching), so two departments
+        scheduling sequentially cannot double-book an instructor.
+
+    The agent does maintain a per-department busy map across all
+    sections (room + instructor) so two cohorts within the same
+    department don't clash on shared resources.
+    """
 
     AGENT_ID_PREFIX = "AGENT_ASA_"
-
-    # SDS Table 83 invariant — room inventory. Capacities determine how
-    # large a single cohort may grow.
-    DEFAULT_ROOM_INVENTORY: list[tuple[str, int]] = [
-        ("NB-101", 60), ("NB-102", 60),
-        ("NB-203", 50), ("NB-204", 50),
-        ("NB-305", 40),
-        ("FBE-12", 80), ("FBE-14", 80),
-    ]
 
     def __init__(
         self,
@@ -121,47 +130,107 @@ class AcademicSchedulingAgent(CourseBaseAgent):
         room_inventory: Optional[list[tuple[str, int]]] = None,
     ) -> None:
         super().__init__(agent_id=agent_id or f"{self.AGENT_ID_PREFIX}DEFAULT")
-        self._rooms: list[tuple[str, int]] = list(
-            room_inventory or self.DEFAULT_ROOM_INVENTORY
+        # Test override: a hand-built list of (name, capacity) pairs
+        # bypasses the Classroom DB query. Production callers pass
+        # None and the agent reads the per-department inventory at
+        # allocation time.
+        self._room_inventory_override: Optional[list[tuple[str, int]]] = (
+            sorted(room_inventory, key=lambda r: -r[1])
+            if room_inventory is not None else None
         )
-        # Sort rooms largest-first so allocation prefers fewer, fuller
-        # cohorts over many small ones.
-        self._rooms.sort(key=lambda r: -r[1])
+
+    # ── Classroom inventory lookup ────────────────────────────────
+
+    async def _rooms_for_department(
+        self, session: AsyncSession, department: str,
+    ) -> list[tuple[str, int]]:
+        """
+        Returns ``[(name, capacity), …]`` for every classroom whose
+        ``department`` matches, largest-first. Tests can short-circuit
+        via the ``room_inventory`` constructor argument.
+        """
+        if self._room_inventory_override is not None:
+            return self._room_inventory_override
+        rows = (
+            await session.execute(
+                select(Classroom).where(
+                    Classroom.department == department,
+                    Classroom.is_deleted == False,  # noqa: E712
+                ).order_by(Classroom.capacity.desc())
+            )
+        ).scalars().all()
+        return [(c.name, c.capacity) for c in rows]
 
     # ── Phase 1: allocate_sections ────────────────────────────────
 
     async def allocate_sections(
-        self, session: AsyncSession, term_id: uuid.UUID,
+        self,
+        session: AsyncSession,
+        term_id: uuid.UUID,
+        department: str,
     ) -> AllocationResult:
         """
-        Group REGISTERED students for ``term_id`` by (department,
-        current_semester) and pin each to a cohort Section. Idempotent
-        on re-runs: a student whose Registration already has
-        ``section_id`` set is skipped.
+        Group REGISTERED students in this department (across every
+        semester level 1–10) by ``current_semester`` and pin each to
+        a cohort Section. Rooms come from ``Classroom`` filtered by
+        the department.
+
+        Idempotent on re-runs: students already pinned to a Section
+        stay put; new students fill remaining capacity in existing
+        sections before fresh ones are created.
         """
         result = AllocationResult()
 
-        # Pre-load existing sections in this term keyed by (dept, sem)
-        # so re-runs can fill remaining capacity instead of creating
-        # duplicates.
+        rooms = await self._rooms_for_department(session, department)
+        if not rooms:
+            # No classrooms means we can't place anyone — report all
+            # affected students as failed rather than silently dropping.
+            unplaced_students = (
+                await session.execute(
+                    select(Student.id).where(
+                        Student.department == department,
+                        Student.is_deleted == False,  # noqa: E712
+                    )
+                )
+            ).scalars().all()
+            for sid in unplaced_students:
+                result.failed.append({
+                    "student_id": str(sid),
+                    "reason": f"no classrooms registered for department '{department}'",
+                })
+            return result
+
+        # Pre-load existing sections in this (term, department) keyed
+        # by semester so re-runs fill remaining capacity instead of
+        # creating duplicates.
         existing_sections = (
             await session.execute(
                 select(Section).where(
+                    Section.term_id == term_id,
+                    Section.department == department,
+                    Section.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalars().all()
+        sections_by_sem: dict[int, list[Section]] = defaultdict(list)
+        for sec in existing_sections:
+            sections_by_sem[sec.semester].append(sec)
+
+        # Section codes are globally unique per term (across all
+        # departments), so pull every code already used in the term —
+        # not just this department's — to avoid collisions when other
+        # departments are scheduled later.
+        all_term_codes = (
+            await session.execute(
+                select(Section.section_code).where(
                     Section.term_id == term_id,
                     Section.is_deleted == False,  # noqa: E712
                 )
             )
         ).scalars().all()
-        sections_by_group: dict[tuple[str, int], list[Section]] = defaultdict(list)
-        for sec in existing_sections:
-            sections_by_group[(sec.department, sec.semester)].append(sec)
+        used_codes: set[str] = set(all_term_codes)
 
-        # Existing global section codes (A, B, C, …) so newly-created
-        # sections in this term don't collide.
-        used_codes: set[str] = {sec.section_code for sec in existing_sections}
-
-        # Pull REGISTERED students for this term and skip ones already
-        # placed.
+        # Pull REGISTERED students in this department.
         rows = (
             await session.execute(
                 select(Registration, Student).join(
@@ -170,33 +239,24 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                     Registration.term_id == term_id,
                     Registration.status == RegistrationStatus.REGISTERED,
                     Registration.is_deleted == False,  # noqa: E712
+                    Student.department == department,
                 )
             )
         ).all()
 
-        students_by_group: dict[tuple[str, int], list[tuple[Registration, Student]]] = (
+        students_by_sem: dict[int, list[tuple[Registration, Student]]] = (
             defaultdict(list)
         )
         for reg, stu in rows:
             if reg.section_id is not None:
-                # Already placed — counts toward capacity in its
-                # existing section but doesn't need re-placement.
-                continue
-            if not stu.department:
-                result.failed.append({
-                    "student_id": str(stu.id),
-                    "reason": "student has no department recorded",
-                })
-                continue
-            students_by_group[(stu.department, stu.current_semester)].append(
-                (reg, stu),
-            )
+                continue   # already placed; skip
+            students_by_sem[stu.current_semester].append((reg, stu))
 
-        for (dept, sem), unplaced in students_by_group.items():
-            sections_for_group = sections_by_group[(dept, sem)]
+        for sem, unplaced in students_by_sem.items():
+            sections_for_sem = sections_by_sem[sem]
 
-            # Step 1: top up existing sections that still have capacity.
-            for sec in sections_for_group:
+            # Step 1: top up existing sections.
+            for sec in sections_for_sem:
                 while unplaced and sec.enrolled_count < sec.capacity:
                     reg, stu = unplaced.pop(0)
                     reg.section_id = sec.id
@@ -209,15 +269,9 @@ class AcademicSchedulingAgent(CourseBaseAgent):
 
             # Step 2: spill remaining students into fresh sections.
             while unplaced:
-                # Pick the largest room not already double-booked at
-                # this slot (room re-use across sections is fine —
-                # they meet at different schedule slots).
-                # Pick the largest single room available; cohort size
-                # is capped at that room's capacity.
-                cohort_capacity = max(cap for _, cap in self._rooms)
-                cohort_room = next(
-                    name for name, cap in self._rooms if cap == cohort_capacity
-                )
+                # Always pick the largest available room — biggest
+                # cohort fits in one section rather than splitting.
+                cohort_room, cohort_capacity = rooms[0]
                 cohort_size = min(len(unplaced), cohort_capacity)
 
                 section_code = _next_section_code(used_codes)
@@ -225,7 +279,7 @@ class AcademicSchedulingAgent(CourseBaseAgent):
 
                 section = Section(
                     term_id=term_id,
-                    department=dept,
+                    department=department,
                     semester=sem,
                     section_code=section_code,
                     room=cohort_room,
@@ -234,11 +288,11 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                 )
                 session.add(section)
                 await session.flush()
-                sections_for_group.append(section)
+                sections_for_sem.append(section)
                 result.sections_created.append({
                     "section_id": str(section.id),
                     "section_code": section_code,
-                    "department": dept,
+                    "department": department,
                     "semester": sem,
                     "room": cohort_room,
                     "capacity": cohort_capacity,
@@ -260,21 +314,17 @@ class AcademicSchedulingAgent(CourseBaseAgent):
     # ── Phase 2: generate_schedule ────────────────────────────────
 
     async def generate_schedule(
-        self, session: AsyncSession, term_id: uuid.UUID,
+        self,
+        session: AsyncSession,
+        term_id: uuid.UUID,
+        department: str,
     ) -> ScheduleArtefact:
         """
-        Build a weekly schedule for every Section in ``term_id``.
+        Build a weekly schedule for every Section in this department
+        for ``term_id``. Re-runs are idempotent: existing slots for
+        the department's sections are deleted before rebuilding.
 
-        For each section:
-            curriculum = courses where Course.semester == section.semester
-            for each course:
-                place ``course.credit_hours`` hour-blocks,
-                avoiding (room, slot) and (instructor, slot) conflicts
-                that already exist in this term.
-
-        Re-runs are idempotent: existing slots are dropped before
-        rebuilding for the section so the schedule reflects the
-        latest student placements.
+        Other departments' sections + slots are untouched.
         """
         artefact = ScheduleArtefact()
 
@@ -282,18 +332,25 @@ class AcademicSchedulingAgent(CourseBaseAgent):
             await session.execute(
                 select(Section).where(
                     Section.term_id == term_id,
+                    Section.department == department,
                     Section.is_deleted == False,  # noqa: E712
-                ).order_by(Section.section_code.asc())
+                ).order_by(
+                    Section.semester.asc(),
+                    Section.section_code.asc(),
+                )
             )
         ).scalars().all()
         artefact.section_count = len(sections)
 
-        # Wipe any existing slots for the term so we rebuild cleanly.
+        # Wipe only this department's existing slots before rebuilding.
         existing_slot_ids = (
             await session.execute(
                 select(ClassScheduleSlot.id)
                 .join(Section, Section.id == ClassScheduleSlot.section_id)
-                .where(Section.term_id == term_id)
+                .where(
+                    Section.term_id == term_id,
+                    Section.department == department,
+                )
             )
         ).scalars().all()
         if existing_slot_ids:
@@ -307,16 +364,21 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                 await session.delete(slot)
             await session.flush()
 
-        # Term-wide conflict bookkeeping. Each entry is a (day, start)
-        # tuple → set of room names / instructor ids in use.
+        # Per-department conflict bookkeeping — rooms + instructors
+        # are department-scoped in the current model, so a sibling
+        # department's slots never need to be cross-checked here.
         room_busy: dict[tuple[str, time], set[str]] = defaultdict(set)
         instructor_busy: dict[tuple[str, time], set[uuid.UUID]] = defaultdict(set)
 
         for sec in sections:
+            # Curriculum is strictly per (department, semester) under
+            # the cohort model — a CS-sem-1 cohort attends only CS-
+            # tagged sem-1 courses, never SE's or BME's.
             curriculum = (
                 await session.execute(
                     select(Course).where(
                         Course.semester == sec.semester,
+                        Course.department == sec.department,
                         Course.is_deleted == False,  # noqa: E712
                     ).order_by(Course.code.asc())
                 )
@@ -436,21 +498,28 @@ class AcademicSchedulingAgent(CourseBaseAgent):
         self, input_data: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Run both phases for a term:
+        Run both phases for a single (term, department) pair:
 
             1. allocate_sections — assigns every REGISTERED student
-               in the term to a Section.
+               in ``department`` to a cohort Section, drawing rooms
+               from that department's :class:`Classroom` inventory.
             2. generate_schedule — builds ClassScheduleSlot rows
-               sized to each course's credit_hours.
+               sized to each course's credit_hours, scoped to this
+               department's sections only.
+
+        Other departments' sections, slots, and conflicts are
+        untouched. Run this once per department per term.
         """
         session: AsyncSession = input_data["session"]
         term_id: uuid.UUID = input_data["term_id"]
+        department: str = input_data["department"]
 
-        allocation = await self.allocate_sections(session, term_id)
-        artefact = await self.generate_schedule(session, term_id)
+        allocation = await self.allocate_sections(session, term_id, department)
+        artefact = await self.generate_schedule(session, term_id, department)
 
         return {
             "allocation": {
+                "department": department,
                 "sections_created": allocation.sections_created,
                 "students_placed_count": len(allocation.students_placed),
                 "students_placed": allocation.students_placed,
@@ -458,6 +527,7 @@ class AcademicSchedulingAgent(CourseBaseAgent):
             },
             "schedule": {
                 "term_id": str(term_id),
+                "department": department,
                 "section_count": artefact.section_count,
                 "slots_created": artefact.slots_created,
                 "sections": artefact.sections,

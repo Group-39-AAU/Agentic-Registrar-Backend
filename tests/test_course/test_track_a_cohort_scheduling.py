@@ -1,22 +1,26 @@
 """
-Track A — cohort-based AcademicSchedulingAgent.
+Track A — cohort-based AcademicSchedulingAgent, department-scoped.
 
-Replaces the old per-CourseOffering scheduling tests. Verifies the
-new contract:
+Verifies the per-department contract:
 
-  - allocate_sections groups REGISTERED students by (department,
-    current_semester) and pins each to a Section with a globally-
-    unique code (A, B, C, …) and a room from the inventory.
+  - allocate_sections groups REGISTERED students in *one* department
+    by current_semester and pins each to a Section with a globally-
+    unique code (A, B, C, …) and a room from that department's
+    Classroom inventory.
   - generate_schedule lays out ClassScheduleSlot rows whose total
     weekly hours per course equal ``course.credit_hours``.
-  - Re-runs are idempotent: students already pinned stay put,
+  - Re-runs are idempotent: students already pinned stay put;
     extra capacity is filled before new sections are created.
+  - Calls for one department don't touch another department's
+    sections or slots.
+
+Tests inject ``room_inventory=`` on the agent to bypass the
+``Classroom`` DB query, so each test owns its own room budget
+without touching seeded rows.
 """
 from __future__ import annotations
 
 import uuid
-from collections import defaultdict
-from datetime import time
 
 import pytest_asyncio
 from sqlalchemy import select
@@ -32,7 +36,16 @@ from app.shared.enums import (
 )
 
 
-# ── Tiny per-test fixture set ────────────────────────────────────
+# ── Tiny per-test helpers ────────────────────────────────────────
+
+
+_DEFAULT_ROOMS = [("BIG-1", 100), ("MED-1", 40), ("LAB-1", 20)]
+
+
+def _make_agent(rooms: list[tuple[str, int]] | None = None) -> AcademicSchedulingAgent:
+    return AcademicSchedulingAgent(
+        room_inventory=rooms if rooms is not None else _DEFAULT_ROOMS,
+    )
 
 
 async def _add_student(
@@ -93,8 +106,10 @@ async def test_allocate_creates_one_section_when_under_capacity(
     )
     await _register(async_session, s, seeded_term)
 
-    agent = AcademicSchedulingAgent()
-    result = await agent.allocate_sections(async_session, seeded_term.id)
+    agent = _make_agent()
+    result = await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
 
     assert len(result.sections_created) == 1
     assert len(result.students_placed) == 1
@@ -103,7 +118,7 @@ async def test_allocate_creates_one_section_when_under_capacity(
             select(Section).where(Section.term_id == seeded_term.id)
         )
     ).scalar_one()
-    assert sec.section_code == "A"   # global counter starts at A
+    assert sec.section_code == "A"
     assert sec.department == "Computer Science"
     assert sec.semester == 1
     assert sec.enrolled_count == 1
@@ -116,8 +131,8 @@ async def test_allocate_splits_when_over_largest_room_capacity(
     With a tight room inventory, more students than fit in one room
     must spill into a second cohort.
     """
-    inventory = [("SMALL", 2)]      # one tiny room, capacity 2
-    agent = AcademicSchedulingAgent(room_inventory=inventory)
+    inventory = [("SMALL", 2)]
+    agent = _make_agent(inventory)
 
     for i in range(3):
         s = await _add_student(
@@ -127,7 +142,9 @@ async def test_allocate_splits_when_over_largest_room_capacity(
         )
         await _register(async_session, s, seeded_term)
 
-    result = await agent.allocate_sections(async_session, seeded_term.id)
+    result = await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
 
     sections = (
         await async_session.execute(
@@ -137,14 +154,19 @@ async def test_allocate_splits_when_over_largest_room_capacity(
         )
     ).scalars().all()
     assert [s.section_code for s in sections] == ["A", "B"]
-    # Cohort A is full (2/2), cohort B holds the spill (1/2)
     assert sections[0].enrolled_count == 2
     assert sections[1].enrolled_count == 1
+    assert len(result.sections_created) == 2
 
 
-async def test_allocate_groups_by_department_and_semester(
+async def test_allocate_is_per_department_call(
     async_session, seeded_term, cs_sem1_course,
 ):
+    """
+    Two students in different departments → two separate allocator
+    runs produce two separate sections. A single call only scopes to
+    one department.
+    """
     cs_a = await _add_student(
         async_session, semester=1, department="Computer Science",
         email="cs-a@aau.edu.et", full_name="CS Studenta",
@@ -156,20 +178,63 @@ async def test_allocate_groups_by_department_and_semester(
     await _register(async_session, cs_a, seeded_term)
     await _register(async_session, se_a, seeded_term)
 
-    agent = AcademicSchedulingAgent()
-    await agent.allocate_sections(async_session, seeded_term.id)
+    agent = _make_agent()
+    # First call: CS only.
+    cs_result = await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
+    assert len(cs_result.sections_created) == 1
+    assert {sec["department"] for sec in cs_result.sections_created} == {
+        "Computer Science",
+    }
+    # Sibling department's student isn't touched
+    se_reg = (
+        await async_session.execute(
+            select(Registration).where(Registration.student_id == se_a.id)
+        )
+    ).scalar_one()
+    assert se_reg.section_id is None
+
+    # Second call: SE.
+    se_result = await agent.allocate_sections(
+        async_session, seeded_term.id, "Software Engineering",
+    )
+    assert {sec["department"] for sec in se_result.sections_created} == {
+        "Software Engineering",
+    }
+
+
+async def test_allocate_groups_by_semester_within_department(
+    async_session, seeded_term, cs_sem1_course,
+):
+    """Two CS students at different semester levels → two cohorts."""
+    s1 = await _add_student(
+        async_session, semester=1, department="Computer Science",
+        email="cs-s1@aau.edu.et", full_name="Csone Student",
+    )
+    s3 = await _add_student(
+        async_session, semester=3, department="Computer Science",
+        email="cs-s3@aau.edu.et", full_name="Csthree Student",
+    )
+    await _register(async_session, s1, seeded_term)
+    await _register(async_session, s3, seeded_term)
+
+    agent = _make_agent()
+    await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
 
     sections = (
         await async_session.execute(
-            select(Section).where(Section.term_id == seeded_term.id).order_by(
-                Section.department.asc(),
-            )
+            select(Section).where(
+                Section.term_id == seeded_term.id,
+                Section.department == "Computer Science",
+            ).order_by(Section.semester.asc())
         )
     ).scalars().all()
-    # One cohort per department, both at semester 1.
-    by_dept = {s.department: s for s in sections}
-    assert set(by_dept) == {"Computer Science", "Software Engineering"}
-    assert all(s.semester == 1 for s in sections)
+    assert [(s.semester, s.section_code) for s in sections] == [
+        (1, "A"), (3, "B"),
+    ]
 
 
 async def test_allocate_is_idempotent(
@@ -182,41 +247,35 @@ async def test_allocate_is_idempotent(
     )
     await _register(async_session, s, seeded_term)
 
-    agent = AcademicSchedulingAgent()
-    first = await agent.allocate_sections(async_session, seeded_term.id)
-    second = await agent.allocate_sections(async_session, seeded_term.id)
+    agent = _make_agent()
+    first = await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
+    second = await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
 
     assert len(first.sections_created) == 1
     assert len(second.sections_created) == 0
     assert len(second.students_placed) == 0
 
 
-async def test_allocate_skips_students_with_no_department(
+async def test_allocate_skips_students_in_other_departments(
     async_session, seeded_term, cs_sem1_course,
 ):
-    """A Student missing a department is recorded as failed, not crashed."""
-    user = User(
-        id=uuid.uuid4(), email="noemploy@aau.edu.et",
-        first_name="No", last_name="Dept",
-        hashed_password="x", role=UserRole.STUDENT, is_active=True,
+    """A run for CS must not place SE students into a CS cohort."""
+    se = await _add_student(
+        async_session, semester=1, department="Software Engineering",
+        email="other-dept@aau.edu.et", full_name="Other Dept",
     )
-    async_session.add(user)
-    await async_session.flush()
-    student = Student(
-        user_id=user.id, student_id="UGR/9990/14",
-        full_name="No Dept", current_semester=1,
-        department=None,
-        enrollment_status=EnrollmentStatus.ACTIVE,
+    await _register(async_session, se, seeded_term)
+
+    agent = _make_agent()
+    result = await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
     )
-    async_session.add(student)
-    await async_session.flush()
-    await _register(async_session, student, seeded_term)
-
-    agent = AcademicSchedulingAgent()
-    result = await agent.allocate_sections(async_session, seeded_term.id)
-
-    assert result.failed
-    assert result.failed[0]["reason"] == "student has no department recorded"
+    assert result.sections_created == []
+    assert result.students_placed == []
 
 
 # ── generate_schedule ────────────────────────────────────────────
@@ -225,24 +284,22 @@ async def test_allocate_skips_students_with_no_department(
 async def test_generate_schedule_emits_credit_hours_worth_of_slots(
     async_session, seeded_term, cs_sem1_course,
 ):
-    """A 3-credit course should produce exactly 3 hour-blocks per section."""
     s = await _add_student(
         async_session, semester=1, department="Computer Science",
         email="hours@aau.edu.et", full_name="Hours Test",
     )
     await _register(async_session, s, seeded_term)
 
-    agent = AcademicSchedulingAgent()
-    await agent.allocate_sections(async_session, seeded_term.id)
-    artefact = await agent.generate_schedule(async_session, seeded_term.id)
+    agent = _make_agent()
+    await agent.allocate_sections(async_session, seeded_term.id, "Computer Science")
+    artefact = await agent.generate_schedule(
+        async_session, seeded_term.id, "Computer Science",
+    )
 
     slots = (
-        await async_session.execute(
-            select(ClassScheduleSlot)
-        )
+        await async_session.execute(select(ClassScheduleSlot))
     ).scalars().all()
     assert len(slots) == cs_sem1_course.credit_hours
-    # Each slot is exactly one hour (start + 1 == end)
     for slot in slots:
         assert slot.day_of_week in {"MON", "TUE", "WED", "THU", "FRI"}
         s_h, s_m = slot.start_time.hour, slot.start_time.minute
@@ -254,7 +311,6 @@ async def test_generate_schedule_emits_credit_hours_worth_of_slots(
 async def test_generate_schedule_pins_instructor_from_assignment(
     async_session, seeded_term, seeded_instructor, cs_sem1_course,
 ):
-    """ClassScheduleSlot.instructor_id mirrors InstructorAssignment."""
     async_session.add(InstructorAssignment(
         instructor_id=seeded_instructor.id,
         course_id=cs_sem1_course.id,
@@ -266,13 +322,16 @@ async def test_generate_schedule_pins_instructor_from_assignment(
     )
     await _register(async_session, s, seeded_term)
 
-    agent = AcademicSchedulingAgent()
-    await agent.allocate_sections(async_session, seeded_term.id)
-    await agent.generate_schedule(async_session, seeded_term.id)
+    agent = _make_agent()
+    await agent.allocate_sections(async_session, seeded_term.id, "Computer Science")
+    await agent.generate_schedule(
+        async_session, seeded_term.id, "Computer Science",
+    )
 
     slots = (
         await async_session.execute(select(ClassScheduleSlot))
     ).scalars().all()
+    assert slots, "expected at least one slot"
     assert all(slot.instructor_id == seeded_instructor.id for slot in slots)
 
 
@@ -285,12 +344,115 @@ async def test_process_task_runs_both_phases(
     )
     await _register(async_session, s, seeded_term)
 
-    agent = AcademicSchedulingAgent()
+    agent = _make_agent()
     payload = await agent.process_task({
         "session": async_session,
         "term_id": seeded_term.id,
+        "department": "Computer Science",
     })
 
     assert payload["allocation"]["students_placed_count"] == 1
+    assert payload["allocation"]["department"] == "Computer Science"
     assert payload["schedule"]["slots_created"] == cs_sem1_course.credit_hours
     assert payload["schedule"]["section_count"] == 1
+
+
+# ── Isolation: scheduling one dept doesn't touch another ────────
+
+
+async def test_scheduling_one_department_does_not_touch_another(
+    async_session, seeded_term, cs_sem1_course,
+):
+    """
+    Two students in different departments, same semester. Scheduling
+    "Computer Science" must place the CS student and emit slots only
+    for the CS cohort — the SE student stays unallocated and no SE
+    section or slot is created.
+    """
+    cs_a = await _add_student(
+        async_session, semester=1, department="Computer Science",
+        email="iso-cs@aau.edu.et", full_name="Iso CS",
+    )
+    se_a = await _add_student(
+        async_session, semester=1, department="Software Engineering",
+        email="iso-se@aau.edu.et", full_name="Iso SE",
+    )
+    await _register(async_session, cs_a, seeded_term)
+    await _register(async_session, se_a, seeded_term)
+
+    agent = _make_agent()
+    await agent.process_task({
+        "session": async_session,
+        "term_id": seeded_term.id,
+        "department": "Computer Science",
+    })
+
+    # CS got a section
+    cs_sections = (
+        await async_session.execute(
+            select(Section).where(
+                Section.term_id == seeded_term.id,
+                Section.department == "Computer Science",
+            )
+        )
+    ).scalars().all()
+    assert len(cs_sections) == 1
+    cs_reg = (
+        await async_session.execute(
+            select(Registration).where(Registration.student_id == cs_a.id)
+        )
+    ).scalar_one()
+    assert cs_reg.section_id == cs_sections[0].id
+
+    # SE didn't
+    se_sections = (
+        await async_session.execute(
+            select(Section).where(
+                Section.term_id == seeded_term.id,
+                Section.department == "Software Engineering",
+            )
+        )
+    ).scalars().all()
+    assert se_sections == []
+    se_reg = (
+        await async_session.execute(
+            select(Registration).where(Registration.student_id == se_a.id)
+        )
+    ).scalar_one()
+    assert se_reg.section_id is None
+
+    # No slots emitted for any SE section
+    se_slots = (
+        await async_session.execute(
+            select(ClassScheduleSlot).join(
+                Section, Section.id == ClassScheduleSlot.section_id,
+            ).where(Section.department == "Software Engineering")
+        )
+    ).scalars().all()
+    assert se_slots == []
+
+
+async def test_allocator_with_no_classrooms_for_department_reports_failure(
+    async_session, seeded_term, cs_sem1_course,
+):
+    """
+    If the department has no Classroom rows seeded (and no test
+    override), the allocator records every affected student as
+    failed instead of crashing.
+    """
+    s = await _add_student(
+        async_session, semester=1, department="Computer Science",
+        email="empty@aau.edu.et", full_name="Empty Dept",
+    )
+    await _register(async_session, s, seeded_term)
+
+    # Force the agent to consult the DB (which has no CS rooms in
+    # this in-memory test DB).
+    agent = AcademicSchedulingAgent(room_inventory=None)
+    result = await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
+
+    assert result.sections_created == []
+    assert result.failed
+    assert "no classrooms" in result.failed[0]["reason"].lower()

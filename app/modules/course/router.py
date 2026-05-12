@@ -369,14 +369,16 @@ async def officer_generate_schedule(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer-only: allocate every REGISTERED student in the term to a
-    cohort Section, then build the per-section weekly schedule. Runs
-    across all departments at once (cohort allocation is term-wide).
+    Officer-only: allocate every REGISTERED student in this department
+    to a cohort Section (across semesters 1–10), then build the
+    per-section weekly schedule. Run once per department per term —
+    other departments are untouched by this call.
     """
     svc = SchedulingService(db)
     try:
         result = await svc.generate_schedule(
             term_id=payload.term_id,
+            department=payload.department,
             officer_role=current_user.role,
             officer_id=current_user.id,
         )
