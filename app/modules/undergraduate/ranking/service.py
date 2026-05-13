@@ -21,59 +21,84 @@ class RankingService:
         )).scalar()
         return (latest_run or 0) + 1
 
-    async def apply_first_run_cutoffs_for_rerun(
+    async def apply_locked_cutoffs_for_rerun(
         self,
         *,
         term_id: uuid.UUID,
+        current_run_number: int,
         final_state: dict[str, Any],
         program_info: dict[str, dict[str, str]],
     ) -> None:
         """
-        Re-assign rerun applicants by using first-run cutoffs for the term.
-        Mutates applicants in `final_state` in-place.
+        Re-assign rerun applicants by using cutoffs locked in by previous runs.
+
+        For each program/stream, the locked cutoff is the lowest final_score from
+        the EARLIEST prior run in which it received any assignments. Programs and
+        streams that have never received an assignment have no floor: any applicant
+        who chose them is eligible, and their assignment in this run will establish
+        the cutoff going forward.
         """
-        first_run_rows = (await self._db.execute(
-            select(RankingResult).where(
+        prior_rows = (await self._db.execute(
+            select(RankingResult)
+            .where(
                 RankingResult.admission_term_id == term_id,
-                RankingResult.ranking_run_number == 1,
+                RankingResult.ranking_run_number < current_run_number,
             )
+            .order_by(RankingResult.ranking_run_number.asc())
         )).scalars().all()
-        if not first_run_rows:
-            raise ValueError("First run ranking results are required for rerun cutoffs")
+        if not prior_rows:
+            raise ValueError("Prior ranking results are required for rerun cutoffs")
 
         program_cutoffs: dict[uuid.UUID, float] = {}
+        program_cutoff_run: dict[uuid.UUID, int] = {}
         stream_cutoffs: dict[str, float] = {}
+        stream_cutoff_run: dict[str, int] = {}
 
-        for row in first_run_rows:
+        for row in prior_rows:
             if row.is_assigned and row.assigned_program_id:
-                current_cutoff = program_cutoffs.get(row.assigned_program_id)
-                if current_cutoff is None or row.final_score < current_cutoff:
-                    program_cutoffs[row.assigned_program_id] = row.final_score
+                pid = row.assigned_program_id
+                locked_run = program_cutoff_run.get(pid)
+                if locked_run is None or row.ranking_run_number == locked_run:
+                    program_cutoff_run.setdefault(pid, row.ranking_run_number)
+                    current_cutoff = program_cutoffs.get(pid)
+                    if current_cutoff is None or row.final_score < current_cutoff:
+                        program_cutoffs[pid] = row.final_score
 
             if row.is_assigned and row.assigned_stream:
                 stream_key = row.assigned_stream.value
-                current_cutoff = stream_cutoffs.get(stream_key)
-                if current_cutoff is None or row.final_score < current_cutoff:
-                    stream_cutoffs[stream_key] = row.final_score
+                locked_run = stream_cutoff_run.get(stream_key)
+                if locked_run is None or row.ranking_run_number == locked_run:
+                    stream_cutoff_run.setdefault(stream_key, row.ranking_run_number)
+                    current_cutoff = stream_cutoffs.get(stream_key)
+                    if current_cutoff is None or row.final_score < current_cutoff:
+                        stream_cutoffs[stream_key] = row.final_score
 
         for applicant in final_state["self_sponsored"]:
             applicant.is_assigned = False
             applicant.assigned_program_id = None
-            applicant.assignment_detail = "Unassigned — below first-run cutoffs"
+            applicant.assignment_detail = "Unassigned — below locked cutoffs"
 
             for choice_num, prog_id in enumerate(
                 [applicant.program_choice_1_id, applicant.program_choice_2_id, applicant.program_choice_3_id], 1
             ):
                 if prog_id is None:
                     continue
+                prog = program_info.get(str(prog_id), {})
+                prog_name = prog.get("name", str(prog_id))
                 cutoff = program_cutoffs.get(prog_id)
-                if cutoff is not None and applicant.final_score >= cutoff:
+                if cutoff is None:
                     applicant.is_assigned = True
                     applicant.assigned_program_id = prog_id
-                    prog = program_info.get(str(prog_id), {})
-                    prog_name = prog.get("name", str(prog_id))
                     applicant.assignment_detail = (
-                        f"Assigned by first-run cutoff to P{choice_num}: {prog_name} "
+                        f"Assigned to P{choice_num}: {prog_name} "
+                        f"(no prior cutoff — establishes cutoff this run)"
+                    )
+                    break
+                if applicant.final_score >= cutoff:
+                    applicant.is_assigned = True
+                    applicant.assigned_program_id = prog_id
+                    applicant.assignment_detail = (
+                        f"Assigned by locked cutoff to P{choice_num}: {prog_name} "
                         f"(cutoff={cutoff})"
                     )
                     break
@@ -82,11 +107,18 @@ class RankingService:
             applicant.is_assigned = False
             applicant.assigned_stream = None
             cutoff = stream_cutoffs.get(applicant.stream)
-            if cutoff is not None and applicant.final_score >= cutoff:
+            if cutoff is None:
                 applicant.is_assigned = True
                 applicant.assigned_stream = applicant.stream
                 applicant.assignment_detail = (
-                    f"Assigned by first-run stream cutoff: {applicant.stream} (cutoff={cutoff})"
+                    f"Assigned to stream {applicant.stream} "
+                    f"(no prior cutoff — establishes cutoff this run)"
+                )
+            elif applicant.final_score >= cutoff:
+                applicant.is_assigned = True
+                applicant.assigned_stream = applicant.stream
+                applicant.assignment_detail = (
+                    f"Assigned by locked stream cutoff: {applicant.stream} (cutoff={cutoff})"
                 )
             else:
-                applicant.assignment_detail = "Unassigned — below first-run stream cutoff"
+                applicant.assignment_detail = "Unassigned — below locked stream cutoff"

@@ -167,11 +167,14 @@ async def run_ranking(
     compiled_graph = build_ranking_graph()
     final_state = compiled_graph.invoke(initial_state)
 
-    # Re-runs use first run's cutoffs to assign applicants.
+    # Re-runs use cutoffs locked in by prior runs. Programs/streams that
+    # have never received an assignment have no floor and will get a cutoff
+    # set by this run's assignments.
     if run_number > 1:
         try:
-            await ranking_service.apply_first_run_cutoffs_for_rerun(
+            await ranking_service.apply_locked_cutoffs_for_rerun(
                 term_id=admission_term_id,
+                current_run_number=run_number,
                 final_state=final_state,
                 program_info=program_info,
             )
