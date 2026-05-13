@@ -12,10 +12,15 @@ dependencies = [
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
+    # We talk to bcrypt directly (see app/core/security.py) rather than
+    # going through passlib, because passlib 1.7.4's bcrypt-version
+    # self-detection breaks on bcrypt 4.x. bcrypt's own API is stable
+    # across versions.
+    "bcrypt>=4.0.0",
     "python-multipart>=0.0.9",
     "email-validator>=2.0.0",
     "langgraph>=0.2.0",
+    "google-genai>=0.3.0",
 ]
 
 [project.optional-dependencies]
@@ -32,4 +37,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Silence the known pytest-asyncio + aiosqlite teardown warning where the
+# aiosqlite worker thread tries to push results onto an event loop that
+# pytest-asyncio has already closed. The result of the test run is not
+# affected; the warning just clutters output.
+filterwarnings = [
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning",
+]
 

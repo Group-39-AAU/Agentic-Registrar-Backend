@@ -21,7 +21,6 @@ class EnrollmentResponse(BaseModel):
     university_id: str
     program_id: Optional[uuid.UUID] = None
     department: str
-    section: str
     enrollment_term: str
     created_at: datetime
 

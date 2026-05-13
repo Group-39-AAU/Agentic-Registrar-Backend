@@ -61,25 +61,85 @@ class AuthService:
 
         return user
 
-    async def authenticate(self, email: str, password: str) -> str:
+    async def authenticate(
+        self, identifier: str, password: str,
+    ) -> tuple[str, bool]:
         """
-        Verify credentials and return a JWT access token.
-        Raises ValueError if credentials are invalid.
-        """
-        result = await self._db.execute(
-            select(User).where(
-                User.email == email,
-                User.is_deleted == False,  # noqa: E712
-            )
-        )
-        user = result.scalar_one_or_none()
+        Verify credentials and return ``(jwt_token, must_change_password)``.
 
+        ``identifier`` can be either an email (admission flow) or a UGR
+        student ID like ``UGR/0001/14`` (post-enrollment portal flow).
+        Lookup tries email first; if no user is found, falls back to
+        joining ``students`` on student_id → user_id. The shared User
+        identity backs both paths so audit history stays unified.
+
+        Raises ValueError on invalid credentials or deactivated account.
+        """
+        user = await self._lookup_user_by_identifier(identifier)
         if user is None or not verify_password(password, user.hashed_password):
-            raise ValueError("Invalid email or password")
+            raise ValueError("Invalid credentials")
 
         if not user.is_active:
             raise ValueError("Account is deactivated")
 
-        token = create_access_token(data={"sub": str(user.id), "role": user.role.value})
-        logger.info("User authenticated: %s", user.email)
-        return token
+        token = create_access_token(
+            data={"sub": str(user.id), "role": user.role.value},
+        )
+        logger.info(
+            "User authenticated: %s (must_change_password=%s)",
+            user.email, user.must_change_password,
+        )
+        return token, user.must_change_password
+
+    async def _lookup_user_by_identifier(self, identifier: str) -> User | None:
+        """
+        Resolve email-or-student-id to a User. Email match wins; if
+        nothing matches, try the Student.student_id → user_id join.
+        """
+        by_email = (
+            await self._db.execute(
+                select(User).where(
+                    User.email == identifier,
+                    User.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if by_email is not None:
+            return by_email
+
+        # Defer the import: course module shouldn't be required to
+        # boot the auth module in environments where it's stubbed out.
+        from app.modules.course.models import Student
+        by_student_id = (
+            await self._db.execute(
+                select(User)
+                .join(Student, Student.user_id == User.id)
+                .where(
+                    Student.student_id == identifier,
+                    User.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        return by_student_id
+
+    async def change_password(
+        self,
+        user: User,
+        current_password: str,
+        new_password: str,
+    ) -> None:
+        """
+        Replace the user's password after verifying the current one.
+        Clears ``must_change_password`` so the lockout middleware lets
+        every other endpoint through again.
+        """
+        if not verify_password(current_password, user.hashed_password):
+            raise ValueError("Current password is incorrect")
+        if current_password == new_password:
+            raise ValueError("New password must differ from current password")
+
+        user.hashed_password = hash_password(new_password)
+        user.must_change_password = False
+        await self._db.commit()
+        await self._db.refresh(user)
+        logger.info("Password changed for user %s", user.email)

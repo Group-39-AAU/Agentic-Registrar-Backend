@@ -5,7 +5,7 @@ System Audit Log — immutable governance ledger.
 import uuid
 from typing import Optional
 
-from sqlalchemy import String
+from sqlalchemy import JSON, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,6 +33,12 @@ class SystemAuditLog(Base):
         UUID(as_uuid=True), index=True, nullable=False
     )
     decision: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # Cross-DB type: JSONB on Postgres (production), JSON on SQLite (tests).
+    # The Postgres column type is unchanged — only the Python-side type is
+    # widened so SQLAlchemy can also emit a SQLite-compatible CREATE TABLE.
     metadata_payload: Mapped[dict] = mapped_column(
-        "metadata", JSONB, server_default="{}", nullable=False
+        "metadata",
+        JSON().with_variant(JSONB(), "postgresql"),
+        server_default="{}",
+        nullable=False,
     )

@@ -18,8 +18,10 @@ from app.database.base import Base
 class Enrollment(Base):
     """
     Immutable enrollment record — one per admitted student.
-    Contains the generated university ID, portal credentials,
-    and assigned department / section.
+    Carries only the durable academic-assignment fields the admission
+    module produces. Section assignment moved to course-management
+    (cohort sections per term, see :class:`Section`); portal password
+    moved to the User row + ``must_change_password`` lockout.
     """
     __tablename__ = "enrollments"
 
@@ -45,10 +47,6 @@ class Enrollment(Base):
         String(20), unique=True, index=True, nullable=False,
         comment="Format: UGR/XXXX/YY"
     )
-    portal_password: Mapped[str] = mapped_column(
-        String(255), nullable=False,
-        comment="Temporary password — student must change on first login"
-    )
 
     # ── Academic Assignment ──
     program_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -57,8 +55,4 @@ class Enrollment(Base):
         nullable=True,
     )
     department: Mapped[str] = mapped_column(String(100), nullable=False)
-    section: Mapped[str] = mapped_column(
-        String(10), nullable=False,
-        comment="Auto-assigned section: A, B, C, …"
-    )
     enrollment_term: Mapped[str] = mapped_column(String(50), nullable=False)

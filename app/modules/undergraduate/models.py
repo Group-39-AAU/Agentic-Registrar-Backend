@@ -13,7 +13,7 @@ from datetime import date
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean, Date, Float, ForeignKey, String, Text, UniqueConstraint,
+    JSON, Boolean, Date, Float, ForeignKey, String, Text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -87,7 +87,9 @@ class UndergraduateApplication(SoftDeleteBase):
 
     remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     extra_data: Mapped[dict] = mapped_column(
-        JSONB, server_default="{}", nullable=False
+        JSON().with_variant(JSONB(), "postgresql"),
+        server_default="{}",
+        nullable=False,
     )
 
     # ── Relationships (lazy="selectin" per architecture blueprint) ──

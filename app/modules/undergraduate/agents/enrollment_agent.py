@@ -8,8 +8,6 @@ Processes all DECIDED + ADMIT applications and produces enrollment
 records with university IDs, temporary passwords, and section assignments.
 """
 
-import secrets
-import string
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -39,10 +37,10 @@ class AdmittedStudent:
     assigned_program_code: Optional[str] = None
     assigned_department: Optional[str] = None
 
-    # Generated during enrollment
+    # Generated during enrollment. Section/portal_password moved to
+    # course-management — see AcademicSchedulingAgent and
+    # OnboardingService respectively.
     university_id: Optional[str] = None
-    portal_password: Optional[str] = None
-    section: Optional[str] = None
 
 
 class EnrollmentState(dict):
@@ -97,26 +95,32 @@ def generate_credentials(state: dict) -> dict:
     Node 2: Generate university ID and temporary portal password
     for each student.
 
-    ID format: UGR/{sequential}/{year_suffix}
-    Password: random 10-char alphanumeric
+    ID format: UGR/{sequential}/{year_suffix}.
+
+    Section assignment and portal-password issuance moved out of the
+    admission module:
+      - Section is now a course-management concern handled by the
+        AcademicSchedulingAgent at term-open time, based on actual
+        registered students per (department, semester).
+      - Portal credentials are issued by OnboardingService (4-digit
+        PIN + must_change_password) when the officer onboards the
+        student into the course-management portal.
     """
     students = state.get("students", [])
     counter = state.get("id_counter_start", 1000)
     year_suffix = state.get("year_suffix", "26")
     traces = state.get("traces", [])
 
-    alphabet = string.ascii_letters + string.digits
-
     for s in students:
         s.university_id = f"UGR/{counter}/{year_suffix}"
-        s.portal_password = "".join(secrets.choice(alphabet) for _ in range(10))
         counter += 1
 
     traces.append({
         "step_name": "generate_credentials",
         "reasoning_log": (
             f"Generated university IDs from UGR/{state.get('id_counter_start', 1000)}/{year_suffix} "
-            f"to UGR/{counter - 1}/{year_suffix} and temporary passwords."
+            f"to UGR/{counter - 1}/{year_suffix}. Portal credentials are "
+            "issued separately by course-management onboarding."
         ),
     })
     return {**state, "students": students, "traces": traces}
@@ -124,31 +128,21 @@ def generate_credentials(state: dict) -> dict:
 
 def assign_and_finalize(state: dict) -> dict:
     """
-    Node 3: Assign sections to students.
+    Node 3: Finalisation — no-op for section assignment.
 
-    Sections are assigned per-program (self-sponsored) or per-stream
-    (government). Each section holds up to `section_capacity` students.
+    Section assignment moved to course-management. This node remains
+    for graph compatibility and to keep the trace chronology readable;
+    it adds a single trace entry recording the handoff.
     """
     students = state.get("students", [])
-    section_capacity = state.get("section_capacity", 50)
     traces = state.get("traces", [])
-
-    # Group students by their program or stream for section assignment
-    group_counters: dict[str, int] = {}  # group_key → count
-
-    for s in students:
-        group_key = str(s.assigned_program_id) if s.assigned_program_id else s.stream
-        count = group_counters.get(group_key, 0)
-
-        # Section letter: A=0, B=1, ...
-        section_index = count // section_capacity
-        s.section = chr(ord("A") + section_index)
-
-        group_counters[group_key] = count + 1
-
     traces.append({
         "step_name": "assign_and_finalize",
-        "reasoning_log": f"Assigned sections for {len(students)} students across {len(group_counters)} groups.",
+        "reasoning_log": (
+            f"Finalised {len(students)} enrollments. Section "
+            "allocation will be performed by the AcademicSchedulingAgent "
+            "after the course-management term opens."
+        ),
     })
     return {**state, "students": students, "traces": traces}
 

@@ -39,8 +39,23 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     ALGORITHM: str = "HS256"
 
-    # ── AI / Gemini ──────────────────────────────────────
+    # ── AI / Gemini (advisory narrative LLM) ─────────────
+    # Empty key disables LLM enrichment; AcademicAdvisoryAgent then
+    # falls back to its rule-based explanation (see app/ai/llm_client.py).
+    # gemini-2.0-flash is on Google's free tier (15 RPM / 1500 RPD)
+    # which comfortably covers final-year project demos.
     GEMINI_API_KEY: str = ""
+    ADVISORY_LLM_MODEL: str = "gemini-2.0-flash"
+    ADVISORY_LLM_TIMEOUT_SECONDS: float = 5.0
+    ADVISORY_LLM_MAX_TOKENS: int = 600
+
+    # ── Tuition / cost-sharing pricing ───────────────────
+    # Self-sponsored students pay this many birr per credit hour
+    # registered each term; government-sponsored students see the
+    # same calculation on their invoice but the bursar bills the
+    # cost-sharing programme rather than the student.
+    FEE_PER_CREDIT_HOUR_BIRR: int = 100
+    TUITION_CURRENCY: str = "ETB"
 
     # ── Logging ──────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
