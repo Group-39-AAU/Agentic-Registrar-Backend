@@ -108,6 +108,7 @@ async def enrollment(async_session, applicant) -> Enrollment:
         id=uuid.uuid4(),
         application_id=app_row.id,
         applicant_id=applicant.id,
+        admission_term_id=term.id,
         university_id="UGR/0042/14",
         department="Computer Science",
         enrollment_term="2025/2026",

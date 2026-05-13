@@ -88,6 +88,7 @@ async def admission_enrollment(
     enrollment = Enrollment(
         application_id=admission_application.id,
         applicant_id=admitted_user.id,
+        admission_term_id=admission_application.admission_term_id,
         university_id="UGR/9001/14",
         department="Computer Science",
         enrollment_term="Fall 2026",
@@ -218,6 +219,7 @@ async def test_onboard_handles_missing_user_name_gracefully(
     enrollment = Enrollment(
         application_id=app.id,
         applicant_id=user.id,
+        admission_term_id=app.admission_term_id,
         university_id="UGR/9999/14",
         department="Computer Science",
         enrollment_term="Fall 2026",

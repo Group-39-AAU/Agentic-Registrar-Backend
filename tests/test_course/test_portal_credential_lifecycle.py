@@ -113,6 +113,7 @@ async def admission_user_with_enrollment(async_session) -> tuple[User, Enrollmen
         id=uuid.uuid4(),
         application_id=app_row.id,
         applicant_id=user.id,
+        admission_term_id=term.id,
         university_id="UGR/0042/14",
         department="Computer Science",
         enrollment_term="2025/2026",
