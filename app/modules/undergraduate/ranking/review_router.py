@@ -7,6 +7,7 @@ or in batch.
 """
 
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -158,6 +159,10 @@ async def list_students_for_review(
     sponsorship_type: SponsorshipType = Query(
         ..., description="Filter by SELF_SPONSORED or GOVERNMENT"
     ),
+    ai_recommended_decision: Optional[DecisionType] = Query(
+        None,
+        description="Filter by latest AI recommended decision: RECOMMEND_ADMIT, RECOMMEND_REJECT, or RECOMMEND_WAITLIST",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
@@ -166,14 +171,50 @@ async def list_students_for_review(
     """
     Paginated list of students awaiting officer review.
     Filtered by sponsorship type (self-sponsored or government).
+    Optionally filtered by the latest AI recommended decision.
     """
     _role_gate(current_user)
+
+    if ai_recommended_decision is not None and ai_recommended_decision not in {
+        DecisionType.RECOMMEND_ADMIT,
+        DecisionType.RECOMMEND_REJECT,
+        DecisionType.RECOMMEND_WAITLIST,
+    }:
+        raise HTTPException(
+            400,
+            "ai_recommended_decision must be RECOMMEND_ADMIT, RECOMMEND_REJECT, or RECOMMEND_WAITLIST",
+        )
 
     base_filter = [
         UndergraduateApplication.current_status == ApplicationStatus.PENDING_REVIEW,
         UndergraduateApplication.is_deleted == False,  # noqa: E712
         UndergraduateApplication.sponsorship_type == sponsorship_type,
     ]
+
+    # If filtering by AI recommended decision, restrict to applications whose
+    # latest AIEvaluation matches the requested decision.
+    if ai_recommended_decision is not None:
+        latest_eval_subq = (
+            select(
+                AIEvaluation.application_id,
+                func.max(AIEvaluation.created_at).label("latest_created_at"),
+            )
+            .group_by(AIEvaluation.application_id)
+            .subquery()
+        )
+        latest_eval = (
+            select(AIEvaluation)
+            .join(
+                latest_eval_subq,
+                (AIEvaluation.application_id == latest_eval_subq.c.application_id)
+                & (AIEvaluation.created_at == latest_eval_subq.c.latest_created_at),
+            )
+            .where(AIEvaluation.recommended_decision == ai_recommended_decision)
+            .subquery()
+        )
+        base_filter.append(
+            UndergraduateApplication.id.in_(select(latest_eval.c.application_id))
+        )
 
     # Total count
     total = (await db.execute(
@@ -228,85 +269,6 @@ async def get_student_review_detail(
         raise HTTPException(404, "Application not found")
 
     return await _build_review_card(app, db)
-
-
-# ══════════════════════════════════════════════════════════════
-#  POST /review/decide/{application_id} — Single decision
-# ══════════════════════════════════════════════════════════════
-
-@router.post("/decide/{application_id}", response_model=DecisionResponse)
-async def decide_single(
-    application_id: uuid.UUID,
-    data: DecisionCreate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Record a final admission decision for a single student.
-    Accepts ADMIT, REJECT, or WAITLIST.
-    Transitions the application to DECIDED.
-    """
-    _role_gate(current_user)
-
-    # Validate decision type
-    if data.human_decision not in {DecisionType.ADMIT, DecisionType.REJECT, DecisionType.WAITLIST}:
-        raise HTTPException(400, "Decision must be ADMIT, REJECT, or WAITLIST")
-
-    # Fetch application
-    app = (await db.execute(
-        select(UndergraduateApplication).where(
-            UndergraduateApplication.id == application_id,
-            UndergraduateApplication.is_deleted == False,  # noqa: E712
-        )
-    )).scalar_one_or_none()
-
-    if not app:
-        raise HTTPException(404, "Application not found")
-
-    if app.current_status != ApplicationStatus.PENDING_REVIEW:
-        raise HTTPException(
-            400,
-            f"Application must be in PENDING_REVIEW status (currently: {app.current_status.value})"
-        )
-
-    # Check for existing decision
-    existing = (await db.execute(
-        select(RegistrarDecision).where(
-            RegistrarDecision.application_id == application_id
-        )
-    )).scalar_one_or_none()
-
-    if existing:
-        raise HTTPException(409, "A decision has already been recorded for this application")
-
-    # Create decision record
-    decision = RegistrarDecision(
-        application_id=application_id,
-        reviewer_id=current_user.id,
-        human_decision=data.human_decision,
-        justification_remarks=data.justification_remarks,
-        override_reason=data.override_reason,
-    )
-    db.add(decision)
-
-    # Update final_decision on the application
-    app.final_decision = data.human_decision.value
-
-    # Transition to DECIDED
-    svc = ApplicationService(db)
-    await svc.change_status(
-        application_id,
-        ApplicationStatusUpdate(
-            new_status=ApplicationStatus.DECIDED,
-            trigger_reason=f"Officer decision: {data.human_decision.value} — {data.justification_remarks[:100]}",
-        ),
-        actor_id=current_user.id,
-        actor_role=current_user.role,
-    )
-
-    await db.commit()
-    await db.refresh(decision)
-    return decision
 
 
 # ══════════════════════════════════════════════════════════════
@@ -408,3 +370,82 @@ async def decide_batch(
         failed=failed,
         results=results,
     )
+
+
+# ══════════════════════════════════════════════════════════════
+#  POST /review/decide/{application_id} — Single decision
+# ══════════════════════════════════════════════════════════════
+
+@router.post("/decide/{application_id}", response_model=DecisionResponse)
+async def decide_single(
+    application_id: uuid.UUID,
+    data: DecisionCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Record a final admission decision for a single student.
+    Accepts ADMIT, REJECT, or WAITLIST.
+    Transitions the application to DECIDED.
+    """
+    _role_gate(current_user)
+
+    # Validate decision type
+    if data.human_decision not in {DecisionType.ADMIT, DecisionType.REJECT, DecisionType.WAITLIST}:
+        raise HTTPException(400, "Decision must be ADMIT, REJECT, or WAITLIST")
+
+    # Fetch application
+    app = (await db.execute(
+        select(UndergraduateApplication).where(
+            UndergraduateApplication.id == application_id,
+            UndergraduateApplication.is_deleted == False,  # noqa: E712
+        )
+    )).scalar_one_or_none()
+
+    if not app:
+        raise HTTPException(404, "Application not found")
+
+    if app.current_status != ApplicationStatus.PENDING_REVIEW:
+        raise HTTPException(
+            400,
+            f"Application must be in PENDING_REVIEW status (currently: {app.current_status.value})"
+        )
+
+    # Check for existing decision
+    existing = (await db.execute(
+        select(RegistrarDecision).where(
+            RegistrarDecision.application_id == application_id
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        raise HTTPException(409, "A decision has already been recorded for this application")
+
+    # Create decision record
+    decision = RegistrarDecision(
+        application_id=application_id,
+        reviewer_id=current_user.id,
+        human_decision=data.human_decision,
+        justification_remarks=data.justification_remarks,
+        override_reason=data.override_reason,
+    )
+    db.add(decision)
+
+    # Update final_decision on the application
+    app.final_decision = data.human_decision.value
+
+    # Transition to DECIDED
+    svc = ApplicationService(db)
+    await svc.change_status(
+        application_id,
+        ApplicationStatusUpdate(
+            new_status=ApplicationStatus.DECIDED,
+            trigger_reason=f"Officer decision: {data.human_decision.value} — {data.justification_remarks[:100]}",
+        ),
+        actor_id=current_user.id,
+        actor_role=current_user.role,
+    )
+
+    await db.commit()
+    await db.refresh(decision)
+    return decision

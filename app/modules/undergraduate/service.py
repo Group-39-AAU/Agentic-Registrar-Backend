@@ -357,9 +357,11 @@ class ApplicationService:
         return built[0]
 
     async def list_applications(
-        self, *, limit: int = 50, offset: int = 0
+        self, *, limit: int = 50, offset: int = 0, term_id: uuid.UUID
     ) -> tuple[list[ApplicationResponse], int]:
-        items, total = await self._app_repo.get_all(limit=limit, offset=offset)
+        items, total = await self._app_repo.get_all(
+            limit=limit, offset=offset, admission_term_id=term_id
+        )
         enriched = await self._build_application_responses(items)
         return enriched, total
 
@@ -406,6 +408,16 @@ class ApplicationService:
                 latest_uat[r.application_id] = r
         uat_id_by_app = {aid: rec.uat_id for aid, rec in latest_uat.items()}
 
+        # Load applicant (User) rows for names/emails
+        applicant_ids: set[uuid.UUID] = {a.applicant_id for a in applications}
+        user_map: dict[uuid.UUID, UserModel] = {}
+        if applicant_ids:
+            user_result = await self._db.execute(
+                select(UserModel).where(UserModel.id.in_(applicant_ids))
+            )
+            for u in user_result.scalars().all():
+                user_map[u.id] = u
+
         prog_ids: set[uuid.UUID] = set()
         for a in applications:
             if a.sponsorship_type == SponsorshipType.SELF_SPONSORED:
@@ -450,6 +462,9 @@ class ApplicationService:
                 ApplicationResponse(
                     id=a.id,
                     applicant_id=a.applicant_id,
+                    applicant_email=(user_map.get(a.applicant_id).email if user_map.get(a.applicant_id) else None),
+                    applicant_first_name=(user_map.get(a.applicant_id).first_name if user_map.get(a.applicant_id) else None),
+                    applicant_last_name=(user_map.get(a.applicant_id).last_name if user_map.get(a.applicant_id) else None),
                     sponsorship_type=a.sponsorship_type,
                     stream=a.stream,
                     admission_number=a.admission_number,

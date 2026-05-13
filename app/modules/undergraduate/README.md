@@ -120,9 +120,9 @@ Each transition is enforced by the state machine in `service.py` and logged in `
 
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
-| `POST` | `/run` | Officer/Admin | Trigger the Ranking Agent (batch process) |
-| `GET` | `/results/{batch_id}` | Officer/Admin | Get ranked list for a batch |
-| `GET` | `/results/{batch_id}/summary` | Officer/Admin | Get batch summary with cutoffs |
+| `POST` | `/run` | Officer/Admin | Trigger the Ranking Agent for an admission term |
+| `GET` | `/results/{term_id}` | Officer/Admin | Get ranked list for a term (latest run by default) |
+| `GET` | `/results/{term_id}/summary` | Officer/Admin | Get term run summary with cutoffs |
 | `GET` | `/stream-quotas` | Officer/Admin | List current stream capacities |
 | `PUT` | `/stream-quotas/{stream}` | Officer/Admin | Update a stream's capacity |
 

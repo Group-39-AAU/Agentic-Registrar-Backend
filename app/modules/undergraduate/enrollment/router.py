@@ -44,6 +44,7 @@ router = APIRouter(prefix="/undergraduate/enrollment", tags=["Undergraduate Enro
 
 @router.post("/run", response_model=EnrollmentRunResponse)
 async def run_enrollment(
+    term_id: uuid.UUID = Query(..., description="Admission term ID to enroll"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -64,6 +65,7 @@ async def run_enrollment(
         select(UndergraduateApplication).where(
             UndergraduateApplication.current_status == ApplicationStatus.DECIDED,
             UndergraduateApplication.final_decision == DecisionType.ADMIT.value,
+            UndergraduateApplication.admission_term_id == term_id,
             UndergraduateApplication.is_deleted == False,  # noqa: E712
         )
     )
@@ -129,6 +131,7 @@ async def run_enrollment(
         student_list.append(AdmittedStudent(
             application_id=app.id,
             applicant_id=app.applicant_id,
+            admission_term_id=app.admission_term_id,
             admission_number=app.admission_number,
             admission_term=app.admission_term.term_name if app.admission_term else "Unknown",
             sponsorship_type=app.sponsorship_type.value,
@@ -143,6 +146,8 @@ async def run_enrollment(
         "students": student_list,
         "id_counter_start": counter_start,
         "year_suffix": year_suffix,
+        "section_capacity": 50,
+        "term_id": term_id,
         "traces": [],
     }
 
@@ -157,6 +162,7 @@ async def run_enrollment(
         enrollment = Enrollment(
             application_id=s.application_id,
             applicant_id=s.applicant_id,
+            admission_term_id=s.admission_term_id,
             university_id=s.university_id,
             program_id=s.assigned_program_id,
             department=s.assigned_department or s.stream,
@@ -230,26 +236,59 @@ async def get_enrollment(
 
 @router.get("/list/all", response_model=EnrollmentListResponse)
 async def list_enrollments(
+    term_id: uuid.UUID = Query(..., description="Admission term ID to filter by"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
     """Paginated list of all enrollment records."""
     total = (await db.execute(
-        select(func.count(Enrollment.id))
+        select(func.count(Enrollment.id)).where(Enrollment.admission_term_id == term_id)
     )).scalar()
 
     offset = (page - 1) * page_size
     result = await db.execute(
         select(Enrollment)
+        .where(Enrollment.admission_term_id == term_id)
         .order_by(Enrollment.university_id)
         .offset(offset)
         .limit(page_size)
     )
     items = result.scalars().all()
 
+    application_ids = [item.application_id for item in items]
+    app_result = await db.execute(
+        select(UndergraduateApplication).where(UndergraduateApplication.id.in_(application_ids))
+    )
+    applications = {app.id: app for app in app_result.scalars().all()}
+
+    applicant_ids = [app.applicant_id for app in applications.values()]
+    user_result = await db.execute(select(User).where(User.id.in_(applicant_ids)))
+    users = {user.id: user for user in user_result.scalars().all()}
+
     return EnrollmentListResponse(
-        items=[EnrollmentResponse.model_validate(e) for e in items],
+        items=[
+            {
+                "id": item.id,
+                "application_id": item.application_id,
+                "applicant_id": item.applicant_id,
+                "student_full_name": (
+                    f"{users[applications[item.application_id].applicant_id].first_name} "
+                    f"{users[applications[item.application_id].applicant_id].last_name}"
+                    if applications.get(item.application_id)
+                    and users.get(applications[item.application_id].applicant_id)
+                    else None
+                ),
+                "admission_term_id": item.admission_term_id,
+                "university_id": item.university_id,
+                "program_id": item.program_id,
+                "department": item.department,
+                "section": item.section,
+                "enrollment_term": item.enrollment_term,
+                "created_at": item.created_at,
+            }
+            for item in items
+        ],
         total=total,
         page=page,
         page_size=page_size,

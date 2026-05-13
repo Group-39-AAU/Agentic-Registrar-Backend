@@ -96,19 +96,30 @@ class ApplicationRepository:
         return result.scalars().all()
 
     async def get_all(
-        self, *, limit: int = 50, offset: int = 0
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        admission_term_id: uuid.UUID,
     ) -> tuple[Sequence[UndergraduateApplication], int]:
-        """Returns (items, total_count) for paginated listing."""
+        """Returns (items, total_count) for paginated listing for a term."""
+
         count_stmt = (
             select(func.count())
             .select_from(UndergraduateApplication)
-            .where(UndergraduateApplication.is_deleted == False)  # noqa: E712
+            .where(
+                UndergraduateApplication.is_deleted == False,  # noqa: E712
+                UndergraduateApplication.admission_term_id == admission_term_id,
+            )
         )
         total = (await self._db.execute(count_stmt)).scalar_one()
 
         items_stmt = (
             select(UndergraduateApplication)
-            .where(UndergraduateApplication.is_deleted == False)  # noqa: E712
+            .where(
+                UndergraduateApplication.is_deleted == False,  # noqa: E712
+                UndergraduateApplication.admission_term_id == admission_term_id,
+            )
             .order_by(UndergraduateApplication.created_at.desc())
             .limit(limit)
             .offset(offset)

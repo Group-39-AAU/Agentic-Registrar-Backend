@@ -18,14 +18,17 @@ class RankingResultResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    ranking_batch_id: str
+    admission_term_id: uuid.UUID
+    ranking_run_number: int
     application_id: uuid.UUID
+    applicant_full_name: Optional[str] = None
     grade12_score: float
     uat_score: float
     final_score: float
     category: str
     rank_position: int
     assigned_program_id: Optional[uuid.UUID] = None
+    assigned_program_department: Optional[str] = None
     assigned_stream: Optional[StreamType] = None
     is_assigned: bool
     assignment_detail: Optional[str] = None
@@ -36,7 +39,8 @@ class RankingResultResponse(BaseModel):
 
 class RankingRunResponse(BaseModel):
     """Response after triggering a ranking batch."""
-    batch_id: str
+    term_id: uuid.UUID
+    run_number: int
     total_processed: int
     self_sponsored_count: int
     government_count: int
@@ -68,7 +72,7 @@ class StreamCutoffResponse(BaseModel):
 
 class RankingSummaryResponse(BaseModel):
     """Overall ranking batch summary with cutoffs."""
-    batch_id: str
+    term_id: uuid.UUID
     program_cutoffs: list[ProgramCutoffResponse]
     stream_cutoffs: list[StreamCutoffResponse]
     total_assigned: int
