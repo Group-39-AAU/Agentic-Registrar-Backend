@@ -7,6 +7,7 @@ or in batch.
 """
 
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -158,6 +159,10 @@ async def list_students_for_review(
     sponsorship_type: SponsorshipType = Query(
         ..., description="Filter by SELF_SPONSORED or GOVERNMENT"
     ),
+    ai_recommended_decision: Optional[DecisionType] = Query(
+        None,
+        description="Filter by latest AI recommended decision: RECOMMEND_ADMIT, RECOMMEND_REJECT, or RECOMMEND_WAITLIST",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
@@ -166,14 +171,50 @@ async def list_students_for_review(
     """
     Paginated list of students awaiting officer review.
     Filtered by sponsorship type (self-sponsored or government).
+    Optionally filtered by the latest AI recommended decision.
     """
     _role_gate(current_user)
+
+    if ai_recommended_decision is not None and ai_recommended_decision not in {
+        DecisionType.RECOMMEND_ADMIT,
+        DecisionType.RECOMMEND_REJECT,
+        DecisionType.RECOMMEND_WAITLIST,
+    }:
+        raise HTTPException(
+            400,
+            "ai_recommended_decision must be RECOMMEND_ADMIT, RECOMMEND_REJECT, or RECOMMEND_WAITLIST",
+        )
 
     base_filter = [
         UndergraduateApplication.current_status == ApplicationStatus.PENDING_REVIEW,
         UndergraduateApplication.is_deleted == False,  # noqa: E712
         UndergraduateApplication.sponsorship_type == sponsorship_type,
     ]
+
+    # If filtering by AI recommended decision, restrict to applications whose
+    # latest AIEvaluation matches the requested decision.
+    if ai_recommended_decision is not None:
+        latest_eval_subq = (
+            select(
+                AIEvaluation.application_id,
+                func.max(AIEvaluation.created_at).label("latest_created_at"),
+            )
+            .group_by(AIEvaluation.application_id)
+            .subquery()
+        )
+        latest_eval = (
+            select(AIEvaluation)
+            .join(
+                latest_eval_subq,
+                (AIEvaluation.application_id == latest_eval_subq.c.application_id)
+                & (AIEvaluation.created_at == latest_eval_subq.c.latest_created_at),
+            )
+            .where(AIEvaluation.recommended_decision == ai_recommended_decision)
+            .subquery()
+        )
+        base_filter.append(
+            UndergraduateApplication.id.in_(select(latest_eval.c.application_id))
+        )
 
     # Total count
     total = (await db.execute(
