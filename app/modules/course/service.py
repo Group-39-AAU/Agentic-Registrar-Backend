@@ -45,7 +45,7 @@ from app.modules.course.exceptions import (
 )
 from app.modules.course.models import (
     AcademicTerm, AddDropRequest, AdvisoryRecommendation,
-    ClassScheduleSlot, CourseManagementOfficer, Course,
+    ClassScheduleSlot, Classroom, CourseManagementOfficer, Course,
     Instructor, InstructorAssignment, PrerequisiteOverride, Registration,
     RegistrationCourse, RegistrationStatusHistory, ScheduleConflict, Section,
     Student,
@@ -329,7 +329,6 @@ class RegistrationService:
                     section_payload = {
                         "section_id": section.id,
                         "section_code": section.section_code,
-                        "room": section.room,
                         "capacity": section.capacity,
                         "enrolled_count": section.enrolled_count,
                     }
@@ -1150,7 +1149,9 @@ class SchedulingService:
 
     # ── Officer trigger ──────────────────────────────────────────
 
-    async def generate_schedule(
+    # ── Phase 1: section allocation ─────────────────────────────
+
+    async def allocate_sections(
         self,
         term_id: uuid.UUID,
         department: str,
@@ -1158,32 +1159,44 @@ class SchedulingService:
         officer_id: uuid.UUID,
     ) -> dict:
         """
-        Run the cohort allocation + per-section weekly-slot generator
-        for a single (term, department) pair. Officer-only.
+        Run cohort allocation only (no schedule slots yet) for a
+        single (term, department) pair. Officer-only.
 
-        Each department is scheduled independently — rooms and
-        instructors are scoped per department under the current model
-        (see ``Classroom.department``), so a sibling department's
-        sections are untouched by this call. Run once per department
-        per term.
+        After this returns, every REGISTERED student in the
+        department has a ``Registration.section_id`` set. The
+        per-class meetings (``ClassScheduleSlot`` rows) come from a
+        separate :meth:`generate_timetable` call so the officer can
+        review the allocation before locking in the schedule.
         """
-        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
-            raise UnauthorizedActorError(
-                "Only registrar officers or admins can generate schedules."
-            )
+        self._require_officer(officer_role)
         term = await self.terms.get(term_id)
         if term is None:
             raise EntityNotFoundError("AcademicTerm", str(term_id))
 
-        payload = await self.scheduling_agent.process_task({
-            "session": self.db,
-            "term_id": term_id,
-            "department": department,
-        })
+        # Fail fast on missing classroom inventory: without rooms the
+        # agent can't place anyone, and silently returning an empty
+        # allocation hides the configuration gap from the officer.
+        classroom_count = (
+            await self.db.execute(
+                select(Classroom.id).where(
+                    Classroom.department == department,
+                    Classroom.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).first()
+        if classroom_count is None:
+            raise InvalidAdjustmentRequestError(
+                f"No classrooms are registered for department '{department}'. "
+                "Add at least one Classroom before allocating sections."
+            )
+
+        allocation = await self.scheduling_agent.allocate_sections(
+            self.db, term_id, department,
+        )
         await self.db.commit()
 
         write_audit_log(
-            action="course.schedule.generated",
+            action="course.sections.allocated",
             actor_role=officer_role.value,
             actor_id=officer_id,
             resource_type="AcademicTerm",
@@ -1191,13 +1204,96 @@ class SchedulingService:
             decision="ok",
             metadata={
                 "department": department,
-                "students_placed": payload["allocation"]["students_placed_count"],
-                "sections_created": len(payload["allocation"]["sections_created"]),
-                "slots_created": payload["schedule"]["slots_created"],
-                "conflicts": payload["schedule"]["conflict_count"],
+                "students_placed": len(allocation.students_placed),
+                "sections_created": len(allocation.sections_created),
+                "failed": len(allocation.failed),
             },
         )
-        return payload
+        return {
+            "term_id": str(term_id),
+            "department": department,
+            "sections_created": allocation.sections_created,
+            "students_placed_count": len(allocation.students_placed),
+            "students_placed": allocation.students_placed,
+            "failed": allocation.failed,
+        }
+
+    # ── Phase 2: weekly-timetable generation ────────────────────
+
+    async def generate_timetable(
+        self,
+        term_id: uuid.UUID,
+        department: str,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+    ) -> dict:
+        """
+        Build the per-section weekly schedule (``ClassScheduleSlot``
+        rows) for every Section the department already has. Requires
+        :meth:`allocate_sections` to have run first — if no sections
+        exist for this (term, department), the response will be
+        empty.
+
+        Idempotent: re-runs delete the department's existing slots
+        and rebuild from scratch.
+        """
+        self._require_officer(officer_role)
+        term = await self.terms.get(term_id)
+        if term is None:
+            raise EntityNotFoundError("AcademicTerm", str(term_id))
+
+        # Refuse to run before any sections exist — otherwise the
+        # officer would silently get an empty timetable response and
+        # think the run had succeeded.
+        section_exists = (
+            await self.db.execute(
+                select(Section.id).where(
+                    Section.term_id == term_id,
+                    Section.department == department,
+                    Section.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).first()
+        if section_exists is None:
+            raise InvalidAdjustmentRequestError(
+                f"No sections exist for department '{department}' in this term. "
+                "Call POST /officer/sections/allocate first."
+            )
+
+        artefact = await self.scheduling_agent.generate_schedule(
+            self.db, term_id, department,
+        )
+        await self.db.commit()
+
+        write_audit_log(
+            action="course.timetable.generated",
+            actor_role=officer_role.value,
+            actor_id=officer_id,
+            resource_type="AcademicTerm",
+            resource_id=term_id,
+            decision="ok",
+            metadata={
+                "department": department,
+                "section_count": artefact.section_count,
+                "slots_created": artefact.slots_created,
+                "conflicts": len(artefact.conflict_ids),
+            },
+        )
+        return {
+            "term_id": str(term_id),
+            "department": department,
+            "section_count": artefact.section_count,
+            "slots_created": artefact.slots_created,
+            "sections": artefact.sections,
+            "conflict_count": len(artefact.conflict_ids),
+            "conflict_ids": [str(cid) for cid in artefact.conflict_ids],
+        }
+
+    def _require_officer(self, officer_role: UserRole) -> None:
+        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+            raise UnauthorizedActorError(
+                "Only registrar officers or admins can run scheduling."
+            )
 
     # ── Read views ───────────────────────────────────────────────
 
@@ -1289,7 +1385,6 @@ class SchedulingService:
                 "section_code": section.section_code,
                 "department": section.department,
                 "semester": section.semester,
-                "room": section.room,
                 "capacity": section.capacity,
                 "enrolled_count": section.enrolled_count,
             },
@@ -1303,6 +1398,7 @@ class SchedulingService:
                     "instructor_id": (
                         str(slot.instructor_id) if slot.instructor_id else None
                     ),
+                    "room": slot.room,
                 }
                 for slot, course in slot_rows
             ],
@@ -1338,7 +1434,7 @@ class SchedulingService:
                 "section_code": sec.section_code,
                 "department": sec.department,
                 "semester": sec.semester,
-                "room": sec.room,
+                "room": slot.room,
                 "course_code": course.code,
                 "course_title": course.title,
                 "day_of_week": slot.day_of_week,
@@ -1347,6 +1443,98 @@ class SchedulingService:
             }
             for slot, course, sec in rows
         ]
+
+    async def assign_instructor_to_slot(
+        self,
+        slot_id: uuid.UUID,
+        instructor_id: uuid.UUID,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+    ) -> ClassScheduleSlot:
+        """
+        Officer-only: change the instructor pinned to one
+        ``ClassScheduleSlot`` row. Refuses if the new instructor is
+        already booked at the same ``(day_of_week, start_time)`` in
+        any other slot in the term — that would create the same
+        collision the generator avoids.
+
+        Raises:
+            UnauthorizedActorError: caller is not officer/admin.
+            EntityNotFoundError: slot or instructor doesn't exist.
+            InvalidAdjustmentRequestError: instructor already booked.
+        """
+        self._require_officer(officer_role)
+
+        slot = (
+            await self.db.execute(
+                select(ClassScheduleSlot).where(
+                    ClassScheduleSlot.id == slot_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if slot is None:
+            raise EntityNotFoundError("ClassScheduleSlot", str(slot_id))
+
+        instructor = (
+            await self.db.execute(
+                select(Instructor).where(
+                    Instructor.id == instructor_id,
+                    Instructor.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if instructor is None:
+            raise EntityNotFoundError("Instructor", str(instructor_id))
+
+        # Resolve the term via the slot's section so collision
+        # checks are scoped to the term that owns this slot.
+        slot_section = (
+            await self.db.execute(
+                select(Section).where(Section.id == slot.section_id)
+            )
+        ).scalar_one()
+
+        collision = (
+            await self.db.execute(
+                select(ClassScheduleSlot.id)
+                .join(Section, Section.id == ClassScheduleSlot.section_id)
+                .where(
+                    Section.term_id == slot_section.term_id,
+                    ClassScheduleSlot.id != slot.id,
+                    ClassScheduleSlot.instructor_id == instructor_id,
+                    ClassScheduleSlot.day_of_week == slot.day_of_week,
+                    ClassScheduleSlot.start_time == slot.start_time,
+                )
+            )
+        ).scalar_one_or_none()
+        if collision is not None:
+            raise InvalidAdjustmentRequestError(
+                f"Instructor {instructor.instructor_id} is already booked "
+                f"on {slot.day_of_week} at "
+                f"{slot.start_time.isoformat(timespec='minutes')} "
+                f"in this term."
+            )
+
+        slot.instructor_id = instructor_id
+        await self.db.commit()
+        await self.db.refresh(slot)
+
+        write_audit_log(
+            action="course.slot.instructor_reassigned",
+            actor_role=officer_role.value,
+            actor_id=officer_id,
+            resource_type="ClassScheduleSlot",
+            resource_id=slot.id,
+            decision="ok",
+            metadata={
+                "instructor_id": str(instructor_id),
+                "section_id": str(slot.section_id),
+                "course_id": str(slot.course_id),
+                "day_of_week": slot.day_of_week,
+                "start_time": slot.start_time.isoformat(timespec="minutes"),
+            },
+        )
+        return slot
 
     async def list_open_conflicts(
         self,

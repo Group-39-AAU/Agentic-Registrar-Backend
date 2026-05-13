@@ -628,8 +628,10 @@ async def _seed_instructor_assignments(
     Seed per-term InstructorAssignments only.
 
     The cohort scheduling agent reads InstructorAssignment to pin a
-    teacher onto every ClassScheduleSlot it emits. Each (course, term)
-    pair gets the first instructor in the course's department.
+    teacher onto every ClassScheduleSlot it emits. Course→instructor
+    is **round-robin within each department**, so every instructor in
+    a dept actually teaches something instead of the first instructor
+    grabbing all 40 courses.
 
     Cohort Section rows are NOT seeded — they are created on demand by
     the AcademicSchedulingAgent when an officer hits
@@ -638,41 +640,70 @@ async def _seed_instructor_assignments(
     spins up sections sized to the room inventory). Likewise the
     per-class ClassScheduleSlot rows are emitted at that time.
     """
+    # Reseeding redistributes via round-robin even on an existing DB.
+    # We wipe the term's assignments first so the round-robin pattern
+    # actually replaces the old "first instructor wins" allocation.
+    existing_for_term = (
+        await session.execute(
+            select(InstructorAssignment).where(
+                InstructorAssignment.term_id == term.id,
+            )
+        )
+    ).scalars().all()
+    for row in existing_for_term:
+        await session.delete(row)
+    if existing_for_term:
+        await session.flush()
+
     instructors_by_dept: dict[str, list[Instructor]] = {}
     for ins in instructors_by_staff_id.values():
         instructors_by_dept.setdefault(ins.department, []).append(ins)
+    # Sort per-dept instructor lists by staff_id so the round-robin
+    # is deterministic across reseed runs.
+    for ins_list in instructors_by_dept.values():
+        ins_list.sort(key=lambda i: i.instructor_id)
+
+    # Group courses by department, sorted by code so the assignment
+    # order is stable across reseed runs.
+    courses_by_dept: dict[str, list[Course]] = {}
+    for code, course in courses_by_code.items():
+        courses_by_dept.setdefault(course.department, []).append(course)
+    for course_list in courses_by_dept.values():
+        course_list.sort(key=lambda c: c.code)
 
     assignment_count = 0
-    for code, course in courses_by_code.items():
-        # Pin the department's first instructor as the canonical
-        # teacher for this (course, term). The scheduling agent reads
-        # InstructorAssignment to populate ClassScheduleSlot.
-        dept_instructors = instructors_by_dept.get(course.department, [])
-        instructor = dept_instructors[0] if dept_instructors else None
-        if instructor is None:
+    for dept, dept_courses in courses_by_dept.items():
+        dept_instructors = instructors_by_dept.get(dept, [])
+        if not dept_instructors:
             continue
-        existing_assn = (
-            await session.execute(
-                select(InstructorAssignment).where(
-                    InstructorAssignment.instructor_id == instructor.id,
-                    InstructorAssignment.course_id == course.id,
-                    InstructorAssignment.term_id == term.id,
+        for idx, course in enumerate(dept_courses):
+            # Round-robin: course #0 → instructor #0, course #1 →
+            # instructor #1, course #2 → instructor #0, etc. With 2
+            # instructors per department and 40 courses, each
+            # instructor ends up teaching 20.
+            instructor = dept_instructors[idx % len(dept_instructors)]
+            existing_assn = (
+                await session.execute(
+                    select(InstructorAssignment).where(
+                        InstructorAssignment.instructor_id == instructor.id,
+                        InstructorAssignment.course_id == course.id,
+                        InstructorAssignment.term_id == term.id,
+                    )
                 )
-            )
-        ).scalar_one_or_none()
-        if existing_assn is None:
-            session.add(
-                InstructorAssignment(
-                    id=_uid(
-                        "assn", term.term_name,
-                        instructor.instructor_id, code,
-                    ),
-                    instructor_id=instructor.id,
-                    course_id=course.id,
-                    term_id=term.id,
+            ).scalar_one_or_none()
+            if existing_assn is None:
+                session.add(
+                    InstructorAssignment(
+                        id=_uid(
+                            "assn", term.term_name,
+                            instructor.instructor_id, course.code,
+                        ),
+                        instructor_id=instructor.id,
+                        course_id=course.id,
+                        term_id=term.id,
+                    )
                 )
-            )
-            assignment_count += 1
+                assignment_count += 1
 
     await session.commit()
     if assignment_count:
@@ -1118,6 +1149,170 @@ async def _seed_bulk_se_sem1_cohort(
         print("⚠️  Bulk SE-sem1 cohort already present — skipping.")
 
 
+# ── Bulk SE upper-year cohorts (years 2–5) ─────────────────────
+#
+# Fills out the SE pyramid: 60 students per year level beyond first
+# year, each fully registered for that year's Fall-semester
+# curriculum in the open term. Realistic batch years are used so
+# UGR ids encode "when did you start" — a year-2 student is in
+# batch 13 (started one year before the current intake), a year-5
+# in batch 10. Each batch year owns its own sequence 0001-0060.
+#
+#   Year 2 → Fall = semester 3 → batch 13 → UGR/0001/13 .. UGR/0060/13
+#   Year 3 → Fall = semester 5 → batch 12 → UGR/0001/12 .. UGR/0060/12
+#   Year 4 → Fall = semester 7 → batch 11 → UGR/0001/11 .. UGR/0060/11
+#   Year 5 → Fall = semester 9 → batch 10 → UGR/0001/10 .. UGR/0060/10
+#
+# Total new students: 4 × 60 = 240. Combined with the 72 SE-sem1
+# students already seeded, the Software Engineering pyramid then
+# holds 312 registered students across 5 year levels.
+
+# (batch_year, target_semester, count)
+SE_BULK_UPPER_COHORTS: list[tuple[int, int, int]] = [
+    (13, 3, 60),   # Year 2
+    (12, 5, 60),   # Year 3
+    (11, 7, 60),   # Year 4
+    (10, 9, 60),   # Year 5
+]
+
+
+async def _seed_bulk_se_upper_year_cohorts(
+    session: AsyncSession,
+    term: AcademicTerm,
+    courses_by_code: dict[str, Course],
+) -> None:
+    """
+    Seed 60 fully-registered SE students at each of semesters 3, 5,
+    7, and 9 (years 2–5). Idempotent per-student: a student whose
+    student_id already exists is skipped, and a registration that
+    already exists for (student, term) is reused.
+
+    Sponsorship is mixed (~33% self-sponsored, ~67% government)
+    matching the SE-sem1 bulk seed so the cost-sharing and bursar
+    paths have non-trivial coverage at every year level.
+    """
+    new_users = 0
+    new_regs = 0
+    new_links = 0
+
+    for batch_year, semester, count in SE_BULK_UPPER_COHORTS:
+        # Build the per-(SE, semester) curriculum: SE<sem><01-04>.
+        course_codes = [
+            f"SE{semester}01", f"SE{semester}02",
+            f"SE{semester}03", f"SE{semester}04",
+        ]
+        # If any expected course is missing the seed is in an
+        # inconsistent state — fail loudly rather than silently
+        # producing empty registrations.
+        try:
+            target_courses = [courses_by_code[c] for c in course_codes]
+        except KeyError as missing:
+            raise RuntimeError(
+                f"SE semester-{semester} curriculum incomplete: "
+                f"course {missing.args[0]} not seeded. Did you skip "
+                "the _seed_courses step?"
+            ) from None
+
+        for i in range(count):
+            seq = i + 1
+            student_id_str = f"UGR/{seq:04d}/{batch_year:02d}"
+            slug = student_id_str.lower().replace("/", "-")
+            email = f"{slug}@aau.edu.et"
+
+            sponsorship = _SELF if i % 3 == 0 else _GOV
+
+            student = (
+                await session.execute(
+                    select(Student).where(Student.student_id == student_id_str)
+                )
+            ).scalar_one_or_none()
+            if student is None:
+                user = await _ensure_user(
+                    session,
+                    email=email,
+                    first_name=f"Year{semester // 2 + 1}Student{seq}",
+                    last_name=f"Batch{batch_year:02d}",
+                    role=UserRole.STUDENT,
+                    user_uid=_uid("user", "student", student_id_str),
+                )
+                student = Student(
+                    id=_uid("student", student_id_str),
+                    user_id=user.id,
+                    student_id=student_id_str,
+                    full_name=(
+                        f"Year{semester // 2 + 1}Student{seq} "
+                        f"Batch{batch_year:02d}"
+                    ),
+                    current_semester=semester,
+                    department="Software Engineering",
+                    sponsorship_type=sponsorship,
+                    enrollment_status=EnrollmentStatus.ACTIVE,
+                )
+                session.add(student)
+                await session.flush()
+                new_users += 1
+
+            # Idempotent: skip if a registration already exists for
+            # this (student, term).
+            existing_reg = (
+                await session.execute(
+                    select(Registration).where(
+                        Registration.student_id == student.id,
+                        Registration.term_id == term.id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing_reg is not None:
+                continue
+
+            reg = Registration(
+                id=_uid("registration", term.term_name, student_id_str),
+                student_id=student.id,
+                term_id=term.id,
+                status=RegistrationStatus.REGISTERED,
+                sponsorship_type=sponsorship,
+                payment_reference=(
+                    None if sponsorship == _GOV
+                    else f"MOCK-PAID-FALL2026-{slug.upper()}"
+                ),
+            )
+            session.add(reg)
+            await session.flush()
+            new_regs += 1
+
+            for course in target_courses:
+                session.add(RegistrationCourse(
+                    id=_uid("regcourse", student_id_str, course.code),
+                    registration_id=reg.id,
+                    course_id=course.id,
+                    is_dropped=False,
+                ))
+                new_links += 1
+
+            session.add(RegistrationStatusHistory(
+                id=_uid("reghist", "init", student_id_str),
+                registration_id=reg.id,
+                previous_status=None,
+                new_status=RegistrationStatus.REGISTERED,
+                changed_by_id=None,
+                agent_id=f"seed-bulk-se-sem{semester}",
+                trigger_reason=(
+                    f"Seed: bulk SE-semester-{semester} (year "
+                    f"{semester // 2 + 1}) cohort"
+                ),
+            ))
+
+    await session.commit()
+    if new_regs or new_users:
+        print(
+            f"✅ Seeded bulk SE upper-year cohorts: {new_users} new "
+            f"students, {new_regs} registrations, {new_links} course "
+            "links."
+        )
+    else:
+        print("⚠️  Bulk SE upper-year cohorts already present — skipping.")
+
+
 async def seed() -> None:
     engine = create_async_engine(DATABASE_URL, echo=False)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -1143,6 +1338,9 @@ async def seed() -> None:
         open_term = next((t for t in terms if t.is_open), terms[0])
         await _seed_registrations(session, open_term, courses_by_code)
         await _seed_bulk_se_sem1_cohort(session, open_term, courses_by_code)
+        await _seed_bulk_se_upper_year_cohorts(
+            session, open_term, courses_by_code,
+        )
 
     await engine.dispose()
     print("\n🎉 Course Management seed complete (Phase 0 + Track A samples).")

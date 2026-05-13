@@ -58,19 +58,6 @@ class CourseResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════
 
 
-class RegistrationDraftCreate(BaseModel):
-    """
-    Request: student creates a draft registration for a term.
-
-    The endpoint resolves the calling student from get_current_user,
-    so student_id is not in the payload. ``sponsorship_type`` is
-    inherited from the student's admission record (denormalised onto
-    Student.sponsorship_type at onboarding time) — the student does
-    not pick it per registration.
-    """
-    term_id: uuid.UUID
-
-
 class SelectCoursesAndSubmitRequest(BaseModel):
     """
     Request: student picks the exact set of courses they want to take
@@ -80,11 +67,6 @@ class SelectCoursesAndSubmitRequest(BaseModel):
     """
     term_id: uuid.UUID
     course_ids: list[uuid.UUID] = Field(default_factory=list)
-
-
-class RegistrationCourseAdd(BaseModel):
-    """Request: add a course to an existing draft."""
-    course_id: uuid.UUID
 
 
 class RegistrationPaymentInitiateResponse(BaseModel):
@@ -200,22 +182,24 @@ class RegistrationSubmitResponse(BaseModel):
 
 class ScheduleGenerateRequest(BaseModel):
     """
-    Officer payload for ``POST /officer/schedule/generate``. Scheduling
-    is one department at a time — pass the term + department, and the
+    Officer payload for the scheduling officer endpoints. Scheduling
+    is one department at a time — pass the term + the
+    :class:`AcademicProgram` UUID of the owning department, and the
     agent allocates cohorts (semesters 1-10 within that department)
     and emits ClassScheduleSlot rows. Other departments are untouched.
     """
     term_id: uuid.UUID
-    department: str = Field(..., min_length=1, max_length=100)
+    program_id: uuid.UUID
 
 
 class SectionRead(BaseModel):
-    """Cohort section header (without slots)."""
+    """Cohort section header (without slots). Rooms live on each
+    ``ClassScheduleSlot`` now — a cohort can attend different courses
+    in different classrooms throughout the week."""
     section_id: uuid.UUID
     section_code: str
     department: str
     semester: int
-    room: Optional[str] = None
     capacity: int
     enrolled_count: int
 
@@ -228,6 +212,7 @@ class ClassScheduleSlotRead(BaseModel):
     start_time: str
     end_time: str
     instructor_id: Optional[uuid.UUID] = None
+    room: Optional[str] = None
 
 
 class SectionScheduleResponse(BaseModel):
@@ -244,7 +229,9 @@ class SectionScheduleResponse(BaseModel):
 
 
 class InstructorScheduleEntry(BaseModel):
-    """One row in an instructor's per-term schedule view."""
+    """One row in an instructor's per-term schedule view. ``room``
+    reflects the specific weekly meeting's classroom — different
+    meetings of the same section may use different rooms."""
     section_id: uuid.UUID
     section_code: str
     department: str
@@ -252,6 +239,25 @@ class InstructorScheduleEntry(BaseModel):
     room: Optional[str] = None
     course_code: str
     course_title: str
+    day_of_week: str
+    start_time: str
+    end_time: str
+
+
+class AssignInstructorToSlotRequest(BaseModel):
+    """
+    Officer payload for ``POST /officer/schedule/slots/{slot_id}/
+    assign-instructor`` — picks the new instructor to teach the slot.
+    """
+    instructor_id: uuid.UUID
+
+
+class SlotInstructorAssignmentResponse(BaseModel):
+    """Returned after an officer successfully reassigns a slot's instructor."""
+    slot_id: uuid.UUID
+    section_id: uuid.UUID
+    course_id: uuid.UUID
+    instructor_id: uuid.UUID
     day_of_week: str
     start_time: str
     end_time: str
@@ -275,10 +281,35 @@ class ScheduleConflictRead(BaseModel):
     detected_by_agent_id: str
 
 
-class ScheduleGenerateResponse(BaseModel):
-    """Payload returned from the officer's generate endpoint."""
-    allocation: dict
-    schedule: dict
+class SectionAllocationResponse(BaseModel):
+    """
+    Payload returned from ``POST /officer/sections/allocate`` — phase
+    1 of scheduling. Every REGISTERED student in the department now
+    has a ``Registration.section_id``; per-class weekly slots are
+    emitted by the separate :class:`TimetableGenerateResponse` flow.
+    """
+    term_id: str
+    department: str
+    sections_created: list[dict] = Field(default_factory=list)
+    students_placed_count: int
+    students_placed: list[dict] = Field(default_factory=list)
+    failed: list[dict] = Field(default_factory=list)
+
+
+class TimetableGenerateResponse(BaseModel):
+    """
+    Payload returned from ``POST /officer/schedule/generate`` — phase
+    2 of scheduling. The department's sections already exist (from
+    the section-allocation call); this response carries the per-
+    section weekly slots that were just emitted.
+    """
+    term_id: str
+    department: str
+    section_count: int
+    slots_created: int
+    sections: list[dict] = Field(default_factory=list)
+    conflict_count: int
+    conflict_ids: list[str] = Field(default_factory=list)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -379,10 +410,10 @@ class StudentResponse(BaseModel):
 
 
 class DashboardSection(BaseModel):
-    """Cohort section the student is allocated to in the current term."""
+    """Cohort section the student is allocated to in the current term.
+    Rooms are per-slot now and surface through the schedule endpoints."""
     section_id: uuid.UUID
     section_code: str
-    room: Optional[str] = None
     capacity: int
     enrolled_count: int
 

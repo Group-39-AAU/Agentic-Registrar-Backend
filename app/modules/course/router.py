@@ -1,26 +1,3 @@
-"""
-Course Management — FastAPI router (Track A foundation).
-
-Mounted under ``/api/v1/courses`` by app/main.py.
-
-Endpoints in this commit:
-
-  Officer (registrar/admin):
-    POST   /officer/terms/{term_id}/open      open the registration window
-    POST   /officer/terms/{term_id}/close     close the registration window
-
-  Student:
-    GET    /me/curriculum                     list courses the student can register for
-    POST   /registrations                     create a draft registration
-    GET    /registrations/{id}                read a draft / finalised registration
-    POST   /registrations/{id}/courses        add a course to a draft
-    DELETE /registrations/{id}/courses/{cid}  remove a course from a draft
-    POST   /registrations/{id}/submit         submit + run the compliance agent
-
-Endpoint role-guarding follows the existing app.core.dependencies
-pattern: get_current_user resolves the User, the route checks role,
-and the service then resolves the matching Student row.
-"""
 
 from __future__ import annotations
 
@@ -28,11 +5,14 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_user, get_email_service
 from app.database.session import get_db
 from app.modules.auth.models import User
+from app.modules.course.models import ClassScheduleSlot, Instructor
+from app.modules.programs.models import AcademicProgram
 from app.modules.course.exceptions import (
     AdjustmentDeniedError,
     ComplianceCheckFailedError,
@@ -53,6 +33,7 @@ from app.modules.course.schemas import (
     AdvisoryEvaluateRequest,
     AdvisoryRecommendationRead,
     AdvisoryReviewCloseRequest,
+    AssignInstructorToSlotRequest,
     ComplianceResultResponse,
     CostSharingFormResponse,
     CourseResponse,
@@ -62,14 +43,14 @@ from app.modules.course.schemas import (
     InstructorResponse,
     InstructorScheduleEntry,
     RegistrationInvoiceResponse,
-    RegistrationCourseAdd,
-    RegistrationDraftCreate,
     RegistrationResponse,
     RegistrationSubmitResponse,
     SelectCoursesAndSubmitRequest,
     ScheduleConflictRead,
     ScheduleGenerateRequest,
-    ScheduleGenerateResponse,
+    SectionAllocationResponse,
+    SlotInstructorAssignmentResponse,
+    TimetableGenerateResponse,
     SectionScheduleResponse,
     PrerequisiteOverrideRequest,
     PrerequisiteOverrideResponse,
@@ -236,28 +217,6 @@ async def register_me(
     )
 
 
-@router.post(
-    "/registrations",
-    response_model=RegistrationResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_registration_draft(
-    payload: RegistrationDraftCreate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    student = await _resolve_student(db, current_user)
-    svc = RegistrationService(db)
-    try:
-        return await svc.create_draft(student.id, payload.term_id)
-    except RegistrationWindowClosedError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    except DuplicateRegistrationError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    except EntityNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-
-
 @router.get(
     "/registrations/{registration_id}",
     response_model=RegistrationResponse,
@@ -267,118 +226,83 @@ async def get_registration(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Read view of the calling student's own registration. Useful for
+    showing the current status (REGISTRATION_OPEN / PAYMENT_HOLD /
+    REGISTERED / ADD_DROP_WINDOW), the course list, and the
+    finalised_at timestamp after the bursar / cost-sharing flow has
+    cleared.
+
+    For writes, students should use the unified
+    ``POST /me/register`` — the previous granular endpoints
+    (create-draft / add-course / remove-course / submit) were
+    consolidated into that one call.
+    """
     student = await _resolve_student(db, current_user)
     svc = RegistrationService(db)
     registration = await svc.registrations.get(registration_id)
     if registration is None or registration.student_id != student.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Registration not found.")
     return registration
-
-
-@router.post(
-    "/registrations/{registration_id}/courses",
-    response_model=RegistrationResponse,
-)
-async def add_course_to_draft(
-    registration_id: uuid.UUID,
-    payload: RegistrationCourseAdd,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    student = await _resolve_student(db, current_user)
-    svc = RegistrationService(db)
-    try:
-        registration = await svc.add_course_to_draft(
-            registration_id, payload.course_id,
-        )
-    except EntityNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    except InvalidStateTransitionError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    if registration.student_id != student.id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your registration.")
-    return registration
-
-
-@router.delete(
-    "/registrations/{registration_id}/courses/{course_id}",
-    response_model=RegistrationResponse,
-)
-async def remove_course_from_draft(
-    registration_id: uuid.UUID,
-    course_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    student = await _resolve_student(db, current_user)
-    svc = RegistrationService(db)
-    registration = await svc.registrations.get(registration_id)
-    if registration is None or registration.student_id != student.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Registration not found.")
-    try:
-        return await svc.remove_course_from_draft(registration_id, course_id)
-    except EntityNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    except InvalidStateTransitionError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
-
-
-@router.post(
-    "/registrations/{registration_id}/submit",
-    response_model=RegistrationSubmitResponse,
-)
-async def submit_registration(
-    registration_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    student = await _resolve_student(db, current_user)
-    svc = RegistrationService(db)
-    registration = await svc.registrations.get(registration_id)
-    if registration is None or registration.student_id != student.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Registration not found.")
-    try:
-        registration, compliance = await svc.submit(
-            registration_id, current_user.id,
-        )
-    except ComplianceCheckFailedError as exc:
-        # 422 carries the structured agent payload so the portal can
-        # show plain-language reasons against each course.
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"compliance": exc.payload},
-        )
-    except InvalidStateTransitionError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    return RegistrationSubmitResponse(
-        registration=RegistrationResponse.model_validate(registration),
-        compliance=ComplianceResultResponse(**compliance),
-    )
 
 
 # ── Scheduling endpoints ─────────────────────────────────────────
 
 
+async def _resolve_program_department(
+    db: AsyncSession, program_id: uuid.UUID,
+) -> str:
+    """
+    Resolve an ``AcademicProgram`` UUID to its ``department`` name —
+    the string the scheduling tables key off. 404 if the program does
+    not exist or has been soft-deleted.
+    """
+    program = (
+        await db.execute(
+            select(AcademicProgram).where(
+                AcademicProgram.id == program_id,
+                AcademicProgram.is_deleted == False,  # noqa: E712
+            )
+        )
+    ).scalar_one_or_none()
+    if program is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"AcademicProgram with id {program_id} not found.",
+        )
+    return program.department
+
+
 @router.post(
-    "/officer/schedule/generate",
-    response_model=ScheduleGenerateResponse,
+    "/officer/sections/allocate",
+    response_model=SectionAllocationResponse,
+    summary="Phase 1 — allocate REGISTERED students into cohort sections",
 )
-async def officer_generate_schedule(
+async def officer_allocate_sections(
     payload: ScheduleGenerateRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer-only: allocate every REGISTERED student in this department
-    to a cohort Section (across semesters 1–10), then build the
-    per-section weekly schedule. Run once per department per term —
-    other departments are untouched by this call.
+    Officer-only: group every REGISTERED student in this department
+    (across semesters 1–10) into cohort sections sized to the
+    department's :class:`Classroom` inventory. Every
+    ``Registration.section_id`` in the department gets pinned.
+
+    Does *not* emit weekly class meetings — that's the separate
+    :func:`officer_generate_timetable` call below, which the officer
+    runs after reviewing the cohort split.
+
+    Idempotent on re-runs: students already pinned stay put; new
+    students fill remaining capacity before fresh sections are
+    created.
     """
+    department = await _resolve_program_department(db, payload.program_id)
     svc = SchedulingService(db)
     try:
-        result = await svc.generate_schedule(
+        result = await svc.allocate_sections(
             term_id=payload.term_id,
-            department=payload.department,
+            department=department,
             officer_role=current_user.role,
             officer_id=current_user.id,
         )
@@ -386,7 +310,53 @@ async def officer_generate_schedule(
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    return ScheduleGenerateResponse(**result)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
+        )
+    return SectionAllocationResponse(**result)
+
+
+@router.post(
+    "/officer/schedule/generate",
+    response_model=TimetableGenerateResponse,
+    summary="Phase 2 — generate weekly class meetings for each section",
+)
+async def officer_generate_timetable(
+    payload: ScheduleGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer-only: build the per-section weekly schedule
+    (``ClassScheduleSlot`` rows) for every Section the department
+    has. Total weekly hours per course == ``course.credit_hours``.
+
+    Prerequisite: :func:`officer_allocate_sections` must have run for
+    this (term, department) — if no sections exist yet, the response
+    is empty (no slots created).
+
+    Idempotent: re-runs delete the department's existing slots and
+    rebuild from scratch.
+    """
+    department = await _resolve_program_department(db, payload.program_id)
+    svc = SchedulingService(db)
+    try:
+        result = await svc.generate_timetable(
+            term_id=payload.term_id,
+            department=department,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
+        )
+    return TimetableGenerateResponse(**result)
 
 
 @router.get(
@@ -395,10 +365,13 @@ async def officer_generate_schedule(
 )
 async def officer_list_conflicts(
     term_id: uuid.UUID,
-    department: str | None = None,
+    program_id: uuid.UUID | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    department: str | None = None
+    if program_id is not None:
+        department = await _resolve_program_department(db, program_id)
     svc = SchedulingService(db)
     try:
         rows = await svc.list_open_conflicts(
@@ -409,6 +382,50 @@ async def officer_list_conflicts(
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
     return rows
+
+
+@router.post(
+    "/officer/schedule/slots/{slot_id}/assign-instructor",
+    response_model=SlotInstructorAssignmentResponse,
+    summary="Reassign the instructor pinned to a single schedule slot",
+)
+async def officer_assign_slot_instructor(
+    slot_id: uuid.UUID,
+    payload: AssignInstructorToSlotRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer-only: replace the instructor on a single
+    ``ClassScheduleSlot``. Refuses with 422 if the new instructor is
+    already booked elsewhere in the term at the same
+    ``(day_of_week, start_time)``.
+    """
+    svc = SchedulingService(db)
+    try:
+        slot = await svc.assign_instructor_to_slot(
+            slot_id=slot_id,
+            instructor_id=payload.instructor_id,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
+        )
+    return SlotInstructorAssignmentResponse(
+        slot_id=slot.id,
+        section_id=slot.section_id,
+        course_id=slot.course_id,
+        instructor_id=slot.instructor_id,
+        day_of_week=slot.day_of_week,
+        start_time=slot.start_time.isoformat(timespec="minutes"),
+        end_time=slot.end_time.isoformat(timespec="minutes"),
+    )
 
 
 @router.get(
@@ -455,6 +472,47 @@ async def get_student_schedule_by_id(
         )
     svc = SchedulingService(db)
     return await svc.get_student_schedule(student_id, term_id)
+
+
+@router.get(
+    "/instructors/me/schedule",
+    response_model=list[InstructorScheduleEntry],
+    summary="Calling instructor's own weekly schedule",
+)
+async def get_my_instructor_schedule(
+    term_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Instructor-only convenience read: every ``ClassScheduleSlot``
+    where the calling user is the assigned instructor in ``term_id``.
+    Resolves the Instructor row from the JWT's ``user_id`` and
+    forwards to the shared :func:`get_instructor_schedule`.
+
+    Returns 403 if the caller is not an INSTRUCTOR or has no
+    Instructor profile.
+    """
+    if current_user.role != UserRole.INSTRUCTOR:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only instructors may view their own teaching schedule.",
+        )
+    instructor = (
+        await db.execute(
+            select(Instructor).where(
+                Instructor.user_id == current_user.id,
+                Instructor.is_deleted == False,  # noqa: E712
+            )
+        )
+    ).scalar_one_or_none()
+    if instructor is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Calling user has no instructor profile.",
+        )
+    svc = SchedulingService(db)
+    return await svc.get_instructor_schedule(instructor.id, term_id)
 
 
 @router.get(

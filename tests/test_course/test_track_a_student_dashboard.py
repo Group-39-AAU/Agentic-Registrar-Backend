@@ -73,7 +73,6 @@ async def fully_populated_student(async_session, seeded_term) -> Student:
         department="Software Engineering",
         semester=2,
         section_code="A",
-        room="NB-101",
         capacity=60,
         enrolled_count=1,
     )
@@ -115,8 +114,8 @@ async def test_dashboard_happy_path_returns_every_field(
     section = term["section"]
     assert section is not None
     assert section["section_code"] == "A"
-    assert section["room"] == "NB-101"
     assert section["capacity"] == 60
+    assert "room" not in section
 
 
 async def test_dashboard_with_no_open_term_returns_null_current_term(

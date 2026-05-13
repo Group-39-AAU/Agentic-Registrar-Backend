@@ -157,11 +157,14 @@ class Section(SoftDeleteBase):
     a group of students at the same point in their program who attend
     every course of that semester together in the same room.
 
-    Section codes are globally unique within a term (A, B, C, … across
-    every department/semester). Capacity is the room capacity; the
-    Academic Scheduling Agent splits a (term, department, semester)
-    student population into as many sections as the largest eligible
-    room can absorb.
+    Section codes restart at ``A`` inside each (term, department,
+    semester) cohort — sem-1 of Software Engineering gets A, B, C;
+    sem-3 of the same department also gets A, B, C. Codes are unique
+    within the cohort, not within the whole term. Capacity is bounded
+    by the department's largest classroom; the room itself is **not**
+    a Section attribute anymore — each :class:`ClassScheduleSlot`
+    picks its own room, so two courses attended by the same cohort
+    can meet in different classrooms during the week.
 
     Per-class meetings (which course meets when, with which instructor,
     in which fixed slot of the section's weekly schedule) live on
@@ -182,7 +185,6 @@ class Section(SoftDeleteBase):
         Integer, nullable=False, index=True,
     )
     section_code: Mapped[str] = mapped_column(String(10), nullable=False)
-    room: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     capacity: Mapped[int] = mapped_column(Integer, nullable=False)
     enrolled_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0,
@@ -192,8 +194,8 @@ class Section(SoftDeleteBase):
 
     __table_args__ = (
         UniqueConstraint(
-            "term_id", "section_code",
-            name="uq_section_code_per_term",
+            "term_id", "department", "semester", "section_code",
+            name="uq_section_code_per_cohort",
         ),
         CheckConstraint(
             "semester BETWEEN 1 AND 12",
@@ -241,6 +243,10 @@ class ClassScheduleSlot(Base):
     )
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    room: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="Classroom this weekly meeting uses",
+    )
 
     section: Mapped["Section"] = relationship(lazy="selectin")
     course: Mapped["Course"] = relationship(lazy="selectin")

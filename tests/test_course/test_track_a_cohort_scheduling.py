@@ -159,6 +159,148 @@ async def test_allocate_splits_when_over_largest_room_capacity(
     assert len(result.sections_created) == 2
 
 
+async def test_allocate_does_not_pin_a_room(
+    async_session, seeded_term, cs_sem1_course,
+):
+    """
+    The allocator deliberately leaves ``Section.room`` unset.
+    Rooms are picked by :meth:`generate_schedule` so the same
+    department's cohorts can share a single picker pass.
+    """
+    agent = _make_agent()
+    stu = await _add_student(
+        async_session, semester=1, department="Computer Science",
+        email="no-room-yet@aau.edu.et", full_name="Nrm Student",
+    )
+    await _register(async_session, stu, seeded_term)
+
+    result = await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
+    assert result.sections_created
+    # Section payload from the allocator no longer carries a room key —
+    # rooms only show up on slot rows after generate_schedule runs.
+    assert all("room" not in s for s in result.sections_created)
+
+
+async def test_generate_section_never_double_books_itself(
+    async_session, seeded_term,
+):
+    """
+    With multiple courses in the same semester, a cohort must never
+    end up with two classes scheduled at the same ``(day, start)`` —
+    even though per-slot room picking now lets different courses use
+    different rooms, a single cohort can only be in one place at a
+    time. The DB has ``uq_section_slot_per_day_start`` enforcing this,
+    and the agent skips conflicting blocks rather than tripping it.
+    """
+    inventory = [("A", 80), ("B", 80), ("C", 80)]
+    agent = _make_agent(inventory)
+
+    for code in ("CS101", "CS102", "CS103", "CS104"):
+        async_session.add(
+            Course(
+                code=code, title=f"Course {code}",
+                credit_hours=2, semester=1,
+                department="Computer Science",
+            )
+        )
+    stu = await _add_student(
+        async_session, semester=1, department="Computer Science",
+        email="double-book@aau.edu.et", full_name="Db Stud",
+    )
+    await _register(async_session, stu, seeded_term)
+    await async_session.flush()
+
+    await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
+    artefact = await agent.generate_schedule(
+        async_session, seeded_term.id, "Computer Science",
+    )
+
+    slots = (
+        await async_session.execute(
+            select(ClassScheduleSlot).join(
+                Section, Section.id == ClassScheduleSlot.section_id,
+            ).where(
+                Section.term_id == seeded_term.id,
+                Section.department == "Computer Science",
+            )
+        )
+    ).scalars().all()
+    # 4 courses × 2 credit hours = 8 slots, all placed.
+    assert artefact.slots_created == 8
+    seen: set = set()
+    for sl in slots:
+        key = (sl.section_id, sl.day_of_week, sl.start_time)
+        assert key not in seen, (
+            f"Section {sl.section_id} double-booked at "
+            f"{sl.day_of_week} {sl.start_time}"
+        )
+        seen.add(key)
+
+
+async def test_generate_spreads_cohorts_across_rooms(
+    async_session, seeded_term,
+):
+    """
+    Three cohorts that fit any room must end up in three distinct
+    rooms after :meth:`generate_schedule`. This is what stops the
+    timetable from packing every cohort into the largest room and
+    emitting ``ROOM_DOUBLE_BOOKED`` conflicts.
+    """
+    inventory = [("BIG", 80), ("MED", 60), ("SMALL", 30)]
+    agent = _make_agent(inventory)
+
+    # One course per semester so generate_schedule has something to
+    # lay down; without curriculum it would no-op and never pick.
+    for sem in (1, 3, 5):
+        async_session.add(
+            Course(
+                code=f"CS{sem}00", title=f"Course {sem}",
+                credit_hours=1, semester=sem,
+                department="Computer Science",
+            )
+        )
+        stu = await _add_student(
+            async_session, semester=sem, department="Computer Science",
+            email=f"spread-{sem}@aau.edu.et",
+            full_name=f"Spread {sem} Student",
+        )
+        await _register(async_session, stu, seeded_term)
+    await async_session.flush()
+
+    await agent.allocate_sections(
+        async_session, seeded_term.id, "Computer Science",
+    )
+    await agent.generate_schedule(
+        async_session, seeded_term.id, "Computer Science",
+    )
+
+    slots = (
+        await async_session.execute(
+            select(ClassScheduleSlot).join(
+                Section, Section.id == ClassScheduleSlot.section_id,
+            ).where(
+                Section.term_id == seeded_term.id,
+                Section.department == "Computer Science",
+            )
+        )
+    ).scalars().all()
+    assert len(slots) == 3, (
+        "One slot per cohort (each course has credit_hours=1) — "
+        f"got {len(slots)}"
+    )
+    rooms_used = {sl.room for sl in slots}
+    assert None not in rooms_used
+    assert len(rooms_used) == 3, (
+        f"All three cohorts fit in any room and are tiny enough to "
+        f"share the smallest one, so each slot must land in a "
+        f"distinct room. Got rooms={rooms_used}"
+    )
+
+
 async def test_allocate_is_per_department_call(
     async_session, seeded_term, cs_sem1_course,
 ):
@@ -232,18 +374,27 @@ async def test_allocate_groups_by_semester_within_department(
             ).order_by(Section.semester.asc())
         )
     ).scalars().all()
+    # Section codes restart at "A" inside each (term, department,
+    # semester) cohort — sem-1 and sem-3 both start at A, they don't
+    # share the term-wide alphabet.
     assert [(s.semester, s.section_code) for s in sections] == [
-        (1, "A"), (3, "B"),
+        (1, "A"), (3, "A"),
     ]
 
 
-async def test_allocate_is_idempotent(
+async def test_allocate_rebuilds_on_rerun(
     async_session, seeded_term, cs_sem1_course,
 ):
-    """Re-running with no new students leaves everything as-is."""
+    """
+    Re-running allocate wipes the prior allocation and rebuilds. The
+    second run re-creates the same logical section but with a fresh
+    DB row (different id), and re-places the student into it. This
+    is the documented "redo" behaviour officers rely on when they
+    want a clean re-split.
+    """
     s = await _add_student(
         async_session, semester=1, department="Computer Science",
-        email="idem@aau.edu.et", full_name="Idem Test",
+        email="rebuild@aau.edu.et", full_name="Rebuild Test",
     )
     await _register(async_session, s, seeded_term)
 
@@ -256,8 +407,14 @@ async def test_allocate_is_idempotent(
     )
 
     assert len(first.sections_created) == 1
-    assert len(second.sections_created) == 0
-    assert len(second.students_placed) == 0
+    assert len(second.sections_created) == 1
+    assert len(second.students_placed) == 1
+
+    first_ids = {s["section_id"] for s in first.sections_created}
+    second_ids = {s["section_id"] for s in second.sections_created}
+    assert first_ids.isdisjoint(second_ids), (
+        "Re-run must hard-delete the old section rows and create new ones."
+    )
 
 
 async def test_allocate_skips_students_in_other_departments(

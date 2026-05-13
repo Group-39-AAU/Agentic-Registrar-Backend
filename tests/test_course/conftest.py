@@ -94,7 +94,6 @@ async def seeded_section(
         department=seeded_course.department,
         semester=seeded_course.semester,
         section_code="A",
-        room="NB-101",
         capacity=30,
         enrolled_count=0,
     )

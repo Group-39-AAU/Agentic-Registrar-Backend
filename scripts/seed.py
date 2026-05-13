@@ -43,6 +43,10 @@ PROGRAMS = [
     {"code": "SE", "name": "Software Engineering", "department": "Software Engineering", "stream": StreamType.NATURAL, "cut_off_score": 560.0, "max_capacity": 100},
     {"code": "EE", "name": "Electrical Engineering", "department": "Electrical & Computer Engineering", "stream": StreamType.NATURAL, "cut_off_score": 540.0, "max_capacity": 80},
     {"code": "ME", "name": "Mechanical Engineering", "department": "Mechanical Engineering", "stream": StreamType.NATURAL, "cut_off_score": 520.0, "max_capacity": 90},
+    # Course-management engineering programs (the 6 covered by course_course seed)
+    {"code": "ChE", "name": "Chemical Engineering", "department": "Chemical Engineering", "stream": StreamType.NATURAL, "cut_off_score": 510.0, "max_capacity": 70},
+    {"code": "CE", "name": "Civil Engineering", "department": "Civil Engineering", "stream": StreamType.NATURAL, "cut_off_score": 515.0, "max_capacity": 90},
+    {"code": "BME", "name": "Bio Medical Engineering", "department": "Bio Medical Engineering", "stream": StreamType.NATURAL, "cut_off_score": 540.0, "max_capacity": 60},
     {"code": "MED", "name": "Medicine", "department": "Medical Sciences", "stream": StreamType.NATURAL, "cut_off_score": 600.0, "max_capacity": 60},
     {"code": "BIO", "name": "Biology", "department": "Biological Sciences", "stream": StreamType.NATURAL, "cut_off_score": 480.0, "max_capacity": 100},
     # ── Social Science ────────────────────────────────
