@@ -43,8 +43,8 @@ from app.modules.course.models import (
     CourseManagementOfficer,
 )
 from app.shared.enums import (
-    EnrollmentStatus, OfficerRole, RegistrationStatus, RiskStatus,
-    SponsorshipType, UserRole,
+    AcademicPhase, EnrollmentStatus, OfficerRole, RegistrationStatus,
+    RiskStatus, SponsorshipType, UserRole,
 )
 
 
@@ -70,26 +70,53 @@ def _uid(*parts: str) -> uuid.UUID:
 #  Academic Term
 # ══════════════════════════════════════════════════════════════
 
-# Two academic terms per year (one academic year = Fall + Spring).
-# Fall is opened by default so registration is testable out of the box;
-# Spring stays closed so the officer can exercise the open/close
-# endpoint without interfering with the in-progress Fall registration.
+# Ethiopian-context academic calendar — every academic year is split
+# into two phases:
+#
+#   Phase One: September → end of January  (≈ Meskerem → Tir)
+#   Phase Two: February  → end of June     (≈ Yekatit  → Sene)
+#
+# We seed the previous and the upcoming academic year (4 terms total).
+# Whichever phase covers "today" is marked ``is_open=True`` so the
+# registration portal is testable out of the box without an officer
+# manually flipping a window. The other three stay closed; officers
+# can exercise the open/close endpoints freely.
 TERMS = [
     {
-        "id": _uid("term", "fall-2026"),
-        "term_name": "Fall 2026",
-        "start_date": date(2026, 9, 1),
-        "end_date": date(2027, 1, 31),
-        "is_open": True,
-        "description": "Fall semester of the 2026/2027 academic year.",
+        "id": _uid("term", "2025-2026-phase-1"),
+        "term_name": "2025/2026",
+        "phase": AcademicPhase.ONE,
+        "start_date": date(2025, 9, 1),
+        "end_date": date(2026, 1, 31),
+        "is_open": False,
+        "description": "Phase One of the 2025/2026 academic year (Sep–Jan).",
     },
     {
-        "id": _uid("term", "spring-2027"),
-        "term_name": "Spring 2027",
+        "id": _uid("term", "2025-2026-phase-2"),
+        "term_name": "2025/2026",
+        "phase": AcademicPhase.TWO,
+        "start_date": date(2026, 2, 1),
+        "end_date": date(2026, 6, 30),
+        "is_open": True,
+        "description": "Phase Two of the 2025/2026 academic year (Feb–Jun).",
+    },
+    {
+        "id": _uid("term", "2026-2027-phase-1"),
+        "term_name": "2026/2027",
+        "phase": AcademicPhase.ONE,
+        "start_date": date(2026, 9, 1),
+        "end_date": date(2027, 1, 31),
+        "is_open": False,
+        "description": "Phase One of the 2026/2027 academic year (Sep–Jan).",
+    },
+    {
+        "id": _uid("term", "2026-2027-phase-2"),
+        "term_name": "2026/2027",
+        "phase": AcademicPhase.TWO,
         "start_date": date(2027, 2, 1),
         "end_date": date(2027, 6, 30),
         "is_open": False,
-        "description": "Spring semester of the 2026/2027 academic year.",
+        "description": "Phase Two of the 2026/2027 academic year (Feb–Jun).",
     },
 ]
 
@@ -437,11 +464,17 @@ async def _seed_terms(session: AsyncSession) -> list[AcademicTerm]:
     for spec in TERMS:
         existing = (
             await session.execute(
-                select(AcademicTerm).where(AcademicTerm.term_name == spec["term_name"])
+                select(AcademicTerm).where(
+                    AcademicTerm.term_name == spec["term_name"],
+                    AcademicTerm.phase == spec["phase"],
+                )
             )
         ).scalar_one_or_none()
         if existing:
-            print(f"⚠️  Academic term '{spec['term_name']}' already exists — skipping.")
+            print(
+                f"⚠️  Academic term '{spec['term_name']}' "
+                f"(phase {spec['phase'].value}) already exists — skipping."
+            )
             seeded.append(existing)
             continue
 
@@ -695,7 +728,7 @@ async def _seed_instructor_assignments(
                 session.add(
                     InstructorAssignment(
                         id=_uid(
-                            "assn", term.term_name,
+                            "assn", term.term_name, term.phase.value,
                             instructor.instructor_id, course.code,
                         ),
                         instructor_id=instructor.id,
@@ -928,7 +961,7 @@ async def _seed_registrations(
             continue
 
         reg = Registration(
-            id=_uid("registration", term.term_name, sample["student_id"]),
+            id=_uid("registration", term.term_name, term.phase.value, sample["student_id"]),
             student_id=student.id,
             term_id=term.id,
             status=sample["status"],
@@ -1104,7 +1137,7 @@ async def _seed_bulk_se_sem1_cohort(
             continue
 
         reg = Registration(
-            id=_uid("registration", term.term_name, student_id_str),
+            id=_uid("registration", term.term_name, term.phase.value, student_id_str),
             student_id=student.id,
             term_id=term.id,
             status=RegistrationStatus.REGISTERED,
@@ -1266,7 +1299,7 @@ async def _seed_bulk_se_upper_year_cohorts(
                 continue
 
             reg = Registration(
-                id=_uid("registration", term.term_name, student_id_str),
+                id=_uid("registration", term.term_name, term.phase.value, student_id_str),
                 student_id=student.id,
                 term_id=term.id,
                 status=RegistrationStatus.REGISTERED,

@@ -34,8 +34,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteBase
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, EnrollmentStatus, OfficerRole,
-    RegistrationStatus, RiskStatus, ScheduleConflictStatus,
+    AcademicPhase, AddDropAction, AddDropRequestStatus, EnrollmentStatus,
+    OfficerRole, RegistrationStatus, RiskStatus, ScheduleConflictStatus,
     ScheduleConflictType, SponsorshipType,
 )
 
@@ -57,14 +57,27 @@ class AcademicTerm(SoftDeleteBase):
     __tablename__ = "academic_terms"
 
     term_name: Mapped[str] = mapped_column(
-        String(100), unique=True, nullable=False, index=True
+        String(100), nullable=False, index=True,
+        comment="Academic year label (e.g. '2025/2026'). Combined with phase for uniqueness.",
     )
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
     is_open: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    phase: Mapped[AcademicPhase] = mapped_column(
+        nullable=False,
+        index=True,
+        comment="Ethiopian-context phase within the academic year: ONE = Sep–Jan, TWO = Feb–Jun.",
+    )
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "term_name", "phase",
+            name="uq_academic_terms_year_phase",
+        ),
+    )
 
 
 # ── Course Catalog ───────────────────────────────────────────────

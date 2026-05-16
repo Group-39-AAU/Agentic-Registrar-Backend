@@ -22,6 +22,7 @@ from app.modules.course.exceptions import (
     InvalidStateTransitionError,
     RegistrationWindowClosedError,
     StudentAlreadyOnboardedError,
+    TermNotYetOpenError,
     UnauthorizedActorError,
 )
 from app.modules.course.repository import StudentRepository
@@ -34,6 +35,8 @@ from app.modules.course.schemas import (
     AdvisoryRecommendationRead,
     AdvisoryReviewCloseRequest,
     AssignInstructorToSlotRequest,
+    AvailableCoursesRequest,
+    AvailableCoursesResponse,
     ComplianceResultResponse,
     CostSharingFormResponse,
     CourseResponse,
@@ -69,6 +72,37 @@ from app.shared.enums import UserRole
 
 
 router = APIRouter(prefix="/courses", tags=["Course Management"])
+
+
+# ── Term catalog (open to every authenticated user) ──────────────
+
+
+@router.get(
+    "/terms",
+    response_model=list[AcademicTermResponse],
+    summary="List academic terms — open and closed, ordered by start_date",
+)
+async def list_terms(
+    is_open: Optional[bool] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Catalog of every (non-deleted) AcademicTerm. Visible to officers,
+    instructors, and students — every role needs a term picker.
+
+    The optional ``is_open`` query param narrows the result:
+
+      * ``is_open=true``  → only the currently-open registration windows
+      * ``is_open=false`` → only closed / future terms
+      * omitted           → every term
+
+    Ordered by ``start_date`` ascending so the calendar reads
+    chronologically.
+    """
+    del current_user  # auth confirmed; no role gate
+    svc = TermService(db)
+    return await svc.list_terms(is_open=is_open)
 
 
 # ── Officer endpoints ────────────────────────────────────────────
@@ -169,6 +203,42 @@ async def list_my_curriculum(
     student = await _resolve_student(db, current_user)
     svc = RegistrationService(db)
     return await svc.list_curriculum_courses(student.id)
+
+
+@router.post(
+    "/me/available-courses",
+    response_model=AvailableCoursesResponse,
+    summary="Courses available to the calling student for a given term",
+)
+async def list_my_available_courses(
+    payload: AvailableCoursesRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Term-keyed view, resolved by three rules:
+
+      1. Term is OPEN → 200 with ``is_registered=false`` and
+         ``courses`` set to the curriculum picker (department +
+         per-term semester filter) the student would register from.
+      2. Term is CLOSED and has already started → 200 with the
+         student's active (non-dropped) registered courses, plus
+         ``registration_id`` + ``registration_status``. **404** if the
+         student has no Registration for that term.
+      3. Term is CLOSED and has not started yet → **409** "this term
+         is not open yet".
+
+    Returns 404 also when ``term_id`` does not match any existing
+    (non-deleted) AcademicTerm.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = RegistrationService(db)
+    try:
+        return await svc.list_available_courses(student.id, payload.term_id)
+    except TermNotYetOpenError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
 
 
 @router.post(

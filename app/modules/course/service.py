@@ -41,6 +41,7 @@ from app.modules.course.exceptions import (
     InvalidStateTransitionError,
     RegistrationWindowClosedError,
     StudentAlreadyOnboardedError,
+    TermNotYetOpenError,
     UnauthorizedActorError,
 )
 from app.modules.course.models import (
@@ -107,6 +108,16 @@ class TermService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
         self.terms = AcademicTermRepository(db)
+
+    async def list_terms(
+        self, *, is_open: Optional[bool] = None,
+    ) -> list[AcademicTerm]:
+        """
+        Catalog read of every academic term. No role gate — officers,
+        instructors, and students all need a term picker. Optional
+        ``is_open`` narrows the result to only open / only closed terms.
+        """
+        return await self.terms.list_all(is_open=is_open)
 
     async def open_window(
         self, term_id: uuid.UUID, officer_role: UserRole, officer_id: uuid.UUID,
@@ -271,6 +282,164 @@ class RegistrationService:
                 )
             ).scalars().all()
         )
+
+    async def list_available_courses(
+        self, student_id: uuid.UUID, term_id: uuid.UUID,
+    ) -> dict:
+        """
+        Three-rule resolution keyed off the term's open flag and the
+        term's dates relative to today:
+
+          1. Term is OPEN → return the curriculum picker the student
+             would register from. The semester is computed via
+             :meth:`_semester_for_term` so the list matches *this
+             term's* expected semester, not just ``student.current_semester``.
+             When the computed semester is outside ``[1, 10]`` the
+             curriculum list is empty.
+
+          2. Term is CLOSED and has already started (``today >=
+             start_date``) → treat as past/in-progress. Look up the
+             student's Registration for the term:
+               * Found → return the active (non-dropped) registered
+                 courses.
+               * Not found → raise ``EntityNotFoundError`` for a
+                 Registration so the router surfaces "you didn't
+                 register for this term" as a 404.
+
+          3. Term is CLOSED and has not started yet (``today <
+             start_date``) → raise :class:`TermNotYetOpenError` so
+             the router can surface a 409 "this term is not open yet".
+
+        Also raises ``EntityNotFoundError`` if either the Student or
+        the AcademicTerm itself is missing.
+        """
+        student = (
+            await self.db.execute(
+                select(Student).where(Student.id == student_id)
+            )
+        ).scalar_one_or_none()
+        if student is None:
+            raise EntityNotFoundError("Student", str(student_id))
+
+        term = (
+            await self.db.execute(
+                select(AcademicTerm).where(
+                    AcademicTerm.id == term_id,
+                    AcademicTerm.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if term is None:
+            raise EntityNotFoundError("AcademicTerm", str(term_id))
+
+        today = date.today()
+
+        # Rule 1 — open term: curriculum picker, per-term semester.
+        if term.is_open:
+            target_semester = await self._semester_for_term(student, term)
+            if target_semester is None or not (1 <= target_semester <= 10):
+                courses: list[Course] = []
+            else:
+                filters = [
+                    Course.semester == target_semester,
+                    Course.is_deleted == False,  # noqa: E712
+                ]
+                if student.department is not None:
+                    filters.append(Course.department == student.department)
+                courses = list(
+                    (
+                        await self.db.execute(
+                            select(Course)
+                            .where(*filters)
+                            .order_by(Course.code.asc())
+                        )
+                    ).scalars().all()
+                )
+            return {
+                "term": term,
+                "is_registered": False,
+                "registration_id": None,
+                "registration_status": None,
+                "courses": courses,
+            }
+
+        # Rule 3 — closed, future: not open yet.
+        if today < term.start_date:
+            raise TermNotYetOpenError(term.term_name)
+
+        # Rule 2 — closed, past/in-progress: must have a registration.
+        registration = (
+            await self.db.execute(
+                select(Registration).where(
+                    Registration.student_id == student_id,
+                    Registration.term_id == term.id,
+                    Registration.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if registration is None:
+            raise EntityNotFoundError(
+                "Registration",
+                f"student={student.student_id}, term='{term.term_name}'",
+            )
+
+        rows = (
+            await self.db.execute(
+                select(Course)
+                .join(
+                    RegistrationCourse,
+                    RegistrationCourse.course_id == Course.id,
+                )
+                .where(
+                    RegistrationCourse.registration_id == registration.id,
+                    RegistrationCourse.is_dropped == False,  # noqa: E712
+                    Course.is_deleted == False,  # noqa: E712
+                )
+                .order_by(Course.code.asc())
+            )
+        ).scalars().all()
+        return {
+            "term": term,
+            "is_registered": True,
+            "registration_id": registration.id,
+            "registration_status": registration.status,
+            "courses": list(rows),
+        }
+
+    async def _semester_for_term(
+        self, student: Student, target_term: AcademicTerm,
+    ) -> Optional[int]:
+        """
+        Compute the semester this student is in for ``target_term``.
+
+        Anchor: the currently-open AcademicTerm pairs with
+        ``student.current_semester``. Every chronological step away
+        from that anchor (ordered by ``start_date``) shifts the
+        semester by ±1. Returns ``None`` when no term is open —
+        callers fall back to whatever they consider sensible.
+        """
+        terms = list(
+            (
+                await self.db.execute(
+                    select(AcademicTerm)
+                    .where(AcademicTerm.is_deleted == False)  # noqa: E712
+                    .order_by(AcademicTerm.start_date.asc())
+                )
+            ).scalars().all()
+        )
+        anchor = next((t for t in terms if t.is_open), None)
+        if anchor is None:
+            return None
+        try:
+            anchor_idx = next(
+                i for i, t in enumerate(terms) if t.id == anchor.id
+            )
+            target_idx = next(
+                i for i, t in enumerate(terms) if t.id == target_term.id
+            )
+        except StopIteration:
+            return None
+        return student.current_semester + (target_idx - anchor_idx)
 
     # ── Student dashboard read ───────────────────────────────────
 

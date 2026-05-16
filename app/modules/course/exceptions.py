@@ -25,6 +25,21 @@ class RegistrationWindowClosedError(Exception):
         )
 
 
+class TermNotYetOpenError(Exception):
+    """
+    Raised when a student asks about a term whose registration window
+    has not yet opened (the term is in the future and currently
+    closed). Distinct from :class:`RegistrationWindowClosedError`,
+    which signals a window that *was* open and is now closed.
+    """
+
+    def __init__(self, term_name: str) -> None:
+        self.term_name = term_name
+        super().__init__(
+            f"Term '{term_name}' is not open yet."
+        )
+
+
 class DuplicateRegistrationError(Exception):
     """Raised when a student already has a registration for a term."""
 
