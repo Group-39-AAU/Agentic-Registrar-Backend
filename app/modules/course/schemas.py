@@ -287,6 +287,24 @@ class ClassScheduleSlotRead(BaseModel):
     end_time: str
     instructor_id: Optional[uuid.UUID] = None
     room: Optional[str] = None
+    # New fields surfaced by /me/schedule once the add/drop schedule
+    # delta path lands. Optional so cohort-only consumers
+    # (/sections/{id}/schedule, /students/{id}/schedule officer view)
+    # keep working unchanged.
+    course_id: Optional[uuid.UUID] = None
+    source: Optional[str] = None        # "cohort" | "addition"
+    source_section_id: Optional[uuid.UUID] = None
+
+
+class PendingAdditionRead(BaseModel):
+    """
+    Course on the registration that has no schedule slots yet —
+    student needs to pick a section via the agent's option proposer.
+    """
+    course_id: uuid.UUID
+    course_code: str
+    course_title: str
+    credit_hours: int
 
 
 class SectionScheduleResponse(BaseModel):
@@ -295,11 +313,17 @@ class SectionScheduleResponse(BaseModel):
     resolving the caller's section), /students/{id}/schedule, and
     /sections/{id}/schedule. ``section`` is null when the caller has no
     cohort assignment yet (e.g. officer hasn't run scheduling).
+
+    On /me/schedule the response includes ``pending_additions`` —
+    courses the student has on the registration but hasn't picked a
+    section for yet (typically post-add/drop). These are blank on
+    section-only reads.
     """
     term_id: uuid.UUID
     student_id: Optional[uuid.UUID] = None
     section: Optional[SectionRead] = None
     slots: list[ClassScheduleSlotRead] = Field(default_factory=list)
+    pending_additions: list[PendingAdditionRead] = Field(default_factory=list)
 
 
 class InstructorScheduleEntry(BaseModel):
@@ -443,6 +467,72 @@ class AddDropBatchResponse(BaseModel):
 class OfficerJustificationRequest(BaseModel):
     """Officer payload for override / reject — both require a reason."""
     justification: str = Field(..., min_length=3, max_length=4000)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Per-student schedule deltas (add/drop integration)
+# ══════════════════════════════════════════════════════════════
+
+
+class ScheduleSlotSummary(BaseModel):
+    """One weekly meeting in a section's schedule."""
+    slot_id: uuid.UUID
+    course_code: str
+    day_of_week: str
+    start_time: str
+    end_time: str
+    room: Optional[str] = None
+    instructor_id: Optional[uuid.UUID] = None
+
+
+class ScheduleConflictDetail(BaseModel):
+    """A slot in an option that collides with an existing slot."""
+    candidate: ScheduleSlotSummary
+    collides_with: ScheduleSlotSummary
+
+
+class ScheduleSectionOption(BaseModel):
+    """
+    One section-level option for a course the student has added via
+    the add/drop flow. ``is_viable`` is False when any candidate slot
+    would collide with the student's current effective schedule;
+    the colliding pairs are listed in ``conflicts`` so the portal
+    can render "Section B clashes with CS101 Mon 09:30".
+    """
+    section_id: uuid.UUID
+    section_code: str
+    department: str
+    semester: int
+    slots: list[ScheduleSlotSummary] = Field(default_factory=list)
+    conflicts: list[ScheduleConflictDetail] = Field(default_factory=list)
+    is_viable: bool
+
+
+class CourseSlim(BaseModel):
+    """Slim course view used inside option/pending payloads."""
+    course_id: uuid.UUID
+    course_code: Optional[str] = None
+    course_title: Optional[str] = None
+
+
+class ScheduleOptionsResponse(BaseModel):
+    """Payload from ``GET /me/schedule/options-for/{course_id}``."""
+    registration_id: uuid.UUID
+    course: CourseSlim
+    options: list[ScheduleSectionOption] = Field(default_factory=list)
+
+
+class ScheduleAcceptRequest(BaseModel):
+    """Body for ``POST /me/schedule/accept-for/{course_id}``."""
+    section_id: uuid.UUID
+
+
+class ScheduleAcceptResponse(BaseModel):
+    """Confirms how many addition rows were materialised."""
+    registration_id: uuid.UUID
+    course_id: uuid.UUID
+    section_id: uuid.UUID
+    slots_created: int
 
 
 # ══════════════════════════════════════════════════════════════

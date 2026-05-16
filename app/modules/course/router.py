@@ -52,6 +52,9 @@ from app.modules.course.schemas import (
     InstructorResponse,
     InstructorScheduleEntry,
     OfficerJustificationRequest,
+    ScheduleAcceptRequest,
+    ScheduleAcceptResponse,
+    ScheduleOptionsResponse,
     RegistrationInvoiceResponse,
     RegistrationResponse,
     RegistrationSubmitResponse,
@@ -550,6 +553,85 @@ async def get_my_schedule(
     student = await _resolve_student(db, current_user)
     svc = SchedulingService(db)
     return await svc.get_student_schedule(student.id, term_id)
+
+
+# ── Per-student schedule deltas (post-add/drop section choice) ──
+#
+# The add/drop apply path automatically removes dropped courses
+# from the schedule (cohort slots are filtered out at read time;
+# any per-student additions for the dropped course are deleted).
+# Added courses, however, may be offered in multiple sections and
+# the student needs to pick one — these endpoints walk that flow:
+#
+#   GET  /me/schedule/options-for/{course_id}
+#        AcademicSchedulingAgent.propose_options_for_course →
+#        every Section that offers the course, each with a
+#        conflict flag against the student's current schedule.
+#
+#   POST /me/schedule/accept-for/{course_id}
+#        Materialises the chosen section's slots as
+#        StudentScheduleAddition rows. Re-checks conflicts so a
+#        stale client cannot bypass.
+
+
+@router.get(
+    "/me/schedule/options-for/{course_id}",
+    response_model=ScheduleOptionsResponse,
+    summary="Section options for an added course (with conflict flags)",
+)
+async def get_schedule_options_for_course(
+    course_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    For an active course on the calling student's registration,
+    list every section that runs it. Each option carries the
+    candidate slot package and a ``conflicts`` list (empty when
+    ``is_viable=true``) describing any collisions with the
+    student's current effective schedule.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = SchedulingService(db)
+    try:
+        return await svc.propose_options_for_added_course(
+            student_id=student.id, course_id=course_id,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.post(
+    "/me/schedule/accept-for/{course_id}",
+    response_model=ScheduleAcceptResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Pick a section for an added course; integrate into schedule",
+)
+async def accept_section_for_added_course(
+    course_id: uuid.UUID,
+    payload: ScheduleAcceptRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Apply the student's chosen section: writes one
+    ``StudentScheduleAddition`` row per slot the section runs for
+    this course. Idempotent on retry. Returns 409 when the chosen
+    section would conflict with the current schedule (must pick a
+    section flagged ``is_viable=true`` from the options endpoint).
+    """
+    student = await _resolve_student(db, current_user)
+    svc = SchedulingService(db)
+    try:
+        return await svc.accept_section_for_added_course(
+            student_id=student.id,
+            course_id=course_id,
+            section_id=payload.section_id,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
 
 
 @router.get(

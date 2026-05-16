@@ -54,7 +54,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
 from app.modules.course.models import (
     ClassScheduleSlot, Classroom, Course, InstructorAssignment,
-    Registration, ScheduleConflict, Section, Student,
+    Registration, RegistrationCourse, ScheduleConflict, Section, Student,
+    StudentScheduleAddition,
 )
 from app.shared.enums import (
     RegistrationStatus, ScheduleConflictStatus, ScheduleConflictType,
@@ -539,6 +540,217 @@ class AcademicSchedulingAgent(CourseBaseAgent):
         ).scalars().first()
         return row.instructor_id if row else None
 
+    # ── Per-student schedule deltas (add/drop integration) ───────
+
+    async def propose_options_for_course(
+        self,
+        session: AsyncSession,
+        *,
+        registration: Registration,
+        course_id: uuid.UUID,
+    ) -> list[dict[str, Any]]:
+        """
+        Propose section options for a course the student has added
+        via the add/drop flow. For every Section in the same
+        (term, department, semester) cohort that has slots for this
+        course, build an option carrying:
+
+          * section info (id, code)
+          * the candidate slot package (day/time/room/instructor)
+          * a ``conflicts`` flag plus the colliding existing slots,
+            so the portal can grey-out unviable picks
+
+        Conflict detection compares each candidate slot against the
+        student's CURRENT effective schedule (cohort minus drops
+        plus already-accepted additions). Pure rule-based — no LLM.
+        """
+        course = await session.get(Course, course_id)
+        if course is None:
+            return []
+
+        # Current schedule = cohort slots (filtered by active courses)
+        # + already-accepted additions. Same shape as
+        # SchedulingService.get_student_schedule, but kept in-agent so
+        # the agent stays self-sufficient for testing.
+        current_slots = await self._effective_slots(
+            session, registration=registration,
+        )
+
+        # Find every Section that has at least one slot for this
+        # course. We restrict to sections in the same (term, dept,
+        # semester) — the curriculum/parity guards in
+        # EnrollmentAdjustmentAgent already ensured the course
+        # belongs there.
+        candidate_sections = (
+            await session.execute(
+                select(Section).join(
+                    ClassScheduleSlot,
+                    ClassScheduleSlot.section_id == Section.id,
+                ).where(
+                    Section.term_id == registration.term_id,
+                    Section.is_deleted == False,  # noqa: E712
+                    ClassScheduleSlot.course_id == course_id,
+                ).distinct()
+            )
+        ).scalars().all()
+
+        options: list[dict[str, Any]] = []
+        for section in candidate_sections:
+            slot_rows = (
+                await session.execute(
+                    select(ClassScheduleSlot).where(
+                        ClassScheduleSlot.section_id == section.id,
+                        ClassScheduleSlot.course_id == course_id,
+                    ).order_by(
+                        ClassScheduleSlot.day_of_week.asc(),
+                        ClassScheduleSlot.start_time.asc(),
+                    )
+                )
+            ).scalars().all()
+            if not slot_rows:
+                continue
+
+            # When the student picks a section for ``course_id``,
+            # any existing slots for that same course (from the cohort
+            # default or a prior addition) are *replaced* — they
+            # shouldn't count as collisions with themselves.
+            conflict_candidates = [
+                e for e in current_slots
+                if e["slot"].course_id != course_id
+            ]
+            conflicts: list[dict[str, Any]] = []
+            for cand in slot_rows:
+                for existing in conflict_candidates:
+                    existing_slot = existing["slot"]
+                    if _slots_collide(cand, existing_slot):
+                        conflicts.append({
+                            "candidate": _slot_summary(cand, course.code),
+                            "collides_with": _slot_summary(
+                                existing_slot, existing["course_code"],
+                            ),
+                        })
+
+            options.append({
+                "section_id": str(section.id),
+                "section_code": section.section_code,
+                "department": section.department,
+                "semester": section.semester,
+                "slots": [
+                    _slot_summary(s, course.code) for s in slot_rows
+                ],
+                "conflicts": conflicts,
+                "is_viable": not conflicts,
+            })
+        # Viable options first, then sort by section code so output
+        # is stable across calls.
+        options.sort(key=lambda o: (not o["is_viable"], o["section_code"]))
+        return options
+
+    async def accept_section_for_course(
+        self,
+        session: AsyncSession,
+        *,
+        registration: Registration,
+        course_id: uuid.UUID,
+        section_id: uuid.UUID,
+    ) -> list[StudentScheduleAddition]:
+        """
+        Materialise the student's choice: insert one
+        :class:`StudentScheduleAddition` row per slot the picked
+        section runs for ``course_id``. Idempotent on retry —
+        existing additions for the same (registration, slot) are
+        left alone (the unique constraint also enforces this at
+        the DB level).
+
+        Caller is responsible for the surrounding transaction; this
+        method only ``session.add()``-s the new rows.
+        """
+        slot_rows = (
+            await session.execute(
+                select(ClassScheduleSlot).where(
+                    ClassScheduleSlot.section_id == section_id,
+                    ClassScheduleSlot.course_id == course_id,
+                )
+            )
+        ).scalars().all()
+        if not slot_rows:
+            return []
+
+        existing = (
+            await session.execute(
+                select(StudentScheduleAddition.schedule_slot_id).where(
+                    StudentScheduleAddition.registration_id == registration.id,
+                )
+            )
+        ).scalars().all()
+        already_added = set(existing)
+
+        created: list[StudentScheduleAddition] = []
+        for slot in slot_rows:
+            if slot.id in already_added:
+                continue
+            row = StudentScheduleAddition(
+                registration_id=registration.id,
+                schedule_slot_id=slot.id,
+                course_id=course_id,
+                source_section_id=section_id,
+            )
+            session.add(row)
+            created.append(row)
+        return created
+
+    async def _effective_slots(
+        self,
+        session: AsyncSession,
+        *,
+        registration: Registration,
+    ) -> list[dict[str, Any]]:
+        """
+        The student's current effective slot list — used both as the
+        baseline for conflict detection and (indirectly) as the data
+        the SchedulingService surfaces on /me/schedule.
+        """
+        await session.refresh(registration, attribute_names=["courses"])
+        active_course_ids = {
+            rc.course_id for rc in registration.courses if not rc.is_dropped
+        }
+        cohort: list[ClassScheduleSlot] = []
+        if registration.section_id is not None and active_course_ids:
+            cohort = list((
+                await session.execute(
+                    select(ClassScheduleSlot).where(
+                        ClassScheduleSlot.section_id == registration.section_id,
+                        ClassScheduleSlot.course_id.in_(active_course_ids),
+                    )
+                )
+            ).scalars().all())
+        additions = list((
+            await session.execute(
+                select(ClassScheduleSlot).join(
+                    StudentScheduleAddition,
+                    StudentScheduleAddition.schedule_slot_id == ClassScheduleSlot.id,
+                ).where(
+                    StudentScheduleAddition.registration_id == registration.id,
+                )
+            )
+        ).scalars().all())
+        all_slots = list(cohort) + list(additions)
+        # Cache course codes in a single query so the conflict
+        # explanations can render `CS101` rather than UUIDs.
+        course_ids = {s.course_id for s in all_slots}
+        codes_by_id: dict[uuid.UUID, str] = {}
+        if course_ids:
+            rows = (
+                await session.execute(
+                    select(Course).where(Course.id.in_(course_ids))
+                )
+            ).scalars().all()
+            codes_by_id = {c.id: c.code for c in rows}
+        return [
+            {"slot": s, "course_code": codes_by_id.get(s.course_id, "?")}
+            for s in all_slots
+        ]
+
     # ── BaseAgent contract ────────────────────────────────────────
 
     async def process_task(
@@ -607,6 +819,33 @@ def _pick_free_room_at_slot(
     # them.
     fitting.sort(key=lambda r: r[1])
     return fitting[0][0]
+
+
+def _slots_collide(a: ClassScheduleSlot, b: ClassScheduleSlot) -> bool:
+    """
+    Half-open interval overlap on the same weekday. ``a.end_time`` ==
+    ``b.start_time`` is treated as adjacent, NOT overlapping, so two
+    back-to-back slots are allowed (matching how the cohort scheduler
+    packs lectures into the 08:30–17:30 day).
+    """
+    if a.day_of_week != b.day_of_week:
+        return False
+    return a.start_time < b.end_time and b.start_time < a.end_time
+
+
+def _slot_summary(slot: ClassScheduleSlot, course_code: str) -> dict[str, Any]:
+    """One-line dict describing a slot for the option/conflict payloads."""
+    return {
+        "slot_id": str(slot.id),
+        "course_code": course_code,
+        "day_of_week": slot.day_of_week,
+        "start_time": slot.start_time.isoformat(timespec="minutes"),
+        "end_time": slot.end_time.isoformat(timespec="minutes"),
+        "room": slot.room,
+        "instructor_id": (
+            str(slot.instructor_id) if slot.instructor_id else None
+        ),
+    }
 
 
 def _next_section_code(used: set[str]) -> str:

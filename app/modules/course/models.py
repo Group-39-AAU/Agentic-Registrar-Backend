@@ -281,6 +281,72 @@ class ClassScheduleSlot(Base):
     )
 
 
+class StudentScheduleAddition(Base):
+    """
+    Per-student schedule delta for a course added via the add/drop
+    flow into a section *other than* the student's cohort.
+
+    The student's effective weekly schedule is computed as:
+
+        cohort_slots(registration.section)
+          MINUS slots whose course_id is in dropped_courses
+          PLUS  StudentScheduleAddition.schedule_slot rows
+
+    Cohort scheduling is untouched — these rows are pure deltas the
+    student picks via :class:`AcademicSchedulingAgent`'s option
+    proposer once the officer has approved the add/drop batch.
+
+    UniqueConstraint(registration_id, schedule_slot_id) prevents
+    duplicate additions for the same picked slot. The course-level
+    UniqueConstraint(registration_id, course_id) is intentionally
+    NOT enforced — a 3-credit course typically attaches as 3 slot
+    rows from the same section, all pointing to the same course.
+    """
+
+    __tablename__ = "student_schedule_additions"
+
+    registration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registrations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    schedule_slot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("class_schedule_slots.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalised so a query for "what courses has the student added
+    # via this delta?" doesn't need to fan out through the slot row.
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    # The Section the student picked from (different from the cohort
+    # section on Registration). Useful for the officer audit trail.
+    source_section_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sections.id"),
+        nullable=False,
+        index=True,
+    )
+
+    registration: Mapped["Registration"] = relationship(lazy="selectin")
+    schedule_slot: Mapped["ClassScheduleSlot"] = relationship(lazy="selectin")
+    course: Mapped["Course"] = relationship(lazy="selectin")
+    source_section: Mapped["Section"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "registration_id", "schedule_slot_id",
+            name="uq_student_addition_per_slot",
+        ),
+    )
+
+
 # ── Classroom inventory ────────────────────────────────────────
 
 

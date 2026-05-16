@@ -49,7 +49,7 @@ from app.modules.course.models import (
     ClassScheduleSlot, Classroom, CourseManagementOfficer, Course,
     Instructor, InstructorAssignment, PrerequisiteOverride, Registration,
     RegistrationCourse, RegistrationStatusHistory, ScheduleConflict, Section,
-    Student,
+    Student, StudentScheduleAddition,
 )
 from app.modules.course.repository import (
     AcademicTermRepository, AddDropRequestRepository,
@@ -1485,11 +1485,20 @@ class SchedulingService:
         term_id: uuid.UUID,
     ) -> dict:
         """
-        Schedule for a single student: resolves the student's
-        Registration for the term, finds its Section, and returns
-        every ClassScheduleSlot for that section. Empty
-        ``slots`` ⇒ the student has not been allocated yet (officer
-        hasn't run scheduling) or has no registration in this term.
+        Effective schedule for a single student. Combines:
+
+          1. **Cohort slots** — every ClassScheduleSlot for the
+             registration's section, filtered to courses that are
+             still on the registration (drops removed).
+          2. **Per-student additions** — slots picked via the
+             ``/me/schedule/options-for/{course_id}`` flow when an
+             added course belongs to a different section.
+
+        Empty ``slots`` ⇒ the student has not been allocated yet
+        (officer hasn't run scheduling) or has no registration in
+        this term. ``pending_additions`` lists courses on the
+        registration that have no slots yet — the student needs to
+        pick a section for them via the agent's option proposer.
         """
         registration = (
             await self.db.execute(
@@ -1500,20 +1509,131 @@ class SchedulingService:
                 )
             )
         ).scalar_one_or_none()
-
-        if registration is None or registration.section_id is None:
+        if registration is None:
             return {
                 "term_id": str(term_id),
                 "student_id": str(student_id),
                 "section": None,
                 "slots": [],
+                "pending_additions": [],
             }
 
-        return await self._section_schedule_payload(
-            section_id=registration.section_id,
-            term_id=term_id,
-            student_id=student_id,
+        # Active vs dropped split — drives the cohort slot filter and
+        # the pending-additions list.
+        await self.db.refresh(registration, attribute_names=["courses"])
+        active_course_ids = {
+            rc.course_id for rc in registration.courses if not rc.is_dropped
+        }
+
+        cohort_rows: list[tuple[ClassScheduleSlot, Course]] = []
+        section_payload = None
+        if registration.section_id is not None:
+            section = await self.db.get(Section, registration.section_id)
+            if section is not None and not section.is_deleted:
+                section_payload = {
+                    "section_id": str(section.id),
+                    "section_code": section.section_code,
+                    "department": section.department,
+                    "semester": section.semester,
+                    "capacity": section.capacity,
+                    "enrolled_count": section.enrolled_count,
+                }
+                cohort_rows = list((
+                    await self.db.execute(
+                        select(ClassScheduleSlot, Course).join(
+                            Course, Course.id == ClassScheduleSlot.course_id,
+                        ).where(
+                            ClassScheduleSlot.section_id == registration.section_id,
+                            ClassScheduleSlot.course_id.in_(active_course_ids)
+                            if active_course_ids else
+                            # ``in_([])`` raises in some dialects — keep the
+                            # filter present but always-false instead.
+                            ClassScheduleSlot.course_id.is_(None),
+                        )
+                    )
+                ).all())
+
+        addition_rows = list((
+            await self.db.execute(
+                select(
+                    StudentScheduleAddition,
+                    ClassScheduleSlot,
+                    Course,
+                    Section,
+                ).join(
+                    ClassScheduleSlot,
+                    ClassScheduleSlot.id == StudentScheduleAddition.schedule_slot_id,
+                ).join(
+                    Course, Course.id == ClassScheduleSlot.course_id,
+                ).join(
+                    Section, Section.id == ClassScheduleSlot.section_id,
+                ).where(
+                    StudentScheduleAddition.registration_id == registration.id,
+                )
+            )
+        ).all())
+
+        # Effective slot list = cohort slots + addition slots, sorted
+        # together so the portal renders a single weekly view.
+        items: list[dict] = []
+        for slot, course in cohort_rows:
+            items.append({
+                "course_id": str(course.id),
+                "course_code": course.code,
+                "course_title": course.title,
+                "day_of_week": slot.day_of_week,
+                "start_time": slot.start_time.isoformat(timespec="minutes"),
+                "end_time": slot.end_time.isoformat(timespec="minutes"),
+                "instructor_id": (
+                    str(slot.instructor_id) if slot.instructor_id else None
+                ),
+                "room": slot.room,
+                "source": "cohort",
+                "source_section_id": (
+                    str(registration.section_id)
+                    if registration.section_id else None
+                ),
+            })
+        for _addition, slot, course, source_section in addition_rows:
+            items.append({
+                "course_id": str(course.id),
+                "course_code": course.code,
+                "course_title": course.title,
+                "day_of_week": slot.day_of_week,
+                "start_time": slot.start_time.isoformat(timespec="minutes"),
+                "end_time": slot.end_time.isoformat(timespec="minutes"),
+                "instructor_id": (
+                    str(slot.instructor_id) if slot.instructor_id else None
+                ),
+                "room": slot.room,
+                "source": "addition",
+                "source_section_id": str(source_section.id),
+            })
+        items.sort(
+            key=lambda s: (s["day_of_week"], s["start_time"]),
         )
+
+        # Pending = active courses with NO slot anywhere in items.
+        scheduled_course_ids = {uuid.UUID(s["course_id"]) for s in items}
+        pending = []
+        for cid in active_course_ids - scheduled_course_ids:
+            course = await self.db.get(Course, cid)
+            if course is None:
+                continue
+            pending.append({
+                "course_id": str(course.id),
+                "course_code": course.code,
+                "course_title": course.title,
+                "credit_hours": course.credit_hours,
+            })
+
+        return {
+            "term_id": str(term_id),
+            "student_id": str(student_id),
+            "section": section_payload,
+            "slots": items,
+            "pending_additions": pending,
+        }
 
     async def get_section_schedule(
         self,
@@ -1585,6 +1705,161 @@ class SchedulingService:
                 for slot, course in slot_rows
             ],
         }
+
+    # ── Per-student schedule deltas (add/drop integration) ───────
+
+    async def propose_options_for_added_course(
+        self,
+        student_id: uuid.UUID,
+        course_id: uuid.UUID,
+    ) -> dict:
+        """
+        Surface every section that offers ``course_id`` as a viable
+        option for the student to slot into. Service-layer wrapper
+        around :meth:`AcademicSchedulingAgent.propose_options_for_course`
+        that resolves the student's currently-active registration
+        first.
+
+        Raises EntityNotFoundError when the student has no active
+        (REGISTERED / ADD_DROP_WINDOW) registration in any term, or
+        when the course is not on that registration's active list
+        (no point picking a section for a course they aren't taking).
+        """
+        registration = await self._resolve_active_registration(student_id)
+        await self.db.refresh(registration, attribute_names=["courses"])
+        active_course_ids = {
+            rc.course_id for rc in registration.courses if not rc.is_dropped
+        }
+        if course_id not in active_course_ids:
+            raise EntityNotFoundError(
+                "RegistrationCourse",
+                f"course {course_id} is not on the student's active "
+                "registration",
+            )
+        course = await self.db.get(Course, course_id)
+        options = await self.scheduling_agent.propose_options_for_course(
+            self.db, registration=registration, course_id=course_id,
+        )
+        return {
+            "registration_id": str(registration.id),
+            "course": {
+                "course_id": str(course.id) if course else str(course_id),
+                "course_code": course.code if course else None,
+                "course_title": course.title if course else None,
+            },
+            "options": options,
+        }
+
+    async def accept_section_for_added_course(
+        self,
+        student_id: uuid.UUID,
+        course_id: uuid.UUID,
+        section_id: uuid.UUID,
+    ) -> dict:
+        """
+        Materialise the student's section choice. Validates that the
+        chosen section actually offers the course; rejects sections
+        that would create a hard conflict with the student's current
+        schedule (the option proposer already flags this, but the
+        accept endpoint re-checks so a stale client cannot bypass).
+        """
+        registration = await self._resolve_active_registration(student_id)
+        await self.db.refresh(registration, attribute_names=["courses"])
+        active_course_ids = {
+            rc.course_id for rc in registration.courses if not rc.is_dropped
+        }
+        if course_id not in active_course_ids:
+            raise EntityNotFoundError(
+                "RegistrationCourse",
+                f"course {course_id} is not on the student's active "
+                "registration",
+            )
+
+        # Re-validate via the same option proposer the student saw —
+        # blocks accepts of a conflicting section even if the client
+        # bypassed the GET.
+        options = await self.scheduling_agent.propose_options_for_course(
+            self.db, registration=registration, course_id=course_id,
+        )
+        chosen = next(
+            (o for o in options if o["section_id"] == str(section_id)),
+            None,
+        )
+        if chosen is None:
+            raise EntityNotFoundError(
+                "Section",
+                f"section {section_id} does not offer course {course_id} "
+                "in this term",
+            )
+        if not chosen["is_viable"]:
+            raise InvalidAdjustmentRequestError(
+                "Selected section conflicts with the student's current "
+                "schedule. Pick a section flagged is_viable=true."
+            )
+
+        created = await self.scheduling_agent.accept_section_for_course(
+            self.db,
+            registration=registration,
+            course_id=course_id,
+            section_id=section_id,
+        )
+        write_audit_log(
+            action="course.schedule.addition_accepted",
+            actor_role=UserRole.STUDENT.value,
+            actor_id=None,
+            resource_type="StudentScheduleAddition",
+            resource_id=registration.id,
+            decision="applied",
+            metadata={
+                "registration_id": str(registration.id),
+                "course_id": str(course_id),
+                "section_id": str(section_id),
+                "slots_created": len(created),
+            },
+        )
+        await self.db.commit()
+        return {
+            "registration_id": str(registration.id),
+            "course_id": str(course_id),
+            "section_id": str(section_id),
+            "slots_created": len(created),
+        }
+
+    async def _resolve_active_registration(
+        self, student_id: uuid.UUID,
+    ) -> Registration:
+        """
+        Find the student's REGISTERED or ADD_DROP_WINDOW registration
+        in the currently-open term. Used by the schedule-delta
+        endpoints — the student can only re-shape the schedule for
+        the in-flight term.
+        """
+        term = await self.terms.get_open()
+        if term is None:
+            raise EntityNotFoundError(
+                "AcademicTerm",
+                "no AcademicTerm is currently open",
+            )
+        registration = (
+            await self.db.execute(
+                select(Registration).where(
+                    Registration.student_id == student_id,
+                    Registration.term_id == term.id,
+                    Registration.status.in_([
+                        RegistrationStatus.REGISTERED,
+                        RegistrationStatus.ADD_DROP_WINDOW,
+                    ]),
+                    Registration.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if registration is None:
+            raise EntityNotFoundError(
+                "Registration",
+                f"student {student_id} has no active registration "
+                f"in term {term.term_name}",
+            )
+        return registration
 
     async def get_instructor_schedule(
         self,
@@ -2152,7 +2427,14 @@ class AddDropService:
     async def _apply_drop(
         self, request: AddDropRequest, registration: Registration,
     ) -> None:
-        """Materialise a DROP: flip ``is_dropped=True`` on the link row."""
+        """
+        Materialise a DROP: flip ``is_dropped=True`` on the link row
+        AND remove any per-student schedule additions that pointed at
+        the dropped course. Cohort slots are filtered out at read
+        time (the SchedulingService.get_student_schedule reader honours
+        ``active_course_ids``), so for them no explicit cleanup is
+        needed — but addition rows are concrete and have to go.
+        """
         link = (
             await self.db.execute(
                 select(RegistrationCourse).where(
@@ -2166,6 +2448,17 @@ class AddDropService:
                 "Cannot drop a course the student is not registered for."
             )
         link.is_dropped = True
+
+        addition_rows = (
+            await self.db.execute(
+                select(StudentScheduleAddition).where(
+                    StudentScheduleAddition.registration_id == registration.id,
+                    StudentScheduleAddition.course_id == request.course_id,
+                )
+            )
+        ).scalars().all()
+        for row in addition_rows:
+            await self.db.delete(row)
 
     def _require_officer_role(self, role: UserRole) -> None:
         if role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
