@@ -218,13 +218,20 @@ async def list_my_available_courses(
     """
     Term-keyed view, resolved by three rules:
 
-      1. Term is OPEN → 200 with ``is_registered=false`` and
-         ``courses`` set to the curriculum picker (department +
-         per-term semester filter) the student would register from.
+      1. Term is OPEN. The lookup always checks for an existing
+         Registration so the frontend can render the correct action
+         button after the student submits and returns to this page:
+           * Registration exists → 200 with
+             ``is_registered=true``, ``registration_status`` (one of
+             ``REGISTRATION_OPEN`` / ``PAYMENT_HOLD`` / ``REGISTERED``
+             / …), and ``courses`` = active registered courses.
+           * No Registration → 200 with ``is_registered=false`` and
+             ``courses`` = curriculum picker (department + per-term
+             semester filter).
       2. Term is CLOSED and has already started → 200 with the
          student's active (non-dropped) registered courses, plus
-         ``registration_id`` + ``registration_status``. **404** if the
-         student has no Registration for that term.
+         ``registration_id`` + ``registration_status``. **404** if
+         the student has no Registration for that term.
       3. Term is CLOSED and has not started yet → **409** "this term
          is not open yet".
 
