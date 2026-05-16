@@ -68,14 +68,18 @@ class AvailableCoursesRequest(BaseModel):
 class AvailableCoursesResponse(BaseModel):
     """
     200-only payload from ``POST /me/available-courses``. Two shapes,
-    based on the term state (errors are surfaced as 404 / 409 instead
-    of returned here):
+    keyed off whether a Registration exists for the (student, term)
+    pair (errors are surfaced as 404 / 409 instead of returned here):
 
-      * Term is OPEN → ``is_registered=False`` and ``courses`` is the
-        curriculum picker (department + per-term semester filter).
-      * Term is CLOSED and started → ``is_registered=True``,
-        ``registration_id`` + ``registration_status`` set, ``courses``
-        is the active (non-dropped) registered selection.
+      * Has a Registration → ``is_registered=True``,
+        ``registration_id`` + ``registration_status`` populated, and
+        ``courses`` is the active (non-dropped) registered selection.
+        Frontends drive the action button off ``registration_status``:
+        ``REGISTRATION_OPEN`` → still in draft, ``PAYMENT_HOLD`` →
+        prompt to pay, ``REGISTERED`` → show "Registered ✓", etc.
+      * No Registration (only reachable when the term is OPEN) →
+        ``is_registered=False`` and ``courses`` is the curriculum
+        picker the student will submit from.
     """
     term: AcademicTermResponse
     is_registered: bool

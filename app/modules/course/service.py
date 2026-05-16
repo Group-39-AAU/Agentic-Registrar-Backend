@@ -287,24 +287,27 @@ class RegistrationService:
         self, student_id: uuid.UUID, term_id: uuid.UUID,
     ) -> dict:
         """
-        Three-rule resolution keyed off the term's open flag and the
-        term's dates relative to today:
+        Three-rule resolution. The registration lookup runs in every
+        branch except Rule 3 — so a student who submitted in an open
+        window and refreshes the page sees their existing registration
+        + its ``status`` (REGISTRATION_OPEN / PAYMENT_HOLD / REGISTERED
+        / …) rather than being shown the picker again.
 
-          1. Term is OPEN → return the curriculum picker the student
-             would register from. The semester is computed via
-             :meth:`_semester_for_term` so the list matches *this
-             term's* expected semester, not just ``student.current_semester``.
-             When the computed semester is outside ``[1, 10]`` the
-             curriculum list is empty.
+          1. Term is OPEN.
+               * Has a Registration → return the registered courses
+                 with ``is_registered=true`` and ``registration_status``
+                 populated. Frontend uses ``registration_status`` to
+                 decide whether to render "Submit", "Pay now",
+                 "Registered ✓", etc.
+               * No Registration → return the curriculum picker the
+                 student will submit from.
 
           2. Term is CLOSED and has already started (``today >=
-             start_date``) → treat as past/in-progress. Look up the
-             student's Registration for the term:
-               * Found → return the active (non-dropped) registered
-                 courses.
-               * Not found → raise ``EntityNotFoundError`` for a
-                 Registration so the router surfaces "you didn't
-                 register for this term" as a 404.
+             start_date``) → must have a Registration.
+               * Found → return the registered courses.
+               * Not found → raise ``EntityNotFoundError`` so the
+                 router surfaces "you didn't register for this term"
+                 as a 404.
 
           3. Term is CLOSED and has not started yet (``today <
              start_date``) → raise :class:`TermNotYetOpenError` so
@@ -334,40 +337,11 @@ class RegistrationService:
 
         today = date.today()
 
-        # Rule 1 — open term: curriculum picker, per-term semester.
-        if term.is_open:
-            target_semester = await self._semester_for_term(student, term)
-            if target_semester is None or not (1 <= target_semester <= 10):
-                courses: list[Course] = []
-            else:
-                filters = [
-                    Course.semester == target_semester,
-                    Course.is_deleted == False,  # noqa: E712
-                ]
-                if student.department is not None:
-                    filters.append(Course.department == student.department)
-                courses = list(
-                    (
-                        await self.db.execute(
-                            select(Course)
-                            .where(*filters)
-                            .order_by(Course.code.asc())
-                        )
-                    ).scalars().all()
-                )
-            return {
-                "term": term,
-                "is_registered": False,
-                "registration_id": None,
-                "registration_status": None,
-                "courses": courses,
-            }
-
-        # Rule 3 — closed, future: not open yet.
-        if today < term.start_date:
+        # Rule 3 — closed and not yet started: surface "not open yet"
+        # before we touch registrations.
+        if not term.is_open and today < term.start_date:
             raise TermNotYetOpenError(term.term_name)
 
-        # Rule 2 — closed, past/in-progress: must have a registration.
         registration = (
             await self.db.execute(
                 select(Registration).where(
@@ -377,33 +351,68 @@ class RegistrationService:
                 )
             )
         ).scalar_one_or_none()
-        if registration is None:
+
+        # Registration exists → return its courses + status, regardless
+        # of whether the term is still open. This is what fixes the
+        # "Submit button still visible after submit" frontend bug.
+        if registration is not None:
+            rows = (
+                await self.db.execute(
+                    select(Course)
+                    .join(
+                        RegistrationCourse,
+                        RegistrationCourse.course_id == Course.id,
+                    )
+                    .where(
+                        RegistrationCourse.registration_id == registration.id,
+                        RegistrationCourse.is_dropped == False,  # noqa: E712
+                        Course.is_deleted == False,  # noqa: E712
+                    )
+                    .order_by(Course.code.asc())
+                )
+            ).scalars().all()
+            return {
+                "term": term,
+                "is_registered": True,
+                "registration_id": registration.id,
+                "registration_status": registration.status,
+                "courses": list(rows),
+            }
+
+        # No registration. If the window is closed (Rule 2 with no
+        # registration), 404. If it's still open (Rule 1, never
+        # submitted yet), return the curriculum picker.
+        if not term.is_open:
             raise EntityNotFoundError(
                 "Registration",
                 f"student={student.student_id}, term='{term.term_name}'",
             )
 
-        rows = (
-            await self.db.execute(
-                select(Course)
-                .join(
-                    RegistrationCourse,
-                    RegistrationCourse.course_id == Course.id,
-                )
-                .where(
-                    RegistrationCourse.registration_id == registration.id,
-                    RegistrationCourse.is_dropped == False,  # noqa: E712
-                    Course.is_deleted == False,  # noqa: E712
-                )
-                .order_by(Course.code.asc())
+        target_semester = await self._semester_for_term(student, term)
+        if target_semester is None or not (1 <= target_semester <= 10):
+            courses: list[Course] = []
+        else:
+            filters = [
+                Course.semester == target_semester,
+                Course.is_deleted == False,  # noqa: E712
+            ]
+            if student.department is not None:
+                filters.append(Course.department == student.department)
+            courses = list(
+                (
+                    await self.db.execute(
+                        select(Course)
+                        .where(*filters)
+                        .order_by(Course.code.asc())
+                    )
+                ).scalars().all()
             )
-        ).scalars().all()
         return {
             "term": term,
-            "is_registered": True,
-            "registration_id": registration.id,
-            "registration_status": registration.status,
-            "courses": list(rows),
+            "is_registered": False,
+            "registration_id": None,
+            "registration_status": None,
+            "courses": courses,
         }
 
     async def _semester_for_term(
