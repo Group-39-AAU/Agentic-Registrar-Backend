@@ -77,7 +77,7 @@ class FakeGenAIClient:
 def _make_llm(fake: FakeGenAIClient, **overrides: Any) -> LLMClient:
     return LLMClient(
         client=fake,
-        model=overrides.get("model", "gemini-2.0-flash"),
+        model=overrides.get("model", "gemini-2.5-flash-lite"),
         timeout_seconds=overrides.get("timeout_seconds", 5.0),
         max_tokens=overrides.get("max_tokens", 600),
     )
@@ -119,13 +119,13 @@ async def test_narrate_advisory_returns_text_on_success():
 
 async def test_request_uses_configured_model_and_token_cap():
     fake = FakeGenAIClient(return_value=_make_response("ok"))
-    llm = _make_llm(fake, model="gemini-2.0-flash", max_tokens=400)
+    llm = _make_llm(fake, model="gemini-2.5-flash-lite", max_tokens=400)
 
     await llm.narrate_advisory(_ADVICE, _STUDENT)
 
     kwargs = fake.last_kwargs
     assert kwargs is not None
-    assert kwargs["model"] == "gemini-2.0-flash"
+    assert kwargs["model"] == "gemini-2.5-flash-lite"
     assert kwargs["config"].max_output_tokens == 400
 
 

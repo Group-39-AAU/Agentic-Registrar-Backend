@@ -26,16 +26,17 @@ from datetime import date, datetime, time
 from typing import Optional
 
 from sqlalchemy import (
-    JSON, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer,
-    String, Text, Time, UniqueConstraint,
+    JSON, Boolean, CheckConstraint, Date, DateTime, Enum, Float, ForeignKey,
+    Integer, String, Text, Time, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteBase
 from app.shared.enums import (
-    AcademicPhase, AddDropAction, AddDropRequestStatus, EnrollmentStatus,
-    OfficerRole, RegistrationStatus, RiskStatus, ScheduleConflictStatus,
+    AcademicPhase, AddDropAction, AddDropBatchStatus, AddDropRequestStatus, ConsultationMode,
+    EnrollmentStatus, GradeLetter, GradeSubmissionStatus, OfficerRole,
+    RegistrationStatus, RiskStatus, ScheduleConflictStatus,
     ScheduleConflictType, SponsorshipType,
 )
 
@@ -276,6 +277,72 @@ class ClassScheduleSlot(Base):
         CheckConstraint(
             "end_time > start_time",
             name="ck_schedule_slot_end_after_start",
+        ),
+    )
+
+
+class StudentScheduleAddition(Base):
+    """
+    Per-student schedule delta for a course added via the add/drop
+    flow into a section *other than* the student's cohort.
+
+    The student's effective weekly schedule is computed as:
+
+        cohort_slots(registration.section)
+          MINUS slots whose course_id is in dropped_courses
+          PLUS  StudentScheduleAddition.schedule_slot rows
+
+    Cohort scheduling is untouched — these rows are pure deltas the
+    student picks via :class:`AcademicSchedulingAgent`'s option
+    proposer once the officer has approved the add/drop batch.
+
+    UniqueConstraint(registration_id, schedule_slot_id) prevents
+    duplicate additions for the same picked slot. The course-level
+    UniqueConstraint(registration_id, course_id) is intentionally
+    NOT enforced — a 3-credit course typically attaches as 3 slot
+    rows from the same section, all pointing to the same course.
+    """
+
+    __tablename__ = "student_schedule_additions"
+
+    registration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registrations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    schedule_slot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("class_schedule_slots.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalised so a query for "what courses has the student added
+    # via this delta?" doesn't need to fan out through the slot row.
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    # The Section the student picked from (different from the cohort
+    # section on Registration). Useful for the officer audit trail.
+    source_section_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sections.id"),
+        nullable=False,
+        index=True,
+    )
+
+    registration: Mapped["Registration"] = relationship(lazy="selectin")
+    schedule_slot: Mapped["ClassScheduleSlot"] = relationship(lazy="selectin")
+    course: Mapped["Course"] = relationship(lazy="selectin")
+    source_section: Mapped["Section"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "registration_id", "schedule_slot_id",
+            name="uq_student_addition_per_slot",
         ),
     )
 
@@ -648,21 +715,34 @@ class RegistrationStatusHistory(Base):
 
 class AddDropRequest(SoftDeleteBase):
     """
-    A student-initiated post-registration change request handled by
-    the EnrollmentAdjustmentAgent.
+    A single course-level item inside an :class:`AddDropBatch`.
+
+    Workflow (PENDING_AGENT → AGENT_APPROVED/DENIED → APPLIED/REJECTED)
+    lives on the parent batch. This row carries only the per-item
+    agent verdict (``status`` + ``reason``) so the officer queue can
+    show "CS201 — ADD — DENIED: prereq CS101 not satisfied" alongside
+    the batch-level decision.
 
     ``deadline_snapshot`` is captured at submit time so late-window
     rule changes do not retroactively break records (Track A
     implementation checklist invariant).
 
-    ``override_by_id`` and ``override_justification`` are populated
-    only when an officer overrides a DENIED request — for prerequisite
-    overrides the calling code MUST verify the officer's role is
-    ``DEPARTMENT_HEAD`` per SRS §3.5.
+    ``override_by_id`` / ``override_justification`` are populated on
+    a parent-batch officer override and copied here for read-side
+    convenience (so per-item rendering of the audit trail does not
+    require a join to the batch).
     """
 
     __tablename__ = "add_drop_requests"
 
+    # NULL only for legacy rows seeded before the batch model existed
+    # — every new item is written under a batch.
+    batch_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("add_drop_batches.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     registration_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("registrations.id"),
@@ -690,8 +770,80 @@ class AddDropRequest(SoftDeleteBase):
         Text, nullable=True
     )
 
+    batch: Mapped[Optional["AddDropBatch"]] = relationship(
+        back_populates="items", lazy="selectin",
+    )
     registration: Mapped["Registration"] = relationship(lazy="selectin")
     course: Mapped["Course"] = relationship(lazy="selectin")
+
+
+class AddDropBatch(SoftDeleteBase):
+    """
+    A student-submitted batch of add/drop changes evaluated as one
+    transaction. Lifecycle:
+
+        PENDING_AGENT
+          → AGENT_APPROVED → APPLIED            (officer approves)
+                          → REJECTED            (officer rejects despite agent OK)
+          → AGENT_DENIED  → APPLIED             (officer overrides; needs justification)
+                          → REJECTED            (officer finalises the denial)
+          → CANCELLED                           (student withdraws before officer)
+
+    All items inside one batch share a fate: APPLIED means every
+    AddDropRequest row was materialised against the registration,
+    REJECTED means none were.
+
+    ``agent_reasons`` mirrors the per-item agent verdict in a single
+    JSON payload so an officer reviewing the queue does not need to
+    fan out to the items table for "why was this denied?".
+    """
+
+    __tablename__ = "add_drop_batches"
+
+    registration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registrations.id"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalised from Registration.student_id so the officer queue
+    # query (`pending batches for any student`) doesn't need a join.
+    student_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("students.id"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[AddDropBatchStatus] = mapped_column(
+        nullable=False,
+        default=AddDropBatchStatus.PENDING_AGENT,
+        index=True,
+    )
+    # Per-item structured agent verdict. Shape:
+    #   [{"course_id": str, "course_code": str, "action": str,
+    #     "passed": bool, "reasons": [str], "details": {...}}, ...]
+    agent_reasons: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list,
+    )
+    # Officer decision audit trail.
+    officer_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True,
+    )
+    officer_decision_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    officer_justification: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
+
+    items: Mapped[list["AddDropRequest"]] = relationship(
+        back_populates="batch",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="AddDropRequest.created_at.asc()",
+    )
+    registration: Mapped["Registration"] = relationship(lazy="selectin")
+    student: Mapped["Student"] = relationship(lazy="selectin")
 
 
 # ── Track A — Advisory ───────────────────────────────────────────
@@ -738,6 +890,28 @@ class AdvisoryRecommendation(Base):
     )
     gap_analysis: Mapped[dict] = mapped_column(
         JSON, nullable=False, default=dict
+    )
+
+    # Demand-driven consultation discriminator. NULL = legacy submit-time
+    # rule-based evaluation (the AcademicAdvisoryAgent.process_task path).
+    # Non-NULL = LLM-backed consultation initiated by the student through
+    # the /advisory/consult/* endpoints, where the value identifies which
+    # of the three modes was invoked.
+    consultation_mode: Mapped[Optional[ConsultationMode]] = mapped_column(
+        nullable=True, index=True,
+    )
+    # LLM-produced graduation-trajectory analysis. NULL on legacy rows.
+    # Shape (informational, not enforced at the column level):
+    #   {
+    #     "semesters_remaining": int,
+    #     "on_track": bool,
+    #     "expected_graduation_semester": int,
+    #     "delay_semesters": int,            # 0 if on track
+    #     "critical_path_courses": [str],    # course codes
+    #     "warnings": [str],
+    #   }
+    graduation_impact: Mapped[Optional[dict]] = mapped_column(
+        JSON, nullable=True,
     )
 
     # Officer-review fields (HITL escalation gate for HIGH risk).
@@ -868,4 +1042,128 @@ class ScheduleConflict(Base):
     )
     other_section: Mapped[Optional["Section"]] = relationship(
         foreign_keys=[other_section_id], lazy="selectin",
+    )
+
+
+# ── Track B precursor — Grade ledger ─────────────────────────────
+
+
+class Grade(SoftDeleteBase):
+    """
+    Per-student per-course per-term grade record.
+
+    Lives in Track A so the Academic Advisory Agent can resolve a
+    student's CGPA + completed-course set server-side without
+    asking the caller to provide them. Shape is Track-B-aligned so
+    the grading lifecycle can extend rather than replace it:
+
+      - ``status`` advances DRAFT → SUBMITTED → FLAGGED → AUTHORISED
+        → REJECTED (SDS Table 60 lifecycle). Only AUTHORISED grades
+        count toward CGPA.
+      - ``letter_grade`` is nullable until SUBMITTED so an instructor
+        can save partial drafts.
+      - ``numeric_score`` is the underlying 0–100 score; the letter
+        grade is the official outcome but the score is preserved for
+        anomaly detection (AssessmentValidationAgent).
+      - ``credit_hours`` is snapshotted from the Course at submission
+        time so curriculum credit-hour edits do not retroactively
+        change a past CGPA.
+      - ``grade_points`` caches ``credit_hours × points(letter_grade)``
+        so CGPA computation is a SUM/SUM in one query.
+
+    UniqueConstraint(student_id, course_id, term_id) prevents two
+    grades for the same (student, course, term) — re-grading lands
+    via a status transition (REJECTED → DRAFT → ...), not a new row.
+    """
+
+    __tablename__ = "grades"
+
+    student_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("students.id"),
+        nullable=False,
+        index=True,
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("academic_terms.id"),
+        nullable=False,
+        index=True,
+    )
+    section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sections.id"),
+        nullable=True,
+        index=True,
+    )
+
+    # GradeLetter member NAMES diverge from VALUES (e.g. ``A_MINUS`` →
+    # ``"A-"``), and SQLAlchemy's default enum binding uses ``.name``
+    # which would mismatch the Postgres enum literals from the
+    # migration ("A", "A-", "B+", ...). ``values_callable`` forces the
+    # bind to use ``.value`` so the canonical letter goes to the DB.
+    letter_grade: Mapped[Optional[GradeLetter]] = mapped_column(
+        Enum(
+            GradeLetter,
+            name="gradeletter",
+            values_callable=lambda enum_cls: [m.value for m in enum_cls],
+            create_type=False,
+        ),
+        nullable=True,
+    )
+    numeric_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+    )
+    credit_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    grade_points: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+    )
+
+    status: Mapped[GradeSubmissionStatus] = mapped_column(
+        nullable=False,
+        default=GradeSubmissionStatus.DRAFT,
+        index=True,
+    )
+
+    # Submission trail. ``entered_by_id`` is the instructor User row;
+    # ``authorised_by_id`` is the officer who flipped the grade to
+    # AUTHORISED (SRS Course-FR-09). Both nullable until the
+    # corresponding lifecycle transition fires.
+    entered_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True,
+    )
+    entered_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    authorised_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True,
+    )
+    authorised_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    student: Mapped["Student"] = relationship(lazy="selectin")
+    course: Mapped["Course"] = relationship(lazy="selectin")
+    term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "student_id", "course_id", "term_id",
+            name="uq_grade_per_student_course_term",
+        ),
+        CheckConstraint(
+            "numeric_score IS NULL OR "
+            "(numeric_score >= 0 AND numeric_score <= 100)",
+            name="ck_grade_score_range",
+        ),
+        CheckConstraint(
+            "credit_hours BETWEEN 1 AND 12",
+            name="ck_grade_credit_hours_range",
+        ),
     )

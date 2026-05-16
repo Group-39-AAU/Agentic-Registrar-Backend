@@ -14,9 +14,11 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.course.grade_points import counts_toward_cgpa, is_passing
 from app.modules.course.models import (
-    AcademicTerm, Course, Registration, RegistrationCourse, Student,
+    AcademicTerm, Course, Grade, Registration, RegistrationCourse, Student,
 )
+from app.shared.enums import GradeSubmissionStatus, RegistrationStatus
 
 
 class AcademicTermRepository:
@@ -43,6 +45,22 @@ class AcademicTermRepository:
             stmt = stmt.where(AcademicTerm.is_open == is_open)
         stmt = stmt.order_by(AcademicTerm.start_date.asc())
         return list((await self.db.execute(stmt)).scalars().all())
+
+    async def get_open(self) -> Optional[AcademicTerm]:
+        """
+        The currently-open term. Phase-1 invariant: at most one term
+        can be open at a time (officer flips ``is_open`` exclusively
+        through TermService.open_window). Returns the most recently
+        opened one as a tiebreaker for any drift.
+        """
+        return (
+            await self.db.execute(
+                select(AcademicTerm).where(
+                    AcademicTerm.is_open == True,  # noqa: E712
+                    AcademicTerm.is_deleted == False,  # noqa: E712
+                ).order_by(AcademicTerm.start_date.desc())
+            )
+        ).scalars().first()
 
 
 class CourseRepository:
@@ -149,6 +167,55 @@ class RegistrationRepository:
             )
         ).scalar_one_or_none()
 
+    async def get_active_for_student_in_term(
+        self, student_id: uuid.UUID, term_id: uuid.UUID,
+    ) -> Optional[Registration]:
+        """
+        The student's REGISTERED or ADD_DROP_WINDOW registration for
+        the given term — i.e. the one the add/drop consult should
+        reason against. Returns None if the student has not yet
+        finalised registration for this term.
+        """
+        return (
+            await self.db.execute(
+                select(Registration).where(
+                    Registration.student_id == student_id,
+                    Registration.term_id == term_id,
+                    Registration.status.in_([
+                        RegistrationStatus.REGISTERED,
+                        RegistrationStatus.ADD_DROP_WINDOW,
+                    ]),
+                    Registration.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def get_draft_for_student_in_term(
+        self, student_id: uuid.UUID, term_id: uuid.UUID,
+    ) -> Optional[Registration]:
+        """
+        The student's in-progress draft registration for the term —
+        anything that is not yet finalised (REGISTERED, ADD_DROP_WINDOW)
+        and is not CANCELLED. Used by the registration-plan consult
+        endpoint to read the proposed course list without asking the
+        caller for it.
+        """
+        non_draft = {
+            RegistrationStatus.REGISTERED,
+            RegistrationStatus.ADD_DROP_WINDOW,
+            RegistrationStatus.CANCELLED,
+        }
+        return (
+            await self.db.execute(
+                select(Registration).where(
+                    Registration.student_id == student_id,
+                    Registration.term_id == term_id,
+                    Registration.status.notin_(non_draft),
+                    Registration.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+
 
 class AddDropRequestRepository:
     def __init__(self, db: AsyncSession) -> None:
@@ -226,3 +293,82 @@ class AdvisoryRecommendationRepository:
                 )
             ).scalars().all()
         )
+
+
+class GradeRepository:
+    """
+    Async helpers over the Track-B-aligned ``grades`` ledger. The
+    advisory consult flow uses this to resolve a student's CGPA and
+    completed-course set without asking the caller — Track B's grade
+    entry pipeline will later be the writer.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def list_authorised_for_student(
+        self, student_id: uuid.UUID,
+    ) -> list[Grade]:
+        """
+        All AUTHORISED grades for a student. Excludes drafts /
+        flagged / submitted / rejected because only authorised
+        grades count toward CGPA per SRS Course-FR-09.
+        """
+        return list(
+            (
+                await self.db.execute(
+                    select(Grade).where(
+                        Grade.student_id == student_id,
+                        Grade.status == GradeSubmissionStatus.AUTHORISED,
+                        Grade.is_deleted == False,  # noqa: E712
+                    )
+                )
+            ).scalars().all()
+        )
+
+    async def completed_course_ids(
+        self, student_id: uuid.UUID,
+    ) -> set[uuid.UUID]:
+        """
+        Course IDs the student has passed (any AUTHORISED grade
+        whose letter is at or above D). F, I, NG do not count.
+        """
+        grades = await self.list_authorised_for_student(student_id)
+        return {g.course_id for g in grades if is_passing(g.letter_grade)}
+
+    async def compute_cgpa(
+        self, student_id: uuid.UUID,
+    ) -> Optional[float]:
+        """
+        Credit-weighted CGPA over every AUTHORISED grade whose
+        letter has a 4.0-scale point value (F counts as 0.0; I and
+        NG are excluded — they route through the AcademicStandingAgent
+        edge-case path per SDS Table 75).
+
+        Returns ``None`` when the student has no CGPA-eligible
+        grades yet (e.g. a fresh first-semester student). Callers
+        should treat None as "no academic history" rather than
+        substituting 0.0, which would falsely trigger the HIGH-risk
+        Warning threshold.
+        """
+        grades = await self.list_authorised_for_student(student_id)
+        eligible = [g for g in grades if counts_toward_cgpa(g.letter_grade)]
+        if not eligible:
+            return None
+
+        total_points = 0.0
+        total_credits = 0
+        for g in eligible:
+            # Prefer the cached grade_points if the writer set it;
+            # otherwise compute on the fly so legacy rows still work.
+            from app.modules.course.grade_points import points_for
+            pts = (
+                g.grade_points
+                if g.grade_points is not None
+                else (points_for(g.letter_grade) or 0.0) * g.credit_hours
+            )
+            total_points += pts
+            total_credits += g.credit_hours
+        if total_credits == 0:
+            return None
+        return round(total_points / total_credits, 2)

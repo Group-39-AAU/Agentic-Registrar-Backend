@@ -19,7 +19,9 @@ from app.modules.course.models import (
     AcademicTerm, Course, CourseManagementOfficer,
     Instructor, Section, Student,
 )
-from app.shared.enums import EnrollmentStatus, OfficerRole, UserRole
+from app.shared.enums import (
+    AcademicPhase, EnrollmentStatus, OfficerRole, UserRole,
+)
 
 
 def _new_user(role: UserRole = UserRole.STUDENT, *, email_slug: str) -> User:
@@ -37,11 +39,13 @@ def _new_user(role: UserRole = UserRole.STUDENT, *, email_slug: str) -> User:
 
 @pytest_asyncio.fixture
 async def seeded_term(async_session) -> AcademicTerm:
+    # phase=ONE matches Sep–Jan window (rebased main added the column).
     term = AcademicTerm(
-        term_name="Fall 2026",
+        term_name="2026/2027",
         start_date=date(2026, 9, 1),
         end_date=date(2027, 1, 31),
         is_open=True,
+        phase=AcademicPhase.ONE,
     )
     async_session.add(term)
     await async_session.flush()

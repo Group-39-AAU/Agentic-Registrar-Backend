@@ -19,7 +19,7 @@ from app.modules.course.models import (
 async def test_term_round_trip(async_session, seeded_term):
     fetched = (
         await async_session.execute(
-            select(AcademicTerm).where(AcademicTerm.term_name == "Fall 2026")
+            select(AcademicTerm).where(AcademicTerm.term_name == "2026/2027")
         )
     ).scalar_one()
     assert fetched.id == seeded_term.id
@@ -103,7 +103,7 @@ async def test_instructor_assignment_round_trip(
     ).scalar_one()
     assert fetched.instructor.instructor_id == "STAFF/0001/10"
     assert fetched.course.code == "CS101"
-    assert fetched.term.term_name == "Fall 2026"
+    assert fetched.term.term_name == "2026/2027"
 
 
 async def test_student_round_trip(async_session, seeded_student):

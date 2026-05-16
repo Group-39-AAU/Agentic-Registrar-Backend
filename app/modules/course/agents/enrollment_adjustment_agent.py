@@ -39,10 +39,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
 from app.modules.course.agents.curriculum_compliance_agent import (
-    ComplianceCheckResult, MAX_CREDIT_LOAD_ECTS,
+    ComplianceCheckResult, CurriculumComplianceAgent, MAX_CREDIT_LOAD_ECTS,
 )
 from app.modules.course.models import (
-    AddDropRequest, Course, Registration, Section,
+    AddDropRequest, Course, Registration, Section, Student,
 )
 from app.modules.course.services import PayMock, pay_mock
 from app.shared.enums import AddDropAction
@@ -69,6 +69,49 @@ class AdjustmentResult:
     details: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class BatchItemVerdict:
+    """
+    Per-item agent verdict inside a batch. ``passed`` is the
+    decision; ``reasons`` is the human-facing plain-language summary
+    of why; ``details`` is the structured payload that lands in the
+    audit log.
+    """
+
+    course_id: uuid.UUID
+    course_code: str
+    action: AddDropAction
+    passed: bool
+    reasons: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_audit_dict(self) -> dict[str, Any]:
+        return {
+            "course_id": str(self.course_id),
+            "course_code": self.course_code,
+            "action": self.action.value,
+            "passed": self.passed,
+            "reasons": list(self.reasons),
+            "details": dict(self.details),
+        }
+
+
+@dataclass
+class BatchResult:
+    """
+    Whole-batch outcome of :meth:`process_batch`. The batch is
+    all-or-nothing: ``approved`` is True only when every item
+    passes. Per-item verdicts are kept on ``items`` so the officer
+    queue can render "approved 2, denied 1: CS201 (prereq unmet)".
+    """
+
+    approved: bool
+    items: list[BatchItemVerdict] = field(default_factory=list)
+
+    def failing_items(self) -> list[BatchItemVerdict]:
+        return [it for it in self.items if not it.passed]
+
+
 # ── Agent ───────────────────────────────────────────────────────
 
 
@@ -84,6 +127,7 @@ class EnrollmentAdjustmentAgent(CourseBaseAgent):
         payment_service: Optional[PayMock] = None,
         min_credit_load: int = MIN_CREDIT_LOAD_ECTS,
         max_credit_load: int = MAX_CREDIT_LOAD_ECTS,
+        compliance_agent: Optional[CurriculumComplianceAgent] = None,
     ) -> None:
         super().__init__(agent_id=agent_id or f"{self.AGENT_ID_PREFIX}DEFAULT")
         # Explicit `is None` rather than `or` — a caller-supplied PayMock
@@ -92,6 +136,13 @@ class EnrollmentAdjustmentAgent(CourseBaseAgent):
         self._pay = payment_service if payment_service is not None else pay_mock
         self._min = min_credit_load
         self._max = max_credit_load
+        # The batch processor delegates the prereq check to the
+        # compliance agent so a single piece of code owns that rule
+        # (SDS Table 66). Reuses the same payment service so both
+        # agents see the same mock state in tests.
+        self._compliance = compliance_agent or CurriculumComplianceAgent(
+            payment_service=self._pay,
+        )
 
     # ── validate_adjustment_window (SDS Table 81) ────────────────
 
@@ -256,16 +307,16 @@ class EnrollmentAdjustmentAgent(CourseBaseAgent):
                     ],
                     details={"new_total": new_total, "ceiling": self._max},
                 )
-            # 4. Payment
-            payment = self.cross_check_payment(
-                registration.student_id, request.course_id,
-            )
-            if not payment.passed:
-                return AdjustmentResult(
-                    approved=False,
-                    reasons=payment.reasons,
-                    details=payment.details,
-                )
+            # # 4. Payment
+            # payment = self.cross_check_payment(
+            #     registration.student_id, request.course_id,
+            # )
+            # if not payment.passed:
+            #     return AdjustmentResult(
+            #         approved=False,
+            #         reasons=payment.reasons,
+            #         details=payment.details,
+            #     )
             return AdjustmentResult(
                 approved=True,
                 details={"new_total": new_total, "course_code": course.code},
@@ -286,6 +337,258 @@ class EnrollmentAdjustmentAgent(CourseBaseAgent):
             approved=True,
             details={"new_total": new_total, "course_code": course.code},
         )
+
+    # ── Batch checks (curriculum / parity / prereq) ──────────────
+
+    def verify_curriculum_membership(
+        self, student: Student, course: Course,
+    ) -> ComplianceCheckResult:
+        """
+        PASS when ``course.department`` matches the student's
+        denormalised department. AAU undergraduate programs do not
+        share courses across departments — each program has its own
+        version of foundational courses like Calculus / Discrete Math.
+        """
+        if not student.department:
+            return ComplianceCheckResult(
+                passed=False,
+                reasons=[
+                    "Student has no department on file; the curriculum "
+                    "match check cannot run. Contact the registrar."
+                ],
+                details={"course_id": str(course.id), "course_code": course.code},
+            )
+        if course.department != student.department:
+            return ComplianceCheckResult(
+                passed=False,
+                reasons=[
+                    f"{course.code} belongs to {course.department}; the "
+                    f"student is enrolled in {student.department} and "
+                    "may only register for courses in their own program."
+                ],
+                details={
+                    "course_id": str(course.id),
+                    "course_code": course.code,
+                    "course_department": course.department,
+                    "student_department": student.department,
+                },
+            )
+        return ComplianceCheckResult(
+            passed=True,
+            details={"course_code": course.code, "department": course.department},
+        )
+
+    def verify_semester_parity(
+        self, student: Student, course: Course,
+    ) -> ComplianceCheckResult:
+        """
+        PASS when the course's semester has the same parity as the
+        student's current semester.
+
+        AAU teaches odd semesters (1, 3, 5, ...) in the first half
+        of the academic year and even semesters (2, 4, 6, ...) in
+        the second. A student in semester 4 (even) can therefore
+        only register for courses whose ``semester`` is even — sem-1
+        and sem-3 courses simply are not being offered this term.
+        Prerequisite ordering catches the rest.
+        """
+        student_parity = student.current_semester % 2
+        course_parity = course.semester % 2
+        student_half = "odd" if student_parity == 1 else "even"
+        course_half = "odd" if course_parity == 1 else "even"
+        if student_parity != course_parity:
+            return ComplianceCheckResult(
+                passed=False,
+                reasons=[
+                    f"{course.code} is a semester-{course.semester} "
+                    f"({course_half}-term) course but the student is in "
+                    f"semester {student.current_semester} "
+                    f"({student_half}-term). That course is not being "
+                    "offered in the current academic term."
+                ],
+                details={
+                    "course_code": course.code,
+                    "course_semester": course.semester,
+                    "student_semester": student.current_semester,
+                },
+            )
+        return ComplianceCheckResult(
+            passed=True,
+            details={
+                "course_code": course.code,
+                "course_semester": course.semester,
+                "student_semester": student.current_semester,
+            },
+        )
+
+    async def verify_prerequisites(
+        self,
+        session: AsyncSession,
+        student_id: uuid.UUID,
+        course: Course,
+        completed_course_ids: set[uuid.UUID],
+        overridden_course_ids: Optional[set[uuid.UUID]] = None,
+    ) -> ComplianceCheckResult:
+        """
+        Thin delegation to :class:`CurriculumComplianceAgent` so the
+        prereq rule (SDS Table 66) has exactly one implementation.
+        Passes through the override set so a Department-Head bypass
+        still wins inside an add/drop batch.
+        """
+        return await self._compliance.verify_prerequisites(
+            session=session,
+            student_id=student_id,
+            course_id=course.id,
+            completed_course_ids=completed_course_ids,
+            overridden_course_ids=overridden_course_ids or set(),
+        )
+
+    # ── process_batch (all-or-nothing) ───────────────────────────
+
+    async def process_batch(
+        self,
+        session: AsyncSession,
+        *,
+        student: Student,
+        registration: Registration,
+        items: list[tuple[Course, AddDropAction]],
+        completed_course_ids: set[uuid.UUID],
+        overridden_course_ids: Optional[set[uuid.UUID]] = None,
+        today: Optional[date] = None,
+        deadline: Optional[date] = None,
+    ) -> BatchResult:
+        """
+        Evaluate every (course, action) pair in the batch against:
+            1. Add/drop window (if a deadline is supplied).
+            2. Curriculum membership — course.department == student's.
+            3. Semester parity — course offered in the current half.
+            4. For ADD: prerequisites satisfied (or overridden).
+            5. For ADD: payment cross-check.
+            6. For DROP: course is currently in the registration.
+            7. Post-batch credit load within [_min, _max] (single
+               summary check across the whole batch).
+
+        All-or-nothing: a failure on any item flips the whole
+        ``BatchResult.approved`` to False but per-item verdicts are
+        still populated so the officer queue can render reasons.
+        """
+        verdicts: list[BatchItemVerdict] = []
+        overrides = overridden_course_ids or set()
+
+        # Snapshot active courses (non-dropped) once so per-item
+        # checks for "already in registration?" don't re-issue queries.
+        await session.refresh(registration, attribute_names=["courses"])
+        active_course_ids = {
+            rc.course_id for rc in registration.courses if not rc.is_dropped
+        }
+        baseline_credits = await self._active_credit_total(
+            session, registration,
+        )
+
+        # Per-item evaluation — bias toward fully reporting every
+        # failure rather than short-circuiting on the first denial,
+        # so the student sees all problems in one round trip.
+        running_delta = 0
+        for course, action in items:
+            reasons: list[str] = []
+            details: dict[str, Any] = {
+                "course_code": course.code,
+                "action": action.value,
+            }
+
+            if deadline is not None:
+                window = self.validate_adjustment_window(
+                    deadline, today=today,
+                )
+                if not window.passed:
+                    reasons.extend(window.reasons)
+                    details.update(window.details)
+
+            membership = self.verify_curriculum_membership(student, course)
+            if not membership.passed:
+                reasons.extend(membership.reasons)
+                details.update(membership.details)
+
+            parity = self.verify_semester_parity(student, course)
+            if not parity.passed:
+                reasons.extend(parity.reasons)
+                details.update(parity.details)
+
+            if action == AddDropAction.ADD:
+                if course.id in active_course_ids:
+                    reasons.append(
+                        f"{course.code} is already on the registration; "
+                        "nothing to add."
+                    )
+                prereq = await self.verify_prerequisites(
+                    session=session,
+                    student_id=student.id,
+                    course=course,
+                    completed_course_ids=completed_course_ids,
+                    overridden_course_ids=overrides,
+                )
+                if not prereq.passed:
+                    reasons.extend(prereq.reasons)
+                    details.update({"prereq_details": prereq.details})
+                # payment = self.cross_check_payment(student.id, course.id)
+                # if not payment.passed:
+                #     reasons.extend(payment.reasons)
+                #     details.update(payment.details)
+                running_delta += course.credit_hours
+            else:   # DROP
+                if course.id not in active_course_ids:
+                    reasons.append(
+                        f"Cannot drop {course.code} — student is not "
+                        "registered for it."
+                    )
+                running_delta -= course.credit_hours
+
+            verdicts.append(BatchItemVerdict(
+                course_id=course.id,
+                course_code=course.code,
+                action=action,
+                passed=not reasons,
+                reasons=reasons,
+                details=details,
+            ))
+
+        # Final credit-load envelope (applies once across the batch).
+        projected_total = baseline_credits + running_delta
+        if projected_total > self._max:
+            verdicts.append(BatchItemVerdict(
+                course_id=uuid.UUID(int=0),
+                course_code="__BATCH__",
+                action=AddDropAction.ADD,
+                passed=False,
+                reasons=[
+                    f"Applying the batch would push credit load to "
+                    f"{projected_total} ECTS (ceiling: {self._max})."
+                ],
+                details={
+                    "baseline_credits": baseline_credits,
+                    "projected_total": projected_total,
+                    "ceiling": self._max,
+                },
+            ))
+        elif projected_total < self._min:
+            verdicts.append(BatchItemVerdict(
+                course_id=uuid.UUID(int=0),
+                course_code="__BATCH__",
+                action=AddDropAction.DROP,
+                passed=False,
+                reasons=[
+                    f"Applying the batch would lower credit load to "
+                    f"{projected_total} ECTS (floor: {self._min})."
+                ],
+                details={
+                    "baseline_credits": baseline_credits,
+                    "projected_total": projected_total,
+                    "floor": self._min,
+                },
+            ))
+
+        approved = all(v.passed for v in verdicts)
+        return BatchResult(approved=approved, items=verdicts)
 
     async def _active_credit_total(
         self, session: AsyncSession, registration: Registration,

@@ -4,17 +4,19 @@ from __future__ import annotations
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.llm_client import LLMUnavailableError
 from app.core.dependencies import get_current_user, get_email_service
 from app.database.session import get_db
 from app.modules.auth.models import User
-from app.modules.course.models import ClassScheduleSlot, Instructor
+from app.modules.course.models import (
+    AdvisoryRecommendation, ClassScheduleSlot, Instructor,
+)
 from app.modules.programs.models import AcademicProgram
 from app.modules.course.exceptions import (
-    AdjustmentDeniedError,
     ComplianceCheckFailedError,
     DuplicateRegistrationError,
     EntityNotFoundError,
@@ -28,12 +30,16 @@ from app.modules.course.exceptions import (
 from app.modules.course.repository import StudentRepository
 from app.modules.course.schemas import (
     AcademicTermResponse,
-    AddDropOverrideRequest,
-    AddDropRequestCreate,
+    AddDropBatchCreate,
+    AddDropBatchResponse,
     AddDropRequestResponse,
+    AdvisoryConsultAddDropRequest,
+    AdvisoryConsultResponse,
     AdvisoryEvaluateRequest,
     AdvisoryRecommendationRead,
     AdvisoryReviewCloseRequest,
+    ConsultationRecommendedCourse,
+    GraduationImpactRead,
     AssignInstructorToSlotRequest,
     AvailableCoursesRequest,
     AvailableCoursesResponse,
@@ -45,6 +51,10 @@ from app.modules.course.schemas import (
     InstructorCreateRequest,
     InstructorResponse,
     InstructorScheduleEntry,
+    OfficerJustificationRequest,
+    ScheduleAcceptRequest,
+    ScheduleAcceptResponse,
+    ScheduleOptionsResponse,
     RegistrationInvoiceResponse,
     RegistrationResponse,
     RegistrationSubmitResponse,
@@ -68,7 +78,7 @@ from app.modules.course.service import (
     RegistrationService, SchedulingService, TermService,
 )
 from app.shared.email.service import EmailService
-from app.shared.enums import UserRole
+from app.shared.enums import AddDropBatchStatus, UserRole
 
 
 router = APIRouter(prefix="/courses", tags=["Course Management"])
@@ -304,11 +314,18 @@ async def get_registration(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Read view of the calling student's own registration. Useful for
-    showing the current status (REGISTRATION_OPEN / PAYMENT_HOLD /
-    REGISTERED / ADD_DROP_WINDOW), the course list, and the
-    finalised_at timestamp after the bursar / cost-sharing flow has
-    cleared.
+    Read view of the calling student's own registration — the spine
+    of the "this semester" portal view.
+
+    Returns:
+      * core fields (status, sponsorship_type, finalised_at, …)
+      * ``term_name`` so the caller does not need a separate term
+        lookup
+      * ``courses`` enriched with each ``course`` row inline (code,
+        title, credit_hours, semester, department) so the portal can
+        render the registration without a second curriculum call
+      * computed aggregates: ``active_courses`` (subset that excludes
+        dropped rows), ``active_credit_total``, ``active_course_count``
 
     For writes, students should use the unified
     ``POST /me/register`` — the previous granular endpoints
@@ -320,7 +337,19 @@ async def get_registration(
     registration = await svc.registrations.get(registration_id)
     if registration is None or registration.student_id != student.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Registration not found.")
-    return registration
+    # ``term`` is selectin-loaded on the model relationship, so this
+    # does not fire an extra query. Build the response off the ORM
+    # row, then patch ``term_name`` (Pydantic's from_attributes can't
+    # reach term.term_name through a relationship without a custom
+    # adapter).
+    response = RegistrationResponse.model_validate(
+        registration, from_attributes=True,
+    )
+    if registration.term is not None:
+        response = response.model_copy(
+            update={"term_name": registration.term.term_name},
+        )
+    return response
 
 
 # ── Scheduling endpoints ─────────────────────────────────────────
@@ -526,6 +555,85 @@ async def get_my_schedule(
     return await svc.get_student_schedule(student.id, term_id)
 
 
+# ── Per-student schedule deltas (post-add/drop section choice) ──
+#
+# The add/drop apply path automatically removes dropped courses
+# from the schedule (cohort slots are filtered out at read time;
+# any per-student additions for the dropped course are deleted).
+# Added courses, however, may be offered in multiple sections and
+# the student needs to pick one — these endpoints walk that flow:
+#
+#   GET  /me/schedule/options-for/{course_id}
+#        AcademicSchedulingAgent.propose_options_for_course →
+#        every Section that offers the course, each with a
+#        conflict flag against the student's current schedule.
+#
+#   POST /me/schedule/accept-for/{course_id}
+#        Materialises the chosen section's slots as
+#        StudentScheduleAddition rows. Re-checks conflicts so a
+#        stale client cannot bypass.
+
+
+@router.get(
+    "/me/schedule/options-for/{course_id}",
+    response_model=ScheduleOptionsResponse,
+    summary="Section options for an added course (with conflict flags)",
+)
+async def get_schedule_options_for_course(
+    course_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    For an active course on the calling student's registration,
+    list every section that runs it. Each option carries the
+    candidate slot package and a ``conflicts`` list (empty when
+    ``is_viable=true``) describing any collisions with the
+    student's current effective schedule.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = SchedulingService(db)
+    try:
+        return await svc.propose_options_for_added_course(
+            student_id=student.id, course_id=course_id,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.post(
+    "/me/schedule/accept-for/{course_id}",
+    response_model=ScheduleAcceptResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Pick a section for an added course; integrate into schedule",
+)
+async def accept_section_for_added_course(
+    course_id: uuid.UUID,
+    payload: ScheduleAcceptRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Apply the student's chosen section: writes one
+    ``StudentScheduleAddition`` row per slot the section runs for
+    this course. Idempotent on retry. Returns 409 when the chosen
+    section would conflict with the current schedule (must pick a
+    section flagged ``is_viable=true`` from the options endpoint).
+    """
+    student = await _resolve_student(db, current_user)
+    svc = SchedulingService(db)
+    try:
+        return await svc.accept_section_for_added_course(
+            student_id=student.id,
+            course_id=course_id,
+            section_id=payload.section_id,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+
+
 @router.get(
     "/students/{student_id}/schedule",
     response_model=SectionScheduleResponse,
@@ -613,23 +721,47 @@ async def get_instructor_schedule(
 
 
 # ── Add/Drop endpoints ───────────────────────────────────────────
+#
+# The student submits one batch carrying multiple (course, action)
+# items. The EnrollmentAdjustmentAgent reviews the batch as a whole
+# (curriculum, semester parity, prereqs, credit envelope, payment)
+# and stamps an AGENT_APPROVED or AGENT_DENIED verdict on the batch
+# row. Nothing is applied at this point — the batch then awaits an
+# officer decision.
+#
+# Officer endpoints:
+#   GET  /officer/add-drop/batches            — queue (AGENT_*)
+#   POST /officer/add-drop/batches/{id}/approve   — approve agent-approved batch
+#   POST /officer/add-drop/batches/{id}/override  — override agent-denied batch
+#   POST /officer/add-drop/batches/{id}/reject    — finalise denial
 
 
 @router.post(
-    "/add-drop/requests",
-    response_model=AddDropRequestResponse,
+    "/add-drop/batches",
+    response_model=AddDropBatchResponse,
     status_code=status.HTTP_201_CREATED,
 )
-async def submit_add_drop_request(
-    payload: AddDropRequestCreate,
+async def submit_add_drop_batch(
+    payload: AddDropBatchCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     email_service: EmailService = Depends(get_email_service),
 ):
-    student = await _resolve_student(db, current_user)
+    """
+    Student-facing batch submission. Carries one or more
+    (course_id, action) items. The agent reviews against:
+      - curriculum membership (course.department == student.department)
+      - semester parity (course offered this half of the year)
+      - prerequisites (via CurriculumComplianceAgent + Grade ledger)
+      - credit-load envelope (12–22 ECTS across the batch)
+      - per-item payment cross-check for ADD
 
-    # Confirm the registration belongs to the calling student.
+    The batch lands in AGENT_APPROVED or AGENT_DENIED and waits for
+    an officer; no changes are applied to the registration yet.
+    """
+    student = await _resolve_student(db, current_user)
     svc = AddDropService(db, email_service=email_service)
+
     registration = await svc.registrations.get(payload.registration_id)
     if registration is None or registration.student_id != student.id:
         raise HTTPException(
@@ -637,89 +769,180 @@ async def submit_add_drop_request(
         )
 
     try:
-        request = await svc.submit_request(
+        return await svc.submit_batch(
             registration_id=payload.registration_id,
-            course_id=payload.course_id,
-            action=payload.action,
-            deadline=payload.deadline,
+            items=[(it.course_id, it.action) for it in payload.items],
             student_user_id=current_user.id,
-        )
-    except AdjustmentDeniedError as exc:
-        # 422 carries the agent verdict so the portal can show
-        # plain-language reasons against the failed request.
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"compliance": exc.payload},
+            deadline=payload.deadline,
         )
     except InvalidAdjustmentRequestError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    return request
 
 
 @router.get(
-    "/add-drop/requests/{request_id}",
-    response_model=AddDropRequestResponse,
+    "/add-drop/batches/{batch_id}",
+    response_model=AddDropBatchResponse,
 )
-async def get_add_drop_request(
-    request_id: uuid.UUID,
+async def get_add_drop_batch(
+    batch_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Owner-or-officer read of one batch + its items + verdicts."""
     svc = AddDropService(db)
-    request = await svc.get(request_id)
-    if request is None:
+    batch = await svc.get_batch(batch_id)
+    if batch is None:
         raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "Add/drop request not found."
+            status.HTTP_404_NOT_FOUND, "Add/drop batch not found."
         )
-    # Owner OR officer may read.
-    if current_user.role not in {
-        UserRole.REGISTRAR_OFFICER, UserRole.ADMIN,
-    }:
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
         student = await _resolve_student(db, current_user)
-        registration = await svc.registrations.get(request.registration_id)
-        if registration is None or registration.student_id != student.id:
+        if batch.student_id != student.id:
             raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Add/drop request not found."
+                status.HTTP_404_NOT_FOUND, "Add/drop batch not found."
             )
-    return request
+    return batch
 
 
 @router.get(
-    "/registrations/{registration_id}/add-drop-requests",
-    response_model=list[AddDropRequestResponse],
+    "/me/add-drop/batches",
+    response_model=list[AddDropBatchResponse],
 )
-async def list_add_drop_requests(
-    registration_id: uuid.UUID,
+async def list_my_add_drop_batches(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Student view of their own batch history (newest first)."""
     student = await _resolve_student(db, current_user)
     svc = AddDropService(db)
-    registration = await svc.registrations.get(registration_id)
-    if registration is None or registration.student_id != student.id:
+    return await svc.list_batches_for_student(student.id)
+
+
+@router.get(
+    "/officer/add-drop/batches",
+    response_model=list[AddDropBatchResponse],
+)
+async def list_officer_add_drop_batches(
+    status_filter: Optional[AddDropBatchStatus] = Query(
+        default=None,
+        alias="status",
+        description=(
+            "Narrow the queue to one workflow status. Must be "
+            "AGENT_APPROVED or AGENT_DENIED. Omit to see both "
+            "(the default queue)."
+        ),
+    ),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer queue. Defaults to batches awaiting a human decision —
+    status in {AGENT_APPROVED, AGENT_DENIED}. Pass ``?status=...``
+    to fetch only one. Officers see every student's pending batch;
+    sorted oldest-first so the queue drains in submission order.
+    """
+    if status_filter is not None and status_filter not in {
+        AddDropBatchStatus.AGENT_APPROVED,
+        AddDropBatchStatus.AGENT_DENIED,
+    }:
         raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "Registration not found."
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "status filter must be AGENT_APPROVED or AGENT_DENIED — "
+            "the queue surfaces only batches awaiting an officer decision.",
         )
-    return await svc.list_for_registration(registration_id)
+    svc = AddDropService(db)
+    try:
+        return await svc.list_pending_batches(
+            officer_role=current_user.role,
+            statuses={status_filter} if status_filter else None,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
 
 
 @router.post(
-    "/officer/add-drop/{request_id}/override",
-    response_model=AddDropRequestResponse,
+    "/officer/add-drop/batches/{batch_id}/approve",
+    response_model=AddDropBatchResponse,
 )
-async def officer_override_add_drop(
-    request_id: uuid.UUID,
-    payload: AddDropOverrideRequest,
+async def officer_approve_add_drop_batch(
+    batch_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     email_service: EmailService = Depends(get_email_service),
 ):
+    """
+    Officer approves an AGENT_APPROVED batch — every item is
+    materialised against the registration and the batch transitions
+    to APPLIED.
+    """
     svc = AddDropService(db, email_service=email_service)
     try:
-        return await svc.officer_override(
-            request_id=request_id,
+        return await svc.officer_approve_batch(
+            batch_id,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.post(
+    "/officer/add-drop/batches/{batch_id}/override",
+    response_model=AddDropBatchResponse,
+)
+async def officer_override_add_drop_batch(
+    batch_id: uuid.UUID,
+    payload: OfficerJustificationRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """
+    Officer overrides an AGENT_DENIED batch — applies every item
+    against the registration despite the agent's denial.
+    Justification is required (officer is going against the agent).
+    """
+    svc = AddDropService(db, email_service=email_service)
+    try:
+        return await svc.officer_override_batch(
+            batch_id,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+            justification=payload.justification,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.post(
+    "/officer/add-drop/batches/{batch_id}/reject",
+    response_model=AddDropBatchResponse,
+)
+async def officer_reject_add_drop_batch(
+    batch_id: uuid.UUID,
+    payload: OfficerJustificationRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer finalises the denial — no changes are applied.
+    Works on either AGENT_APPROVED (officer disagrees with agent)
+    or AGENT_DENIED (officer confirms agent). Justification required.
+    """
+    svc = AddDropService(db)
+    try:
+        return await svc.officer_reject_batch(
+            batch_id,
             officer_role=current_user.role,
             officer_id=current_user.id,
             justification=payload.justification,
@@ -825,6 +1048,172 @@ async def list_high_risk_advisory_queue(
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+
+
+# ── Demand-driven LLM consultations ──────────────────────────────
+#
+# Three student-initiated entry points to the AcademicAdvisoryAgent's
+# Gemini-backed consult flow. Hard-fail contract: if the LLM cannot
+# answer (no GEMINI_API_KEY, timeout, API error, malformed JSON), we
+# return 503 ServiceUnavailable rather than silently degrading to
+# the rule engine — these endpoints exist precisely to deliver the
+# deep graduation-trajectory analysis the rule engine cannot.
+
+
+def _to_consult_response(
+    rec: AdvisoryRecommendation,
+) -> AdvisoryConsultResponse:
+    """
+    Project a persisted AdvisoryRecommendation row into the consult
+    response shape. Reads the LLM-specific fields (graduation_impact,
+    consultation_mode, the recommended_courses LLM-shape) and surfaces
+    the warnings + filtered_recommendations that the agent stuffed
+    into ``gap_analysis`` for the consult flow.
+    """
+    gap = rec.gap_analysis or {}
+    grad = rec.graduation_impact or {}
+    return AdvisoryConsultResponse(
+        recommendation_id=rec.id,
+        student_id=rec.student_id,
+        term_id=rec.term_id,
+        mode=rec.consultation_mode,
+        verdict=str(gap.get("verdict") or "NEEDS_REVIEW"),
+        risk_status=rec.risk_status,
+        narrative=rec.risk_explanation,
+        recommended_courses=[
+            ConsultationRecommendedCourse(
+                course_code=str(item.get("course_code", "")),
+                title=str(item.get("title", "")),
+                credit_hours=int(item.get("credit_hours") or 0),
+                is_core=bool(item.get("is_core", False)),
+                reason=str(item.get("reason", "")),
+                requires_override=item.get("requires_override"),
+            )
+            for item in (rec.recommended_courses or [])
+            if isinstance(item, dict)
+        ],
+        warnings=[str(w) for w in (gap.get("warnings") or [])],
+        graduation_impact=GraduationImpactRead(
+            semesters_remaining=grad.get("semesters_remaining"),
+            on_track=grad.get("on_track"),
+            expected_graduation_semester=grad.get(
+                "expected_graduation_semester"
+            ),
+            delay_semesters=grad.get("delay_semesters"),
+            critical_path_courses=list(
+                grad.get("critical_path_courses") or []
+            ),
+        ),
+        filtered_recommendations=list(
+            gap.get("filtered_recommendations") or []
+        ),
+        created_at=rec.created_at,
+    )
+
+
+@router.post(
+    "/advisory/consult/pre-registration",
+    response_model=AdvisoryConsultResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def consult_pre_registration(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    "What should I take this semester?" — no body needed. Server
+    reads the student's profile, the open AcademicTerm, the student's
+    completed courses + CGPA from the Grade ledger, and the
+    department curriculum; the LLM returns a recommended plan +
+    graduation-trajectory analysis.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = AdvisoryService(db)
+    try:
+        rec = await svc.consult_pre_registration(student_id=student.id)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except LLMUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Advisory LLM unavailable: {exc.reason}",
+        )
+    return _to_consult_response(rec)
+
+
+@router.post(
+    "/advisory/consult/registration-plan",
+    response_model=AdvisoryConsultResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def consult_registration_plan(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    "Is my current draft sound?" — no body needed. Server reads the
+    student's in-progress Registration for the open term and
+    validates the active course set against curriculum + history.
+    Returns 404 when the student has no draft (they should hit
+    /advisory/consult/pre-registration instead).
+    """
+    student = await _resolve_student(db, current_user)
+    svc = AdvisoryService(db)
+    try:
+        rec = await svc.consult_registration_plan(student_id=student.id)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except LLMUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Advisory LLM unavailable: {exc.reason}",
+        )
+    return _to_consult_response(rec)
+
+
+@router.post(
+    "/advisory/consult/add-drop",
+    response_model=AdvisoryConsultResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def consult_add_drop(
+    payload: AdvisoryConsultAddDropRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Two operating modes:
+
+      - **Guided** ("if I add X / drop Y, am I still on track?") —
+        body carries one or both of ``add_course_ids`` and
+        ``drop_course_ids``; the agent evaluates that specific
+        hypothetical against the current registration.
+      - **Proactive** ("what, if anything, should I change?") —
+        body is empty (or both lists empty); the agent reviews the
+        active registration against the curriculum + history and
+        either recommends concrete adds / drops with reasons, or
+        confirms the plan is already healthy.
+
+    In both modes the server finds the student's REGISTERED /
+    ADD_DROP_WINDOW registration in the open term. Returns 404 when
+    the student has no active registration.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = AdvisoryService(db)
+    try:
+        rec = await svc.consult_add_drop(
+            student_id=student.id,
+            add_course_ids=payload.add_course_ids,
+            drop_course_ids=payload.drop_course_ids,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except LLMUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Advisory LLM unavailable: {exc.reason}",
+        )
+    return _to_consult_response(rec)
 
 
 @router.post(

@@ -12,11 +12,11 @@ import uuid
 from datetime import date, datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from app.shared.enums import (
-    AcademicPhase, AddDropAction, AddDropRequestStatus, EnrollmentStatus,
-    RegistrationStatus, RiskStatus, SponsorshipType,
+    AcademicPhase, AddDropAction, AddDropBatchStatus, AddDropRequestStatus, ConsultationMode,
+    EnrollmentStatus, RegistrationStatus, RiskStatus, SponsorshipType,
 )
 
 
@@ -166,25 +166,64 @@ class CostSharingFormResponse(BaseModel):
 
 
 class RegistrationCourseRead(BaseModel):
+    """
+    A single course on a registration. ``course`` is the nested
+    catalog row (code, title, credit_hours, semester, department) so
+    the portal can render the registration without a second
+    round-trip to the curriculum endpoint.
+    """
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     course_id: uuid.UUID
     section_id: Optional[uuid.UUID] = None
     is_dropped: bool
+    course: Optional[CourseResponse] = None
 
 
 class RegistrationResponse(BaseModel):
+    """
+    Registration aggregate for a (student, term) pair, enriched with
+    the term metadata and credit-load aggregates the portal needs to
+    render the "this semester" view.
+
+    ``active_credit_total`` and ``active_course_count`` are computed
+    from the items list and intentionally exclude dropped rows so
+    they line up with what the EnrollmentAdjustmentAgent enforces
+    against the 12–22 ECTS envelope.
+    """
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     student_id: uuid.UUID
     term_id: uuid.UUID
+    term_name: Optional[str] = None
     status: RegistrationStatus
     sponsorship_type: SponsorshipType
     payment_reference: Optional[str] = None
     finalised_at: Optional[datetime] = None
     courses: list[RegistrationCourseRead] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def active_courses(self) -> list[RegistrationCourseRead]:
+        """Subset of ``courses`` excluding dropped rows."""
+        return [c for c in self.courses if not c.is_dropped]
+
+    @computed_field
+    @property
+    def active_credit_total(self) -> int:
+        """Sum of credit_hours across non-dropped courses."""
+        return sum(
+            c.course.credit_hours
+            for c in self.courses
+            if not c.is_dropped and c.course is not None
+        )
+
+    @computed_field
+    @property
+    def active_course_count(self) -> int:
+        return sum(1 for c in self.courses if not c.is_dropped)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -248,6 +287,24 @@ class ClassScheduleSlotRead(BaseModel):
     end_time: str
     instructor_id: Optional[uuid.UUID] = None
     room: Optional[str] = None
+    # New fields surfaced by /me/schedule once the add/drop schedule
+    # delta path lands. Optional so cohort-only consumers
+    # (/sections/{id}/schedule, /students/{id}/schedule officer view)
+    # keep working unchanged.
+    course_id: Optional[uuid.UUID] = None
+    source: Optional[str] = None        # "cohort" | "addition"
+    source_section_id: Optional[uuid.UUID] = None
+
+
+class PendingAdditionRead(BaseModel):
+    """
+    Course on the registration that has no schedule slots yet —
+    student needs to pick a section via the agent's option proposer.
+    """
+    course_id: uuid.UUID
+    course_code: str
+    course_title: str
+    credit_hours: int
 
 
 class SectionScheduleResponse(BaseModel):
@@ -256,11 +313,17 @@ class SectionScheduleResponse(BaseModel):
     resolving the caller's section), /students/{id}/schedule, and
     /sections/{id}/schedule. ``section`` is null when the caller has no
     cohort assignment yet (e.g. officer hasn't run scheduling).
+
+    On /me/schedule the response includes ``pending_additions`` —
+    courses the student has on the registration but hasn't picked a
+    section for yet (typically post-add/drop). These are blank on
+    section-only reads.
     """
     term_id: uuid.UUID
     student_id: Optional[uuid.UUID] = None
     section: Optional[SectionRead] = None
     slots: list[ClassScheduleSlotRead] = Field(default_factory=list)
+    pending_additions: list[PendingAdditionRead] = Field(default_factory=list)
 
 
 class InstructorScheduleEntry(BaseModel):
@@ -352,19 +415,30 @@ class TimetableGenerateResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════
 
 
-class AddDropRequestCreate(BaseModel):
-    """Request: student submits an add/drop change."""
-    registration_id: uuid.UUID
+class AddDropBatchItemCreate(BaseModel):
+    """A single (course, action) pair inside a batch submission."""
     course_id: uuid.UUID
     action: AddDropAction
-    deadline: date
+
+
+class AddDropBatchCreate(BaseModel):
+    """
+    Student-submitted add/drop batch. ``items`` must list one entry
+    per course — duplicate course_ids are rejected by the service
+    layer. ``deadline`` is optional; the service snapshots the
+    AcademicTerm's end_date when omitted.
+    """
+    registration_id: uuid.UUID
+    items: list[AddDropBatchItemCreate] = Field(..., min_length=1)
+    deadline: Optional[date] = None
 
 
 class AddDropRequestResponse(BaseModel):
-    """Read view of an AddDropRequest."""
+    """Per-item read view inside a batch."""
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    batch_id: Optional[uuid.UUID] = None
     registration_id: uuid.UUID
     course_id: uuid.UUID
     action: AddDropAction
@@ -375,9 +449,90 @@ class AddDropRequestResponse(BaseModel):
     override_justification: Optional[str] = None
 
 
-class AddDropOverrideRequest(BaseModel):
-    """Officer override payload."""
+class AddDropBatchResponse(BaseModel):
+    """Read view of an :class:`AddDropBatch` + its items."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    registration_id: uuid.UUID
+    student_id: uuid.UUID
+    status: AddDropBatchStatus
+    agent_reasons: list = Field(default_factory=list)
+    officer_id: Optional[uuid.UUID] = None
+    officer_decision_at: Optional[datetime] = None
+    officer_justification: Optional[str] = None
+    items: list[AddDropRequestResponse] = Field(default_factory=list)
+
+
+class OfficerJustificationRequest(BaseModel):
+    """Officer payload for override / reject — both require a reason."""
     justification: str = Field(..., min_length=3, max_length=4000)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Per-student schedule deltas (add/drop integration)
+# ══════════════════════════════════════════════════════════════
+
+
+class ScheduleSlotSummary(BaseModel):
+    """One weekly meeting in a section's schedule."""
+    slot_id: uuid.UUID
+    course_code: str
+    day_of_week: str
+    start_time: str
+    end_time: str
+    room: Optional[str] = None
+    instructor_id: Optional[uuid.UUID] = None
+
+
+class ScheduleConflictDetail(BaseModel):
+    """A slot in an option that collides with an existing slot."""
+    candidate: ScheduleSlotSummary
+    collides_with: ScheduleSlotSummary
+
+
+class ScheduleSectionOption(BaseModel):
+    """
+    One section-level option for a course the student has added via
+    the add/drop flow. ``is_viable`` is False when any candidate slot
+    would collide with the student's current effective schedule;
+    the colliding pairs are listed in ``conflicts`` so the portal
+    can render "Section B clashes with CS101 Mon 09:30".
+    """
+    section_id: uuid.UUID
+    section_code: str
+    department: str
+    semester: int
+    slots: list[ScheduleSlotSummary] = Field(default_factory=list)
+    conflicts: list[ScheduleConflictDetail] = Field(default_factory=list)
+    is_viable: bool
+
+
+class CourseSlim(BaseModel):
+    """Slim course view used inside option/pending payloads."""
+    course_id: uuid.UUID
+    course_code: Optional[str] = None
+    course_title: Optional[str] = None
+
+
+class ScheduleOptionsResponse(BaseModel):
+    """Payload from ``GET /me/schedule/options-for/{course_id}``."""
+    registration_id: uuid.UUID
+    course: CourseSlim
+    options: list[ScheduleSectionOption] = Field(default_factory=list)
+
+
+class ScheduleAcceptRequest(BaseModel):
+    """Body for ``POST /me/schedule/accept-for/{course_id}``."""
+    section_id: uuid.UUID
+
+
+class ScheduleAcceptResponse(BaseModel):
+    """Confirms how many addition rows were materialised."""
+    registration_id: uuid.UUID
+    course_id: uuid.UUID
+    section_id: uuid.UUID
+    slots_created: int
 
 
 # ══════════════════════════════════════════════════════════════
@@ -411,6 +566,8 @@ class AdvisoryRecommendationRead(BaseModel):
     proposed_courses: list = Field(default_factory=list)
     recommended_courses: list = Field(default_factory=list)
     gap_analysis: dict = Field(default_factory=dict)
+    consultation_mode: Optional[ConsultationMode] = None
+    graduation_impact: Optional[dict] = None
     requires_officer_review: bool
     reviewed_by_id: Optional[uuid.UUID] = None
     reviewed_at: Optional[datetime] = None
@@ -420,6 +577,95 @@ class AdvisoryRecommendationRead(BaseModel):
 class AdvisoryReviewCloseRequest(BaseModel):
     """Officer payload for closing an advisory HITL review."""
     review_notes: str = Field(..., min_length=3, max_length=4000)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Advisory — demand-driven LLM consultations
+# ══════════════════════════════════════════════════════════════
+#
+# These three endpoints power the student's "Ask the Advisor" UX
+# from three distinct moments in the registration lifecycle:
+#
+#   POST /advisory/consult/pre-registration  (no draft yet)
+#   POST /advisory/consult/registration-plan (draft ready, validate)
+#   POST /advisory/consult/add-drop          (mid-term changes)
+#
+# Each shares the AcademicHistoryOverride mixin: until Track B
+# (grades) lands, the caller must supply CGPA + completed-course
+# IDs because the server cannot resolve them. Both fields are
+# required for now to keep the LLM payload faithful.
+
+
+# The pre-registration and registration-plan consult endpoints take
+# NO request body — every input (student, department, current
+# semester, CGPA, completed courses, current term, in-progress
+# registration draft) is server-resolved. The router exposes those
+# endpoints with no payload parameter.
+
+class AdvisoryConsultAddDropRequest(BaseModel):
+    """
+    Add/drop consult payload. Two shapes are accepted:
+
+      * Guided  — at least one of ``add_course_ids`` /
+        ``drop_course_ids`` is non-empty. The agent evaluates that
+        specific hypothetical change.
+      * Proactive — both lists empty (or body omitted entirely).
+        The agent reviews the active registration against the
+        curriculum + history and proactively recommends adds/drops
+        (or confirms the plan is healthy).
+
+    Everything else (the student's REGISTERED registration for the
+    open term, currently enrolled courses, completed courses, CGPA,
+    department curriculum) is server-resolved.
+    """
+    add_course_ids: list[uuid.UUID] = Field(default_factory=list)
+    drop_course_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class GraduationImpactRead(BaseModel):
+    """Forward-looking graduation-trajectory snapshot."""
+    semesters_remaining: Optional[int] = None
+    on_track: Optional[bool] = None
+    expected_graduation_semester: Optional[int] = None
+    delay_semesters: Optional[int] = None
+    critical_path_courses: list[str] = Field(default_factory=list)
+
+
+class ConsultationRecommendedCourse(BaseModel):
+    """A single LLM-recommended course (post-validation)."""
+    course_code: str
+    title: str
+    credit_hours: int
+    is_core: bool
+    reason: str
+    requires_override: Optional[bool] = None
+
+
+class AdvisoryConsultResponse(BaseModel):
+    """
+    Response shape for all three /advisory/consult/* endpoints.
+    Mirrors :class:`ConsultationResult` but uses the persisted row's
+    UUID + timestamps so the student can refer back to this exact
+    consultation later.
+    """
+    model_config = ConfigDict(from_attributes=False)
+
+    recommendation_id: uuid.UUID
+    student_id: uuid.UUID
+    term_id: uuid.UUID
+    mode: ConsultationMode
+    verdict: str
+    risk_status: RiskStatus
+    narrative: str
+    recommended_courses: list[ConsultationRecommendedCourse] = Field(
+        default_factory=list
+    )
+    warnings: list[str] = Field(default_factory=list)
+    graduation_impact: GraduationImpactRead = Field(
+        default_factory=GraduationImpactRead
+    )
+    filtered_recommendations: list[str] = Field(default_factory=list)
+    created_at: datetime
 
 
 # ══════════════════════════════════════════════════════════════
@@ -459,6 +705,7 @@ class DashboardCurrentTerm(BaseModel):
     term_name: str
     start_date: date
     end_date: date
+    registration_id: Optional[uuid.UUID] = None
     registration_status: Optional[RegistrationStatus] = None
     section: Optional[DashboardSection] = None
 
