@@ -34,9 +34,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteBase
 from app.shared.enums import (
-    AcademicPhase, AddDropAction, AddDropRequestStatus, ConsultationMode, EnrollmentStatus,
-    GradeLetter, GradeSubmissionStatus, OfficerRole, RegistrationStatus,
-    RiskStatus, ScheduleConflictStatus, ScheduleConflictType, SponsorshipType,
+    AcademicPhase, AddDropAction, AddDropBatchStatus, AddDropRequestStatus, ConsultationMode,
+    EnrollmentStatus, GradeLetter, GradeSubmissionStatus, OfficerRole,
+    RegistrationStatus, RiskStatus, ScheduleConflictStatus,
+    ScheduleConflictType, SponsorshipType,
 )
 
 
@@ -648,21 +649,34 @@ class RegistrationStatusHistory(Base):
 
 class AddDropRequest(SoftDeleteBase):
     """
-    A student-initiated post-registration change request handled by
-    the EnrollmentAdjustmentAgent.
+    A single course-level item inside an :class:`AddDropBatch`.
+
+    Workflow (PENDING_AGENT → AGENT_APPROVED/DENIED → APPLIED/REJECTED)
+    lives on the parent batch. This row carries only the per-item
+    agent verdict (``status`` + ``reason``) so the officer queue can
+    show "CS201 — ADD — DENIED: prereq CS101 not satisfied" alongside
+    the batch-level decision.
 
     ``deadline_snapshot`` is captured at submit time so late-window
     rule changes do not retroactively break records (Track A
     implementation checklist invariant).
 
-    ``override_by_id`` and ``override_justification`` are populated
-    only when an officer overrides a DENIED request — for prerequisite
-    overrides the calling code MUST verify the officer's role is
-    ``DEPARTMENT_HEAD`` per SRS §3.5.
+    ``override_by_id`` / ``override_justification`` are populated on
+    a parent-batch officer override and copied here for read-side
+    convenience (so per-item rendering of the audit trail does not
+    require a join to the batch).
     """
 
     __tablename__ = "add_drop_requests"
 
+    # NULL only for legacy rows seeded before the batch model existed
+    # — every new item is written under a batch.
+    batch_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("add_drop_batches.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     registration_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("registrations.id"),
@@ -690,8 +704,80 @@ class AddDropRequest(SoftDeleteBase):
         Text, nullable=True
     )
 
+    batch: Mapped[Optional["AddDropBatch"]] = relationship(
+        back_populates="items", lazy="selectin",
+    )
     registration: Mapped["Registration"] = relationship(lazy="selectin")
     course: Mapped["Course"] = relationship(lazy="selectin")
+
+
+class AddDropBatch(SoftDeleteBase):
+    """
+    A student-submitted batch of add/drop changes evaluated as one
+    transaction. Lifecycle:
+
+        PENDING_AGENT
+          → AGENT_APPROVED → APPLIED            (officer approves)
+                          → REJECTED            (officer rejects despite agent OK)
+          → AGENT_DENIED  → APPLIED             (officer overrides; needs justification)
+                          → REJECTED            (officer finalises the denial)
+          → CANCELLED                           (student withdraws before officer)
+
+    All items inside one batch share a fate: APPLIED means every
+    AddDropRequest row was materialised against the registration,
+    REJECTED means none were.
+
+    ``agent_reasons`` mirrors the per-item agent verdict in a single
+    JSON payload so an officer reviewing the queue does not need to
+    fan out to the items table for "why was this denied?".
+    """
+
+    __tablename__ = "add_drop_batches"
+
+    registration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registrations.id"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalised from Registration.student_id so the officer queue
+    # query (`pending batches for any student`) doesn't need a join.
+    student_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("students.id"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[AddDropBatchStatus] = mapped_column(
+        nullable=False,
+        default=AddDropBatchStatus.PENDING_AGENT,
+        index=True,
+    )
+    # Per-item structured agent verdict. Shape:
+    #   [{"course_id": str, "course_code": str, "action": str,
+    #     "passed": bool, "reasons": [str], "details": {...}}, ...]
+    agent_reasons: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list,
+    )
+    # Officer decision audit trail.
+    officer_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True,
+    )
+    officer_decision_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    officer_justification: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
+
+    items: Mapped[list["AddDropRequest"]] = relationship(
+        back_populates="batch",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="AddDropRequest.created_at.asc()",
+    )
+    registration: Mapped["Registration"] = relationship(lazy="selectin")
+    student: Mapped["Student"] = relationship(lazy="selectin")
 
 
 # ── Track A — Advisory ───────────────────────────────────────────

@@ -12,11 +12,11 @@ import uuid
 from datetime import date, datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from app.shared.enums import (
-    AcademicPhase, AddDropAction, AddDropRequestStatus, ConsultationMode, EnrollmentStatus,
-    RegistrationStatus, RiskStatus, SponsorshipType,
+    AcademicPhase, AddDropAction, AddDropBatchStatus, AddDropRequestStatus, ConsultationMode,
+    EnrollmentStatus, RegistrationStatus, RiskStatus, SponsorshipType,
 )
 
 
@@ -166,25 +166,64 @@ class CostSharingFormResponse(BaseModel):
 
 
 class RegistrationCourseRead(BaseModel):
+    """
+    A single course on a registration. ``course`` is the nested
+    catalog row (code, title, credit_hours, semester, department) so
+    the portal can render the registration without a second
+    round-trip to the curriculum endpoint.
+    """
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     course_id: uuid.UUID
     section_id: Optional[uuid.UUID] = None
     is_dropped: bool
+    course: Optional[CourseResponse] = None
 
 
 class RegistrationResponse(BaseModel):
+    """
+    Registration aggregate for a (student, term) pair, enriched with
+    the term metadata and credit-load aggregates the portal needs to
+    render the "this semester" view.
+
+    ``active_credit_total`` and ``active_course_count`` are computed
+    from the items list and intentionally exclude dropped rows so
+    they line up with what the EnrollmentAdjustmentAgent enforces
+    against the 12–22 ECTS envelope.
+    """
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     student_id: uuid.UUID
     term_id: uuid.UUID
+    term_name: Optional[str] = None
     status: RegistrationStatus
     sponsorship_type: SponsorshipType
     payment_reference: Optional[str] = None
     finalised_at: Optional[datetime] = None
     courses: list[RegistrationCourseRead] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def active_courses(self) -> list[RegistrationCourseRead]:
+        """Subset of ``courses`` excluding dropped rows."""
+        return [c for c in self.courses if not c.is_dropped]
+
+    @computed_field
+    @property
+    def active_credit_total(self) -> int:
+        """Sum of credit_hours across non-dropped courses."""
+        return sum(
+            c.course.credit_hours
+            for c in self.courses
+            if not c.is_dropped and c.course is not None
+        )
+
+    @computed_field
+    @property
+    def active_course_count(self) -> int:
+        return sum(1 for c in self.courses if not c.is_dropped)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -352,19 +391,30 @@ class TimetableGenerateResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════
 
 
-class AddDropRequestCreate(BaseModel):
-    """Request: student submits an add/drop change."""
-    registration_id: uuid.UUID
+class AddDropBatchItemCreate(BaseModel):
+    """A single (course, action) pair inside a batch submission."""
     course_id: uuid.UUID
     action: AddDropAction
-    deadline: date
+
+
+class AddDropBatchCreate(BaseModel):
+    """
+    Student-submitted add/drop batch. ``items`` must list one entry
+    per course — duplicate course_ids are rejected by the service
+    layer. ``deadline`` is optional; the service snapshots the
+    AcademicTerm's end_date when omitted.
+    """
+    registration_id: uuid.UUID
+    items: list[AddDropBatchItemCreate] = Field(..., min_length=1)
+    deadline: Optional[date] = None
 
 
 class AddDropRequestResponse(BaseModel):
-    """Read view of an AddDropRequest."""
+    """Per-item read view inside a batch."""
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    batch_id: Optional[uuid.UUID] = None
     registration_id: uuid.UUID
     course_id: uuid.UUID
     action: AddDropAction
@@ -375,8 +425,23 @@ class AddDropRequestResponse(BaseModel):
     override_justification: Optional[str] = None
 
 
-class AddDropOverrideRequest(BaseModel):
-    """Officer override payload."""
+class AddDropBatchResponse(BaseModel):
+    """Read view of an :class:`AddDropBatch` + its items."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    registration_id: uuid.UUID
+    student_id: uuid.UUID
+    status: AddDropBatchStatus
+    agent_reasons: list = Field(default_factory=list)
+    officer_id: Optional[uuid.UUID] = None
+    officer_decision_at: Optional[datetime] = None
+    officer_justification: Optional[str] = None
+    items: list[AddDropRequestResponse] = Field(default_factory=list)
+
+
+class OfficerJustificationRequest(BaseModel):
+    """Officer payload for override / reject — both require a reason."""
     justification: str = Field(..., min_length=3, max_length=4000)
 
 
@@ -550,6 +615,7 @@ class DashboardCurrentTerm(BaseModel):
     term_name: str
     start_date: date
     end_date: date
+    registration_id: Optional[uuid.UUID] = None
     registration_status: Optional[RegistrationStatus] = None
     section: Optional[DashboardSection] = None
 

@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger, write_audit_log
 from app.modules.course.agents import (
-    AcademicAdvisoryAgent, AcademicSchedulingAgent, Advice,
+    AcademicAdvisoryAgent, AcademicSchedulingAgent, Advice, BatchResult,
     ConsultationResult, CurriculumComplianceAgent, EnrollmentAdjustmentAgent,
 )
 from app.modules.course.exceptions import (
@@ -45,7 +45,7 @@ from app.modules.course.exceptions import (
     UnauthorizedActorError,
 )
 from app.modules.course.models import (
-    AcademicTerm, AddDropRequest, AdvisoryRecommendation,
+    AcademicTerm, AddDropBatch, AddDropRequest, AdvisoryRecommendation,
     ClassScheduleSlot, Classroom, CourseManagementOfficer, Course,
     Instructor, InstructorAssignment, PrerequisiteOverride, Registration,
     RegistrationCourse, RegistrationStatusHistory, ScheduleConflict, Section,
@@ -57,8 +57,9 @@ from app.modules.course.repository import (
     RegistrationRepository, StudentRepository,
 )
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, ConsultationMode, EnrollmentStatus,
-    OfficerRole, RegistrationStatus, RiskStatus, SponsorshipType, UserRole,
+    AddDropAction, AddDropBatchStatus, AddDropRequestStatus, ConsultationMode,
+    EnrollmentStatus, OfficerRole, RegistrationStatus, RiskStatus,
+    SponsorshipType, UserRole,
 )
 
 logger = get_logger("course.service")
@@ -516,6 +517,9 @@ class RegistrationService:
                 "term_name": open_term.term_name,
                 "start_date": open_term.start_date,
                 "end_date": open_term.end_date,
+                "registration_id": (
+                    registration.id if registration else None
+                ),
                 "registration_status": (
                     registration.status if registration else None
                 ),
@@ -1737,16 +1741,32 @@ class SchedulingService:
 
 class AddDropService:
     """
-    Drives the AddDropRequest lifecycle:
+    Drives the AddDropBatch workflow:
 
-        PENDING
-          -> APPROVED -> APPLIED            (agent approves)
-          -> DENIED                         (agent blocks)
-              -> OVERRIDDEN -> APPLIED      (officer override)
+        PENDING_AGENT
+          → AGENT_APPROVED → APPLIED          (officer approves)
+                          → REJECTED          (officer rejects despite agent OK)
+          → AGENT_DENIED  → APPLIED           (officer overrides; needs justification)
+                          → REJECTED          (officer finalises the denial)
+          → CANCELLED                         (student withdraws)
 
-    The EnrollmentAdjustmentAgent makes the policy decision; this
-    service is responsible for persisting the outcome, applying the
-    actual change to the registration, and writing the audit trail.
+    Per-item agent verdicts ride on the ``AddDropRequest`` rows
+    (status + reason), but the workflow status that actually gates
+    apply / reject lives on the parent batch. The agent enforces:
+
+      - curriculum membership (course department == student department)
+      - semester parity (course offered in the current half of the year)
+      - prerequisites satisfied (delegated to CurriculumComplianceAgent)
+      - credit-load envelope across the whole batch
+      - per-item payment cross-check for ADD
+
+    The service layer:
+      - resolves the student's completed-course set from the Grade
+        ledger (server-side, no caller input)
+      - resolves the open AcademicTerm's add/drop deadline
+      - runs the agent and persists the verdict
+      - materialises every item against the registration only when
+        the officer explicitly approves (or overrides a denial)
     """
 
     def __init__(
@@ -1759,25 +1779,37 @@ class AddDropService:
         self.db = db
         self.registrations = RegistrationRepository(db)
         self.requests = AddDropRequestRepository(db)
+        self.terms = AcademicTermRepository(db)
+        self.grades = GradeRepository(db)
         self.agent = adjustment_agent or EnrollmentAdjustmentAgent()
         self.email_service = email_service
 
-    # ── Submit (the spine) ──────────────────────────────────────
+    # ── Submit batch (the spine) ────────────────────────────────
 
-    async def submit_request(
+    async def submit_batch(
         self,
         registration_id: uuid.UUID,
-        course_id: uuid.UUID,
-        action: AddDropAction,
-        deadline: date,
+        items: list[tuple[uuid.UUID, AddDropAction]],
+        *,
         student_user_id: uuid.UUID,
-    ) -> AddDropRequest:
+        deadline: Optional[date] = None,
+    ) -> AddDropBatch:
         """
-        Persist a new AddDropRequest, run the agent, and either:
-            • apply the change and flip status to APPLIED, or
-            • flip status to DENIED and raise AdjustmentDeniedError
-              with the agent payload.
+        Persist a new :class:`AddDropBatch` with one
+        :class:`AddDropRequest` per (course, action) item, run the
+        agent against the whole batch, persist the per-item verdicts,
+        and leave the batch in AGENT_APPROVED or AGENT_DENIED for
+        the officer queue.
+
+        Does NOT apply the change. Apply only fires when the officer
+        approves (AGENT_APPROVED → APPLIED) or overrides
+        (AGENT_DENIED → APPLIED).
         """
+        if not items:
+            raise InvalidAdjustmentRequestError(
+                "Batch must contain at least one (course, action) item."
+            )
+
         registration = await self.registrations.get(registration_id)
         if registration is None:
             raise EntityNotFoundError("Registration", str(registration_id))
@@ -1790,75 +1822,303 @@ class AddDropService:
                 "REGISTERED or ADD_DROP_WINDOW registrations accept add/drop."
             )
 
-        request = AddDropRequest(
-            registration_id=registration_id,
-            course_id=course_id,
-            action=action,
-            deadline_snapshot=deadline,
-            status=AddDropRequestStatus.PENDING,
+        student = await self.db.get(Student, registration.student_id)
+        if student is None:
+            raise EntityNotFoundError(
+                "Student", str(registration.student_id),
+            )
+
+        # Snapshot the term's deadline so a late rule change can't
+        # retroactively break this batch.
+        term = await self.terms.get(registration.term_id)
+        deadline_snapshot = (
+            deadline if deadline is not None
+            else (term.end_date if term is not None else date.today())
         )
-        self.db.add(request)
+
+        # Reject same-course duplicates within the batch — they would
+        # double-count toward the credit envelope and confuse the
+        # officer review.
+        seen: set[uuid.UUID] = set()
+        for course_id, _ in items:
+            if course_id in seen:
+                raise InvalidAdjustmentRequestError(
+                    f"Course {course_id} appears more than once in the "
+                    "batch; submit one (course, action) per course."
+                )
+            seen.add(course_id)
+
+        # Load every Course row in one round trip.
+        course_ids = [c for c, _ in items]
+        course_rows = (
+            await self.db.execute(
+                select(Course).where(
+                    Course.id.in_(course_ids),
+                    Course.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalars().all()
+        by_id = {c.id: c for c in course_rows}
+        missing = [str(cid) for cid in course_ids if cid not in by_id]
+        if missing:
+            raise EntityNotFoundError("Course", ", ".join(missing))
+
+        # Create the batch + per-item rows.
+        batch = AddDropBatch(
+            registration_id=registration_id,
+            student_id=registration.student_id,
+            status=AddDropBatchStatus.PENDING_AGENT,
+        )
+        self.db.add(batch)
+        await self.db.flush()
+        for course_id, action in items:
+            self.db.add(AddDropRequest(
+                batch_id=batch.id,
+                registration_id=registration_id,
+                course_id=course_id,
+                action=action,
+                deadline_snapshot=deadline_snapshot,
+                status=AddDropRequestStatus.PENDING,
+            ))
         await self.db.flush()
 
-        await self._run_agent_and_apply(
-            request, registration, student_user_id,
+        # Run the agent. Completed courses + prereq overrides are
+        # both server-resolved.
+        completed = await self.grades.completed_course_ids(student.id)
+        overrides = await self._overridden_prereq_course_ids(registration.id)
+        ordered_items = [(by_id[cid], action) for cid, action in items]
+        result: BatchResult = await self.agent.process_batch(
+            self.db,
+            student=student,
+            registration=registration,
+            items=ordered_items,
+            completed_course_ids=completed,
+            overridden_course_ids=overrides,
+            deadline=deadline_snapshot,
         )
-        await self.db.commit()
-        await self.db.refresh(request)
-        return request
 
-    async def _run_agent_and_apply(
-        self,
-        request: AddDropRequest,
-        registration: Registration,
-        actor_id: uuid.UUID,
-    ) -> None:
-        result = await self.agent.process_add_drop(
-            self.db, request, registration,
-        )
-        if not result.approved:
-            request.status = AddDropRequestStatus.DENIED
-            request.reason = "; ".join(result.reasons)
-            write_audit_log(
-                action="course.add_drop.denied",
-                actor_role=UserRole.AGENT.value,
-                actor_id=None,
-                resource_type="AddDropRequest",
-                resource_id=request.id,
-                decision=AddDropRequestStatus.DENIED.value,
-                metadata={
-                    "agent_id": self.agent.agent_id,
-                    "reasons": result.reasons,
-                    "details": result.details,
-                },
+        # Persist per-item verdicts on the AddDropRequest rows and
+        # the batch-wide audit payload on AddDropBatch.agent_reasons.
+        verdict_by_course: dict[uuid.UUID, Any] = {
+            v.course_id: v for v in result.items
+            if v.course_code != "__BATCH__"
+        }
+        await self.db.refresh(batch, attribute_names=["items"])
+        for req in batch.items:
+            verdict = verdict_by_course.get(req.course_id)
+            if verdict is None:
+                continue
+            req.status = (
+                AddDropRequestStatus.APPROVED if verdict.passed
+                else AddDropRequestStatus.DENIED
             )
-            raise AdjustmentDeniedError({
-                "approved": False,
-                "reasons": result.reasons,
-                "details": result.details,
-            })
+            if verdict.reasons:
+                req.reason = "; ".join(verdict.reasons)
+        batch.agent_reasons = [v.to_audit_dict() for v in result.items]
+        batch.status = (
+            AddDropBatchStatus.AGENT_APPROVED if result.approved
+            else AddDropBatchStatus.AGENT_DENIED
+        )
 
-        request.status = AddDropRequestStatus.APPROVED
-        await self._apply_approved_change(request, registration)
-        request.status = AddDropRequestStatus.APPLIED
         write_audit_log(
-            action="course.add_drop.applied",
-            actor_role=UserRole.AGENT.value,
-            actor_id=actor_id,
-            resource_type="AddDropRequest",
-            resource_id=request.id,
-            decision=AddDropRequestStatus.APPLIED.value,
+            action="course.add_drop.batch_submitted",
+            actor_role=UserRole.STUDENT.value,
+            actor_id=student_user_id,
+            resource_type="AddDropBatch",
+            resource_id=batch.id,
+            decision=batch.status.value,
             metadata={
                 "agent_id": self.agent.agent_id,
-                "details": result.details,
+                "item_count": len(items),
+                "approved": result.approved,
+                "failing_items": [
+                    v.course_code for v in result.failing_items()
+                    if v.course_code != "__BATCH__"
+                ],
             },
         )
-        await self._notify_student(registration, request)
+        await self.db.commit()
+        await self.db.refresh(batch)
+        return batch
 
-    async def _apply_approved_change(
+    async def _overridden_prereq_course_ids(
+        self, registration_id: uuid.UUID,
+    ) -> set[uuid.UUID]:
+        """
+        Course IDs whose prereqs have been bypassed by a Department
+        Head for this registration (so the agent skips the prereq
+        check for them).
+        """
+        rows = (
+            await self.db.execute(
+                select(PrerequisiteOverride).where(
+                    PrerequisiteOverride.registration_id == registration_id,
+                )
+            )
+        ).scalars().all()
+        return {r.course_id for r in rows}
+
+    # ── Officer actions ─────────────────────────────────────────
+
+    async def officer_approve_batch(
+        self,
+        batch_id: uuid.UUID,
+        *,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+    ) -> AddDropBatch:
+        """
+        Officer approves an AGENT_APPROVED batch. Materialises every
+        item against the registration and transitions the batch to
+        APPLIED. The officer is recorded on the batch + items so the
+        audit trail attributes the apply to a human.
+        """
+        self._require_officer_role(officer_role)
+        batch = await self._get_batch_or_404(batch_id)
+        if batch.status != AddDropBatchStatus.AGENT_APPROVED:
+            raise InvalidAdjustmentRequestError(
+                f"Cannot approve batch in status {batch.status.value}; "
+                "only AGENT_APPROVED batches accept officer approval. "
+                "Use override to apply an AGENT_DENIED batch."
+            )
+        return await self._apply_batch(
+            batch=batch,
+            officer_role=officer_role,
+            officer_id=officer_id,
+            justification=None,
+            audit_action="course.add_drop.officer_approved",
+        )
+
+    async def officer_override_batch(
+        self,
+        batch_id: uuid.UUID,
+        *,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+        justification: str,
+    ) -> AddDropBatch:
+        """
+        Officer overrides an AGENT_DENIED batch and applies it anyway.
+        Justification is required (and persisted) since the officer is
+        going against the agent's verdict.
+        """
+        self._require_officer_role(officer_role)
+        if not justification or not justification.strip():
+            raise InvalidAdjustmentRequestError(
+                "Override justification is required."
+            )
+        batch = await self._get_batch_or_404(batch_id)
+        if batch.status != AddDropBatchStatus.AGENT_DENIED:
+            raise InvalidAdjustmentRequestError(
+                f"Cannot override batch in status {batch.status.value}; "
+                "only AGENT_DENIED batches can be overridden. Use "
+                "approve for AGENT_APPROVED batches."
+            )
+        return await self._apply_batch(
+            batch=batch,
+            officer_role=officer_role,
+            officer_id=officer_id,
+            justification=justification.strip(),
+            audit_action="course.add_drop.officer_override",
+        )
+
+    async def officer_reject_batch(
+        self,
+        batch_id: uuid.UUID,
+        *,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+        justification: str,
+    ) -> AddDropBatch:
+        """
+        Officer finalises the denial — no items are applied. Works
+        from either AGENT_APPROVED (officer disagrees with the agent)
+        or AGENT_DENIED (officer agrees with the agent and closes the
+        case). Justification is required.
+        """
+        self._require_officer_role(officer_role)
+        if not justification or not justification.strip():
+            raise InvalidAdjustmentRequestError(
+                "Rejection justification is required."
+            )
+        batch = await self._get_batch_or_404(batch_id)
+        if batch.status not in {
+            AddDropBatchStatus.AGENT_APPROVED,
+            AddDropBatchStatus.AGENT_DENIED,
+        }:
+            raise InvalidAdjustmentRequestError(
+                f"Cannot reject batch in status {batch.status.value}; "
+                "only AGENT_APPROVED or AGENT_DENIED batches accept "
+                "a rejection."
+            )
+        batch.status = AddDropBatchStatus.REJECTED
+        batch.officer_id = officer_id
+        batch.officer_decision_at = datetime.now(timezone.utc)
+        batch.officer_justification = justification.strip()
+        write_audit_log(
+            action="course.add_drop.officer_rejected",
+            actor_role=officer_role.value,
+            actor_id=officer_id,
+            resource_type="AddDropBatch",
+            resource_id=batch.id,
+            decision=AddDropBatchStatus.REJECTED.value,
+            metadata={"justification": justification.strip()},
+        )
+        await self.db.commit()
+        await self.db.refresh(batch)
+        return batch
+
+    # ── Apply (shared by approve + override) ────────────────────
+
+    async def _apply_batch(
+        self,
+        *,
+        batch: AddDropBatch,
+        officer_role: UserRole,
+        officer_id: uuid.UUID,
+        justification: Optional[str],
+        audit_action: str,
+    ) -> AddDropBatch:
+        registration = await self.registrations.get(batch.registration_id)
+        if registration is None:
+            raise EntityNotFoundError(
+                "Registration", str(batch.registration_id),
+            )
+
+        await self.db.refresh(batch, attribute_names=["items"])
+        for req in batch.items:
+            await self._apply_item(req, registration)
+            req.status = AddDropRequestStatus.APPLIED
+            if justification is not None:
+                req.override_by_id = officer_id
+                req.override_justification = justification
+
+        batch.status = AddDropBatchStatus.APPLIED
+        batch.officer_id = officer_id
+        batch.officer_decision_at = datetime.now(timezone.utc)
+        if justification is not None:
+            batch.officer_justification = justification
+
+        write_audit_log(
+            action=audit_action,
+            actor_role=officer_role.value,
+            actor_id=officer_id,
+            resource_type="AddDropBatch",
+            resource_id=batch.id,
+            decision=AddDropBatchStatus.APPLIED.value,
+            metadata={
+                "item_count": len(batch.items),
+                "justification": justification,
+            },
+        )
+        await self._notify_student_batch(registration, batch)
+        await self.db.commit()
+        await self.db.refresh(batch)
+        return batch
+
+    async def _apply_item(
         self, request: AddDropRequest, registration: Registration,
     ) -> None:
-        """Materialise an approved request as a RegistrationCourse mutation."""
         if request.action == AddDropAction.ADD:
             await self._apply_add(request, registration)
         else:
@@ -1869,10 +2129,8 @@ class AddDropService:
     ) -> None:
         """
         Materialise an ADD: insert (or un-drop) the
-        ``RegistrationCourse`` row. The student's cohort
-        ``Registration.section_id`` is unchanged — the cohort's
-        weekly schedule is rebuilt the next time the officer runs
-        scheduling.
+        ``RegistrationCourse`` row. The cohort's weekly schedule is
+        rebuilt the next time the officer runs scheduling.
         """
         existing_link = (
             await self.db.execute(
@@ -1894,12 +2152,7 @@ class AddDropService:
     async def _apply_drop(
         self, request: AddDropRequest, registration: Registration,
     ) -> None:
-        """
-        Materialise a DROP: flip ``is_dropped=True`` on the existing
-        ``RegistrationCourse`` row. Section/cohort assignment is
-        unaffected — only the per-course slots regenerate next
-        scheduling run.
-        """
+        """Materialise a DROP: flip ``is_dropped=True`` on the link row."""
         link = (
             await self.db.execute(
                 select(RegistrationCourse).where(
@@ -1914,95 +2167,50 @@ class AddDropService:
             )
         link.is_dropped = True
 
-    # ── Officer override ────────────────────────────────────────
-
-    async def officer_override(
-        self,
-        request_id: uuid.UUID,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
-        justification: str,
-    ) -> AddDropRequest:
-        """
-        Flip a DENIED request to OVERRIDDEN, then APPLIED. Officer
-        role is REGISTRAR_OFFICER, DEPARTMENT_HEAD, or ADMIN —
-        prerequisite-specific overrides go through a different audit
-        trail (PrerequisiteOverride) handled by the registration
-        service.
-        """
-        if officer_role not in {
-            UserRole.REGISTRAR_OFFICER, UserRole.ADMIN,
-        }:
+    def _require_officer_role(self, role: UserRole) -> None:
+        if role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
             raise UnauthorizedActorError(
-                "Only registrar officers or admins can override an add/drop request."
-            )
-        if not justification or not justification.strip():
-            raise InvalidAdjustmentRequestError(
-                "Override justification is required."
+                "Only registrar officers or admins can act on an "
+                "add/drop batch."
             )
 
-        request = await self.requests.get(request_id)
-        if request is None:
-            raise EntityNotFoundError("AddDropRequest", str(request_id))
-        if request.status != AddDropRequestStatus.DENIED:
-            raise InvalidAdjustmentRequestError(
-                f"Cannot override request in status {request.status.value}; "
-                "only DENIED requests can be overridden."
+    async def _get_batch_or_404(self, batch_id: uuid.UUID) -> AddDropBatch:
+        batch = (
+            await self.db.execute(
+                select(AddDropBatch).where(
+                    AddDropBatch.id == batch_id,
+                    AddDropBatch.is_deleted == False,  # noqa: E712
+                )
             )
+        ).scalar_one_or_none()
+        if batch is None:
+            raise EntityNotFoundError("AddDropBatch", str(batch_id))
+        return batch
 
-        registration = await self.registrations.get(request.registration_id)
-        if registration is None:
-            raise EntityNotFoundError(
-                "Registration", str(request.registration_id),
-            )
-
-        request.status = AddDropRequestStatus.OVERRIDDEN
-        request.override_by_id = officer_id
-        request.override_justification = justification.strip()
-        await self._apply_approved_change(request, registration)
-        request.status = AddDropRequestStatus.APPLIED
-
-        write_audit_log(
-            action="course.add_drop.officer_override",
-            actor_role=officer_role.value,
-            actor_id=officer_id,
-            resource_type="AddDropRequest",
-            resource_id=request.id,
-            decision=AddDropRequestStatus.APPLIED.value,
-            metadata={
-                "previous_reason": request.reason,
-                "justification": justification.strip(),
-            },
-        )
-        await self._notify_student(registration, request)
-        await self.db.commit()
-        await self.db.refresh(request)
-        return request
-
-    async def _notify_student(
-        self, registration: Registration, request: AddDropRequest,
+    async def _notify_student_batch(
+        self, registration: Registration, batch: AddDropBatch,
     ) -> None:
         """
-        Wire the agent's notification payload to the EmailService.
-        Always emits a structured stdout audit-log row; the actual
-        email is only attempted when an EmailService was injected
-        (production wiring) so unit tests run without SMTP setup.
+        Per-item notification on apply. Mirrors the audit-log row the
+        single-item path used to write so the existing observability
+        dashboards keep working; the email itself fires once per
+        applied item via the agent's notify payload.
         """
-        payload = self.agent.notify_adjustment_success(
-            registration.student_id, request,
-        )
-        write_audit_log(
-            action="course.add_drop.notification",
-            actor_role=UserRole.AGENT.value,
-            actor_id=None,
-            resource_type="AddDropRequest",
-            resource_id=request.id,
-            decision="notified",
-            metadata=payload,
-        )
+        for req in batch.items:
+            payload = self.agent.notify_adjustment_success(
+                registration.student_id, req,
+            )
+            write_audit_log(
+                action="course.add_drop.notification",
+                actor_role=UserRole.AGENT.value,
+                actor_id=None,
+                resource_type="AddDropRequest",
+                resource_id=req.id,
+                decision="notified",
+                metadata=payload,
+            )
         if self.email_service is None:
             return
-        # Resolve the student's email via the User row.
         student = await self.db.get(Student, registration.student_id)
         if student is None:
             return
@@ -2011,23 +2219,74 @@ class AddDropService:
         if user is None or not user.email:
             return
         from app.shared.email.schemas import EmailMessage
+        summary = "; ".join(
+            f"{req.action.value} {req.course_id}" for req in batch.items
+        )
         await self.email_service.send(
             EmailMessage(
                 to_email=user.email,
-                subject=payload["subject"],
-                text_body=payload["body"],
+                subject="Your add/drop batch was applied",
+                text_body=(
+                    "Your add/drop batch has been approved by the "
+                    f"registrar and applied to your registration:\n\n{summary}"
+                ),
             )
         )
 
     # ── Reads ───────────────────────────────────────────────────
 
-    async def get(self, request_id: uuid.UUID) -> Optional[AddDropRequest]:
-        return await self.requests.get(request_id)
+    async def get_batch(
+        self, batch_id: uuid.UUID,
+    ) -> Optional[AddDropBatch]:
+        return (
+            await self.db.execute(
+                select(AddDropBatch).where(
+                    AddDropBatch.id == batch_id,
+                    AddDropBatch.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
 
-    async def list_for_registration(
-        self, registration_id: uuid.UUID,
-    ) -> list[AddDropRequest]:
-        return await self.requests.list_for_registration(registration_id)
+    async def list_batches_for_student(
+        self, student_id: uuid.UUID,
+    ) -> list[AddDropBatch]:
+        return list(
+            (
+                await self.db.execute(
+                    select(AddDropBatch).where(
+                        AddDropBatch.student_id == student_id,
+                        AddDropBatch.is_deleted == False,  # noqa: E712
+                    ).order_by(AddDropBatch.created_at.desc())
+                )
+            ).scalars().all()
+        )
+
+    async def list_pending_batches(
+        self,
+        *,
+        officer_role: UserRole,
+        statuses: Optional[set[AddDropBatchStatus]] = None,
+    ) -> list[AddDropBatch]:
+        """
+        Officer queue. Defaults to {AGENT_APPROVED, AGENT_DENIED} —
+        the two states that need a human decision. Callers can pass
+        a custom set to surface APPLIED / REJECTED history.
+        """
+        self._require_officer_role(officer_role)
+        target = statuses or {
+            AddDropBatchStatus.AGENT_APPROVED,
+            AddDropBatchStatus.AGENT_DENIED,
+        }
+        return list(
+            (
+                await self.db.execute(
+                    select(AddDropBatch).where(
+                        AddDropBatch.status.in_(target),
+                        AddDropBatch.is_deleted == False,  # noqa: E712
+                    ).order_by(AddDropBatch.created_at.asc())
+                )
+            ).scalars().all()
+        )
 
 
 class AdvisoryService:

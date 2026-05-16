@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +17,6 @@ from app.modules.course.models import (
 )
 from app.modules.programs.models import AcademicProgram
 from app.modules.course.exceptions import (
-    AdjustmentDeniedError,
     ComplianceCheckFailedError,
     DuplicateRegistrationError,
     EntityNotFoundError,
@@ -31,8 +30,8 @@ from app.modules.course.exceptions import (
 from app.modules.course.repository import StudentRepository
 from app.modules.course.schemas import (
     AcademicTermResponse,
-    AddDropOverrideRequest,
-    AddDropRequestCreate,
+    AddDropBatchCreate,
+    AddDropBatchResponse,
     AddDropRequestResponse,
     AdvisoryConsultAddDropRequest,
     AdvisoryConsultResponse,
@@ -52,6 +51,7 @@ from app.modules.course.schemas import (
     InstructorCreateRequest,
     InstructorResponse,
     InstructorScheduleEntry,
+    OfficerJustificationRequest,
     RegistrationInvoiceResponse,
     RegistrationResponse,
     RegistrationSubmitResponse,
@@ -75,7 +75,7 @@ from app.modules.course.service import (
     RegistrationService, SchedulingService, TermService,
 )
 from app.shared.email.service import EmailService
-from app.shared.enums import UserRole
+from app.shared.enums import AddDropBatchStatus, UserRole
 
 
 router = APIRouter(prefix="/courses", tags=["Course Management"])
@@ -311,11 +311,18 @@ async def get_registration(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Read view of the calling student's own registration. Useful for
-    showing the current status (REGISTRATION_OPEN / PAYMENT_HOLD /
-    REGISTERED / ADD_DROP_WINDOW), the course list, and the
-    finalised_at timestamp after the bursar / cost-sharing flow has
-    cleared.
+    Read view of the calling student's own registration — the spine
+    of the "this semester" portal view.
+
+    Returns:
+      * core fields (status, sponsorship_type, finalised_at, …)
+      * ``term_name`` so the caller does not need a separate term
+        lookup
+      * ``courses`` enriched with each ``course`` row inline (code,
+        title, credit_hours, semester, department) so the portal can
+        render the registration without a second curriculum call
+      * computed aggregates: ``active_courses`` (subset that excludes
+        dropped rows), ``active_credit_total``, ``active_course_count``
 
     For writes, students should use the unified
     ``POST /me/register`` — the previous granular endpoints
@@ -327,7 +334,19 @@ async def get_registration(
     registration = await svc.registrations.get(registration_id)
     if registration is None or registration.student_id != student.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Registration not found.")
-    return registration
+    # ``term`` is selectin-loaded on the model relationship, so this
+    # does not fire an extra query. Build the response off the ORM
+    # row, then patch ``term_name`` (Pydantic's from_attributes can't
+    # reach term.term_name through a relationship without a custom
+    # adapter).
+    response = RegistrationResponse.model_validate(
+        registration, from_attributes=True,
+    )
+    if registration.term is not None:
+        response = response.model_copy(
+            update={"term_name": registration.term.term_name},
+        )
+    return response
 
 
 # ── Scheduling endpoints ─────────────────────────────────────────
@@ -620,23 +639,47 @@ async def get_instructor_schedule(
 
 
 # ── Add/Drop endpoints ───────────────────────────────────────────
+#
+# The student submits one batch carrying multiple (course, action)
+# items. The EnrollmentAdjustmentAgent reviews the batch as a whole
+# (curriculum, semester parity, prereqs, credit envelope, payment)
+# and stamps an AGENT_APPROVED or AGENT_DENIED verdict on the batch
+# row. Nothing is applied at this point — the batch then awaits an
+# officer decision.
+#
+# Officer endpoints:
+#   GET  /officer/add-drop/batches            — queue (AGENT_*)
+#   POST /officer/add-drop/batches/{id}/approve   — approve agent-approved batch
+#   POST /officer/add-drop/batches/{id}/override  — override agent-denied batch
+#   POST /officer/add-drop/batches/{id}/reject    — finalise denial
 
 
 @router.post(
-    "/add-drop/requests",
-    response_model=AddDropRequestResponse,
+    "/add-drop/batches",
+    response_model=AddDropBatchResponse,
     status_code=status.HTTP_201_CREATED,
 )
-async def submit_add_drop_request(
-    payload: AddDropRequestCreate,
+async def submit_add_drop_batch(
+    payload: AddDropBatchCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     email_service: EmailService = Depends(get_email_service),
 ):
-    student = await _resolve_student(db, current_user)
+    """
+    Student-facing batch submission. Carries one or more
+    (course_id, action) items. The agent reviews against:
+      - curriculum membership (course.department == student.department)
+      - semester parity (course offered this half of the year)
+      - prerequisites (via CurriculumComplianceAgent + Grade ledger)
+      - credit-load envelope (12–22 ECTS across the batch)
+      - per-item payment cross-check for ADD
 
-    # Confirm the registration belongs to the calling student.
+    The batch lands in AGENT_APPROVED or AGENT_DENIED and waits for
+    an officer; no changes are applied to the registration yet.
+    """
+    student = await _resolve_student(db, current_user)
     svc = AddDropService(db, email_service=email_service)
+
     registration = await svc.registrations.get(payload.registration_id)
     if registration is None or registration.student_id != student.id:
         raise HTTPException(
@@ -644,89 +687,180 @@ async def submit_add_drop_request(
         )
 
     try:
-        request = await svc.submit_request(
+        return await svc.submit_batch(
             registration_id=payload.registration_id,
-            course_id=payload.course_id,
-            action=payload.action,
-            deadline=payload.deadline,
+            items=[(it.course_id, it.action) for it in payload.items],
             student_user_id=current_user.id,
-        )
-    except AdjustmentDeniedError as exc:
-        # 422 carries the agent verdict so the portal can show
-        # plain-language reasons against the failed request.
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"compliance": exc.payload},
+            deadline=payload.deadline,
         )
     except InvalidAdjustmentRequestError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    return request
 
 
 @router.get(
-    "/add-drop/requests/{request_id}",
-    response_model=AddDropRequestResponse,
+    "/add-drop/batches/{batch_id}",
+    response_model=AddDropBatchResponse,
 )
-async def get_add_drop_request(
-    request_id: uuid.UUID,
+async def get_add_drop_batch(
+    batch_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Owner-or-officer read of one batch + its items + verdicts."""
     svc = AddDropService(db)
-    request = await svc.get(request_id)
-    if request is None:
+    batch = await svc.get_batch(batch_id)
+    if batch is None:
         raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "Add/drop request not found."
+            status.HTTP_404_NOT_FOUND, "Add/drop batch not found."
         )
-    # Owner OR officer may read.
-    if current_user.role not in {
-        UserRole.REGISTRAR_OFFICER, UserRole.ADMIN,
-    }:
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
         student = await _resolve_student(db, current_user)
-        registration = await svc.registrations.get(request.registration_id)
-        if registration is None or registration.student_id != student.id:
+        if batch.student_id != student.id:
             raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Add/drop request not found."
+                status.HTTP_404_NOT_FOUND, "Add/drop batch not found."
             )
-    return request
+    return batch
 
 
 @router.get(
-    "/registrations/{registration_id}/add-drop-requests",
-    response_model=list[AddDropRequestResponse],
+    "/me/add-drop/batches",
+    response_model=list[AddDropBatchResponse],
 )
-async def list_add_drop_requests(
-    registration_id: uuid.UUID,
+async def list_my_add_drop_batches(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Student view of their own batch history (newest first)."""
     student = await _resolve_student(db, current_user)
     svc = AddDropService(db)
-    registration = await svc.registrations.get(registration_id)
-    if registration is None or registration.student_id != student.id:
+    return await svc.list_batches_for_student(student.id)
+
+
+@router.get(
+    "/officer/add-drop/batches",
+    response_model=list[AddDropBatchResponse],
+)
+async def list_officer_add_drop_batches(
+    status_filter: Optional[AddDropBatchStatus] = Query(
+        default=None,
+        alias="status",
+        description=(
+            "Narrow the queue to one workflow status. Must be "
+            "AGENT_APPROVED or AGENT_DENIED. Omit to see both "
+            "(the default queue)."
+        ),
+    ),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer queue. Defaults to batches awaiting a human decision —
+    status in {AGENT_APPROVED, AGENT_DENIED}. Pass ``?status=...``
+    to fetch only one. Officers see every student's pending batch;
+    sorted oldest-first so the queue drains in submission order.
+    """
+    if status_filter is not None and status_filter not in {
+        AddDropBatchStatus.AGENT_APPROVED,
+        AddDropBatchStatus.AGENT_DENIED,
+    }:
         raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "Registration not found."
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "status filter must be AGENT_APPROVED or AGENT_DENIED — "
+            "the queue surfaces only batches awaiting an officer decision.",
         )
-    return await svc.list_for_registration(registration_id)
+    svc = AddDropService(db)
+    try:
+        return await svc.list_pending_batches(
+            officer_role=current_user.role,
+            statuses={status_filter} if status_filter else None,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
 
 
 @router.post(
-    "/officer/add-drop/{request_id}/override",
-    response_model=AddDropRequestResponse,
+    "/officer/add-drop/batches/{batch_id}/approve",
+    response_model=AddDropBatchResponse,
 )
-async def officer_override_add_drop(
-    request_id: uuid.UUID,
-    payload: AddDropOverrideRequest,
+async def officer_approve_add_drop_batch(
+    batch_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     email_service: EmailService = Depends(get_email_service),
 ):
+    """
+    Officer approves an AGENT_APPROVED batch — every item is
+    materialised against the registration and the batch transitions
+    to APPLIED.
+    """
     svc = AddDropService(db, email_service=email_service)
     try:
-        return await svc.officer_override(
-            request_id=request_id,
+        return await svc.officer_approve_batch(
+            batch_id,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.post(
+    "/officer/add-drop/batches/{batch_id}/override",
+    response_model=AddDropBatchResponse,
+)
+async def officer_override_add_drop_batch(
+    batch_id: uuid.UUID,
+    payload: OfficerJustificationRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """
+    Officer overrides an AGENT_DENIED batch — applies every item
+    against the registration despite the agent's denial.
+    Justification is required (officer is going against the agent).
+    """
+    svc = AddDropService(db, email_service=email_service)
+    try:
+        return await svc.officer_override_batch(
+            batch_id,
+            officer_role=current_user.role,
+            officer_id=current_user.id,
+            justification=payload.justification,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except InvalidAdjustmentRequestError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.post(
+    "/officer/add-drop/batches/{batch_id}/reject",
+    response_model=AddDropBatchResponse,
+)
+async def officer_reject_add_drop_batch(
+    batch_id: uuid.UUID,
+    payload: OfficerJustificationRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer finalises the denial — no changes are applied.
+    Works on either AGENT_APPROVED (officer disagrees with agent)
+    or AGENT_DENIED (officer confirms agent). Justification required.
+    """
+    svc = AddDropService(db)
+    try:
+        return await svc.officer_reject_batch(
+            batch_id,
             officer_role=current_user.role,
             officer_id=current_user.id,
             justification=payload.justification,

@@ -220,21 +220,43 @@ class AddDropAction(str, Enum):
 
 class AddDropRequestStatus(str, Enum):
     """
-    Lifecycle of an AddDropRequest from submission to applied change.
+    Per-item agent verdict on a single AddDropRequest row inside a
+    batch. The workflow status now lives on :class:`AddDropBatch`;
+    these values record only what the agent decided about *this*
+    course in the batch (so officer-visible reasoning per item
+    survives).
 
-    Flow:
-        PENDING                      (student just submitted)
-            -> APPROVED              (EnrollmentAdjustmentAgent passed)
-            -> DENIED                (agent blocked it)
-            -> OVERRIDDEN            (officer override of a DENIED request)
-        APPROVED | OVERRIDDEN
-            -> APPLIED               (change written to the registration)
+      PENDING   — agent has not yet evaluated this item
+      APPROVED  — agent passed this item
+      DENIED    — agent blocked this item (see reason field)
+      APPLIED   — applied to the registration (post-officer-decision)
     """
     PENDING = "PENDING"
     APPROVED = "APPROVED"
     DENIED = "DENIED"
     OVERRIDDEN = "OVERRIDDEN"
     APPLIED = "APPLIED"
+
+
+class AddDropBatchStatus(str, Enum):
+    """
+    Workflow status of a student-submitted add/drop batch.
+
+      PENDING_AGENT    — just submitted, awaiting agent review
+      AGENT_APPROVED   — agent passed the whole batch, awaiting officer
+      AGENT_DENIED     — agent blocked the batch, awaiting officer
+                         (officer may override and apply, or reject)
+      APPLIED          — officer approved or overrode; changes
+                         materialised on the registration
+      REJECTED         — officer finalised the denial; no changes
+      CANCELLED        — student withdrew the batch before resolution
+    """
+    PENDING_AGENT = "PENDING_AGENT"
+    AGENT_APPROVED = "AGENT_APPROVED"
+    AGENT_DENIED = "AGENT_DENIED"
+    APPLIED = "APPLIED"
+    REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
 
 
 class ScheduleConflictType(str, Enum):

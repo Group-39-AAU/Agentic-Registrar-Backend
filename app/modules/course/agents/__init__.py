@@ -34,6 +34,8 @@ from app.modules.course.agents.curriculum_compliance_agent import (
 )
 from app.modules.course.agents.enrollment_adjustment_agent import (
     AdjustmentResult,
+    BatchItemVerdict,
+    BatchResult,
     EnrollmentAdjustmentAgent,
     MIN_CREDIT_LOAD_ECTS,
 )
@@ -44,6 +46,8 @@ __all__ = [
     "AdjustmentResult",
     "Advice",
     "AllocationResult",
+    "BatchItemVerdict",
+    "BatchResult",
     "ComplianceCheckResult",
     "ConsultationResult",
     "CourseBaseAgent",

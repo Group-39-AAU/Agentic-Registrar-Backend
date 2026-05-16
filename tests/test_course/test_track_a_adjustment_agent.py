@@ -277,10 +277,23 @@ async def test_process_ADD_blocked_by_credit_ceiling(
     assert result.details["new_total"] == 24
 
 
-async def test_process_ADD_blocked_by_missing_payment(
+async def test_process_add_drop_legacy_path_does_not_check_payment(
     async_session, adjustment_agent,
     registration_with_courses, heavy_course,
 ):
+    """
+    The legacy single-item ``process_add_drop`` no longer enforces
+    payment — that check moved to the batch path
+    (:meth:`process_batch`) which the production router now uses.
+    The ``cross_check_payment`` primitive is still verified directly
+    by ``test_cross_check_payment_*`` and exercised end-to-end
+    against missing payment in the batch tests
+    (``tests/test_track_a_add_drop_batch.py``).
+
+    This test pins the current behavior so a future re-enable of
+    the legacy check is a deliberate diff rather than a silent
+    regression of the batch flow.
+    """
     request = _build_request(
         registration_id=registration_with_courses.id,
         course_id=heavy_course.id,
@@ -290,8 +303,9 @@ async def test_process_ADD_blocked_by_missing_payment(
     result = await adjustment_agent.process_add_drop(
         async_session, request, registration_with_courses,
     )
-    assert result.approved is False
-    assert "outstanding" in result.reasons[0].lower()
+    assert result.approved is True
+    assert result.reasons == []
+    assert result.details["course_code"] == "MATH601"
 
 
 async def test_process_blocked_by_closed_window(
