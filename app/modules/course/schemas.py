@@ -15,8 +15,8 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, EnrollmentStatus, RegistrationStatus,
-    RiskStatus, SponsorshipType,
+    AcademicPhase, AddDropAction, AddDropRequestStatus, EnrollmentStatus,
+    RegistrationStatus, RiskStatus, SponsorshipType,
 )
 
 
@@ -31,6 +31,7 @@ class AcademicTermResponse(BaseModel):
 
     id: uuid.UUID
     term_name: str
+    phase: AcademicPhase
     start_date: date
     end_date: date
     is_open: bool
@@ -51,6 +52,36 @@ class CourseResponse(BaseModel):
     credit_hours: int
     semester: int
     department: str
+
+
+class AvailableCoursesRequest(BaseModel):
+    """
+    Body for ``POST /courses/me/available-courses``. The student
+    picks the term they want to inspect; the service then decides
+    whether to show their registered selection or the curriculum
+    picker based on whether they already have a Registration for
+    that term.
+    """
+    term_id: uuid.UUID
+
+
+class AvailableCoursesResponse(BaseModel):
+    """
+    200-only payload from ``POST /me/available-courses``. Two shapes,
+    based on the term state (errors are surfaced as 404 / 409 instead
+    of returned here):
+
+      * Term is OPEN → ``is_registered=False`` and ``courses`` is the
+        curriculum picker (department + per-term semester filter).
+      * Term is CLOSED and started → ``is_registered=True``,
+        ``registration_id`` + ``registration_status`` set, ``courses``
+        is the active (non-dropped) registered selection.
+    """
+    term: AcademicTermResponse
+    is_registered: bool
+    registration_id: Optional[uuid.UUID] = None
+    registration_status: Optional[RegistrationStatus] = None
+    courses: list[CourseResponse]
 
 
 # ══════════════════════════════════════════════════════════════

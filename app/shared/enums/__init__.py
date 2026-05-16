@@ -37,6 +37,18 @@ class StreamType(str, Enum):
     SOCIAL = "SOCIAL"
 
 
+class AcademicPhase(str, Enum):
+    """
+    Ethiopian-context academic-year phase. Each academic year is split
+    into two phases:
+
+      ONE — September → end of January
+      TWO — February  → end of June
+    """
+    ONE = "ONE"
+    TWO = "TWO"
+
+
 class PaymentStatus(str, Enum):
     """Application payment lifecycle."""
     PENDING = "PENDING"

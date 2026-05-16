@@ -156,7 +156,10 @@ async def _get_or_create_application(
 
 
 async def _get_or_create_enrollment(
-    db: AsyncSession, user: User, app_row: UndergraduateApplication,
+    db: AsyncSession,
+    user: User,
+    app_row: UndergraduateApplication,
+    term: UndergraduateAdmissionTerm,
 ) -> Enrollment:
     existing = (
         await db.execute(
@@ -164,14 +167,18 @@ async def _get_or_create_enrollment(
         )
     ).scalar_one_or_none()
     if existing is not None:
-        # Reconcile department in case the catalog moved underneath us
-        # (e.g. earlier bootstrap used a different department label).
-        changed = False
+        # Reconcile department + admission_term_id in case the catalog
+        # moved underneath us (e.g. earlier bootstrap used a different
+        # department label, or predates the admission_term_id column).
+        changes: list[str] = []
         if existing.department != TARGET_DEPARTMENT:
             existing.department = TARGET_DEPARTMENT
-            changed = True
+            changes.append("department")
+        if existing.admission_term_id != term.id:
+            existing.admission_term_id = term.id
+            changes.append("admission_term_id")
         await db.flush()
-        suffix = " — department reconciled" if changed else ""
+        suffix = f" — reconciled: {', '.join(changes)}" if changes else ""
         print(
             f"  ↻  Enrollment already exists "
             f"(university_id={existing.university_id}){suffix}"
@@ -182,6 +189,7 @@ async def _get_or_create_enrollment(
         id=uuid.uuid4(),
         application_id=app_row.id,
         applicant_id=user.id,
+        admission_term_id=term.id,
         university_id=TARGET_UNIVERSITY_ID,
         department=TARGET_DEPARTMENT,
         enrollment_term="2026/2027",
@@ -251,7 +259,7 @@ async def main() -> None:
         term = await _get_or_create_admission_term(db)
         user = await _get_or_create_user(db)
         app_row = await _get_or_create_application(db, user, term)
-        await _get_or_create_enrollment(db, user, app_row)
+        await _get_or_create_enrollment(db, user, app_row, term)
         await _get_or_create_student(db, user)
         await _force_password(db, user)
         await db.commit()

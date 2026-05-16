@@ -33,6 +33,17 @@ class AcademicTermRepository:
             )
         ).scalar_one_or_none()
 
+    async def list_all(
+        self, *, is_open: Optional[bool] = None,
+    ) -> list[AcademicTerm]:
+        stmt = select(AcademicTerm).where(
+            AcademicTerm.is_deleted == False,  # noqa: E712
+        )
+        if is_open is not None:
+            stmt = stmt.where(AcademicTerm.is_open == is_open)
+        stmt = stmt.order_by(AcademicTerm.start_date.asc())
+        return list((await self.db.execute(stmt)).scalars().all())
+
 
 class CourseRepository:
     def __init__(self, db: AsyncSession) -> None:
