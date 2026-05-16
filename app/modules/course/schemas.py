@@ -15,7 +15,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.shared.enums import (
-    AcademicPhase, AddDropAction, AddDropRequestStatus, EnrollmentStatus,
+    AcademicPhase, AddDropAction, AddDropRequestStatus, ConsultationMode, EnrollmentStatus,
     RegistrationStatus, RiskStatus, SponsorshipType,
 )
 
@@ -411,6 +411,8 @@ class AdvisoryRecommendationRead(BaseModel):
     proposed_courses: list = Field(default_factory=list)
     recommended_courses: list = Field(default_factory=list)
     gap_analysis: dict = Field(default_factory=dict)
+    consultation_mode: Optional[ConsultationMode] = None
+    graduation_impact: Optional[dict] = None
     requires_officer_review: bool
     reviewed_by_id: Optional[uuid.UUID] = None
     reviewed_at: Optional[datetime] = None
@@ -420,6 +422,95 @@ class AdvisoryRecommendationRead(BaseModel):
 class AdvisoryReviewCloseRequest(BaseModel):
     """Officer payload for closing an advisory HITL review."""
     review_notes: str = Field(..., min_length=3, max_length=4000)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Advisory — demand-driven LLM consultations
+# ══════════════════════════════════════════════════════════════
+#
+# These three endpoints power the student's "Ask the Advisor" UX
+# from three distinct moments in the registration lifecycle:
+#
+#   POST /advisory/consult/pre-registration  (no draft yet)
+#   POST /advisory/consult/registration-plan (draft ready, validate)
+#   POST /advisory/consult/add-drop          (mid-term changes)
+#
+# Each shares the AcademicHistoryOverride mixin: until Track B
+# (grades) lands, the caller must supply CGPA + completed-course
+# IDs because the server cannot resolve them. Both fields are
+# required for now to keep the LLM payload faithful.
+
+
+# The pre-registration and registration-plan consult endpoints take
+# NO request body — every input (student, department, current
+# semester, CGPA, completed courses, current term, in-progress
+# registration draft) is server-resolved. The router exposes those
+# endpoints with no payload parameter.
+
+class AdvisoryConsultAddDropRequest(BaseModel):
+    """
+    Add/drop consult payload. Two shapes are accepted:
+
+      * Guided  — at least one of ``add_course_ids`` /
+        ``drop_course_ids`` is non-empty. The agent evaluates that
+        specific hypothetical change.
+      * Proactive — both lists empty (or body omitted entirely).
+        The agent reviews the active registration against the
+        curriculum + history and proactively recommends adds/drops
+        (or confirms the plan is healthy).
+
+    Everything else (the student's REGISTERED registration for the
+    open term, currently enrolled courses, completed courses, CGPA,
+    department curriculum) is server-resolved.
+    """
+    add_course_ids: list[uuid.UUID] = Field(default_factory=list)
+    drop_course_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class GraduationImpactRead(BaseModel):
+    """Forward-looking graduation-trajectory snapshot."""
+    semesters_remaining: Optional[int] = None
+    on_track: Optional[bool] = None
+    expected_graduation_semester: Optional[int] = None
+    delay_semesters: Optional[int] = None
+    critical_path_courses: list[str] = Field(default_factory=list)
+
+
+class ConsultationRecommendedCourse(BaseModel):
+    """A single LLM-recommended course (post-validation)."""
+    course_code: str
+    title: str
+    credit_hours: int
+    is_core: bool
+    reason: str
+    requires_override: Optional[bool] = None
+
+
+class AdvisoryConsultResponse(BaseModel):
+    """
+    Response shape for all three /advisory/consult/* endpoints.
+    Mirrors :class:`ConsultationResult` but uses the persisted row's
+    UUID + timestamps so the student can refer back to this exact
+    consultation later.
+    """
+    model_config = ConfigDict(from_attributes=False)
+
+    recommendation_id: uuid.UUID
+    student_id: uuid.UUID
+    term_id: uuid.UUID
+    mode: ConsultationMode
+    verdict: str
+    risk_status: RiskStatus
+    narrative: str
+    recommended_courses: list[ConsultationRecommendedCourse] = Field(
+        default_factory=list
+    )
+    warnings: list[str] = Field(default_factory=list)
+    graduation_impact: GraduationImpactRead = Field(
+        default_factory=GraduationImpactRead
+    )
+    filtered_recommendations: list[str] = Field(default_factory=list)
+    created_at: datetime
 
 
 # ══════════════════════════════════════════════════════════════

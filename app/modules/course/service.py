@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import Any, TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from app.shared.email.service import EmailService
@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.logging import get_logger, write_audit_log
 from app.modules.course.agents import (
     AcademicAdvisoryAgent, AcademicSchedulingAgent, Advice,
-    CurriculumComplianceAgent, EnrollmentAdjustmentAgent,
+    ConsultationResult, CurriculumComplianceAgent, EnrollmentAdjustmentAgent,
 )
 from app.modules.course.exceptions import (
     AdjustmentDeniedError,
@@ -53,12 +53,12 @@ from app.modules.course.models import (
 )
 from app.modules.course.repository import (
     AcademicTermRepository, AddDropRequestRepository,
-    AdvisoryRecommendationRepository, CourseRepository,
+    AdvisoryRecommendationRepository, CourseRepository, GradeRepository,
     RegistrationRepository, StudentRepository,
 )
 from app.shared.enums import (
-    AddDropAction, AddDropRequestStatus, EnrollmentStatus, OfficerRole,
-    RegistrationStatus, RiskStatus, SponsorshipType, UserRole,
+    AddDropAction, AddDropRequestStatus, ConsultationMode, EnrollmentStatus,
+    OfficerRole, RegistrationStatus, RiskStatus, SponsorshipType, UserRole,
 )
 
 logger = get_logger("course.service")
@@ -2252,6 +2252,280 @@ class AdvisoryService:
         self, student_id: uuid.UUID,
     ) -> list[AdvisoryRecommendation]:
         return await self.recommendations.list_for_student(student_id)
+
+    # ── Demand-driven consult endpoints ─────────────────────────
+    #
+    # Three wrappers around the single agent.consult() entry point —
+    # one per UX surface (pre-registration, plan review, add-drop).
+    # Every input that isn't the question itself is server-resolved:
+    #
+    #   - currently-open AcademicTerm   → AcademicTermRepository.get_open
+    #   - student profile + department  → Student row
+    #   - CGPA + completed courses      → GradeRepository (AUTHORISED)
+    #   - in-progress draft (plan)      → RegistrationRepository
+    #                                     .get_draft_for_student_in_term
+    #   - active registration (a/d)     → RegistrationRepository
+    #                                     .get_active_for_student_in_term
+    #
+    # The only caller-provided fields are the proposed add/drop
+    # course IDs — that is the question being asked, not student
+    # state. Hard-fail contract: LLMUnavailableError bubbles up and
+    # the router translates it to 503.
+
+    async def consult_pre_registration(
+        self,
+        student_id: uuid.UUID,
+    ) -> AdvisoryRecommendation:
+        """
+        "What should I take this semester?" — no caller inputs other
+        than identity. The agent reads completed courses + CGPA from
+        the Grade ledger and recommends a fresh plan against the
+        currently-open term's curriculum.
+        """
+        student, term = await self._resolve_student_and_open_term(
+            student_id
+        )
+        return await self._run_consultation(
+            student=student,
+            term=term,
+            mode=ConsultationMode.PRE_REGISTRATION,
+            proposed_course_ids=None,
+            add_course_ids=None,
+            drop_course_ids=None,
+        )
+
+    async def consult_registration_plan(
+        self,
+        student_id: uuid.UUID,
+    ) -> AdvisoryRecommendation:
+        """
+        "Is my draft sound?" — server reads the student's in-progress
+        Registration for the open term (status not in
+        {REGISTERED, ADD_DROP_WINDOW, CANCELLED}) and validates the
+        active course set. Raises EntityNotFoundError when the
+        student has no draft, so the router can return a helpful 404.
+        """
+        student, term = await self._resolve_student_and_open_term(
+            student_id
+        )
+        draft = await self.registrations.get_draft_for_student_in_term(
+            student_id=student_id, term_id=term.id,
+        )
+        if draft is None:
+            raise EntityNotFoundError(
+                "RegistrationDraft",
+                f"student {student.student_id} has no in-progress "
+                f"draft for term {term.term_name}",
+            )
+        proposed_ids = [
+            rc.course_id for rc in draft.courses if not rc.is_dropped
+        ]
+        return await self._run_consultation(
+            student=student,
+            term=term,
+            mode=ConsultationMode.REGISTRATION_PLAN,
+            proposed_course_ids=proposed_ids,
+            add_course_ids=None,
+            drop_course_ids=None,
+        )
+
+    async def consult_add_drop(
+        self,
+        student_id: uuid.UUID,
+        *,
+        add_course_ids: Optional[list[uuid.UUID]] = None,
+        drop_course_ids: Optional[list[uuid.UUID]] = None,
+    ) -> AdvisoryRecommendation:
+        """
+        "If I add X / drop Y, am I still on track?" — server finds
+        the student's REGISTERED / ADD_DROP_WINDOW registration in
+        the currently-open term, reads its active courses, and asks
+        the agent about the impact of the proposed delta.
+        """
+        student, term = await self._resolve_student_and_open_term(
+            student_id
+        )
+        registration = (
+            await self.registrations.get_active_for_student_in_term(
+                student_id=student_id, term_id=term.id,
+            )
+        )
+        if registration is None:
+            raise EntityNotFoundError(
+                "Registration",
+                f"student {student.student_id} is not REGISTERED for "
+                f"term {term.term_name}",
+            )
+        active_course_ids = [
+            rc.course_id for rc in registration.courses if not rc.is_dropped
+        ]
+        return await self._run_consultation(
+            student=student,
+            term=term,
+            mode=ConsultationMode.ADD_DROP,
+            proposed_course_ids=active_course_ids,
+            add_course_ids=add_course_ids,
+            drop_course_ids=drop_course_ids,
+        )
+
+    async def _resolve_student_and_open_term(
+        self, student_id: uuid.UUID,
+    ) -> tuple[Student, AcademicTerm]:
+        """
+        Look up the student + the currently-open AcademicTerm. Both
+        are required for every consult mode; either missing is a
+        404 the router surfaces.
+        """
+        student = (
+            await self.db.execute(
+                select(Student).where(
+                    Student.id == student_id,
+                    Student.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if student is None:
+            raise EntityNotFoundError("Student", str(student_id))
+
+        term = await self.terms.get_open()
+        if term is None:
+            raise EntityNotFoundError(
+                "AcademicTerm",
+                "no AcademicTerm is currently open for registration",
+            )
+        return student, term
+
+    async def _run_consultation(
+        self,
+        *,
+        student: Student,
+        term: AcademicTerm,
+        mode: ConsultationMode,
+        proposed_course_ids: Optional[list[uuid.UUID]],
+        add_course_ids: Optional[list[uuid.UUID]],
+        drop_course_ids: Optional[list[uuid.UUID]],
+    ) -> AdvisoryRecommendation:
+        cgpa, completed_course_ids = await self._resolve_academic_history(
+            student=student,
+        )
+        department = student.department or await self._fallback_department(
+            proposed_course_ids
+        )
+
+        student_context: dict[str, Any] = {
+            "student_id": student.student_id,
+            "department": department,
+            "current_semester": student.current_semester,
+            "cgpa": cgpa,                  # may be None — agent + LLM tolerate
+            "sponsorship_type": (
+                student.sponsorship_type.value
+                if student.sponsorship_type else None
+            ),
+        }
+        current_term = {
+            "term_id": str(term.id),
+            "term_name": term.term_name,
+            "start_date": term.start_date.isoformat(),
+            "end_date": term.end_date.isoformat(),
+            "is_open": term.is_open,
+        }
+
+        result: ConsultationResult = await self.agent.consult(
+            self.db,
+            mode=mode,
+            student_context=student_context,
+            completed_course_ids=completed_course_ids,
+            proposed_course_ids=proposed_course_ids,
+            add_course_ids=add_course_ids,
+            drop_course_ids=drop_course_ids,
+            current_term=current_term,
+        )
+
+        recommendation = AdvisoryRecommendation(
+            student_id=student.id,
+            term_id=term.id,
+            risk_status=result.risk_status,
+            risk_explanation=result.narrative,
+            proposed_courses=[
+                str(cid) for cid in (proposed_course_ids or [])
+            ],
+            recommended_courses=result.recommended_courses,
+            gap_analysis={
+                "completed_count": len(completed_course_ids),
+                "warnings": result.warnings,
+                "filtered_recommendations": result.filtered_recommendations,
+                "verdict": result.verdict,
+            },
+            consultation_mode=mode,
+            graduation_impact=result.graduation_impact,
+            requires_officer_review=False,
+        )
+        self.db.add(recommendation)
+        await self.db.flush()
+
+        write_audit_log(
+            action="course.advisory.consulted",
+            actor_role=UserRole.AGENT.value,
+            actor_id=None,
+            resource_type="AdvisoryRecommendation",
+            resource_id=recommendation.id,
+            decision=result.verdict,
+            metadata={
+                "agent_id": self.agent.agent_id,
+                "mode": mode.value,
+                "risk_status": result.risk_status.value,
+                "proposed_count": len(proposed_course_ids or []),
+                "added_count": len(add_course_ids or []),
+                "dropped_count": len(drop_course_ids or []),
+                "filtered_count": len(result.filtered_recommendations),
+                "cgpa": cgpa,
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(recommendation)
+        return recommendation
+
+    async def _resolve_academic_history(
+        self,
+        *,
+        student: Student,
+    ) -> tuple[Optional[float], set[uuid.UUID]]:
+        """
+        Resolve (CGPA, completed_course_ids) from the Grade ledger.
+
+        Returns ``(None, set())`` for a fresh student with no
+        AUTHORISED grades — the agent and LLM treat None CGPA as
+        "no academic history", which is the correct signal for a
+        first-semester student.
+        """
+        grades_repo = GradeRepository(self.db)
+        cgpa = await grades_repo.compute_cgpa(student.id)
+        completed = await grades_repo.completed_course_ids(student.id)
+        return cgpa, completed
+
+    async def _fallback_department(
+        self, proposed_course_ids: Optional[list[uuid.UUID]],
+    ) -> str:
+        """
+        Last-resort department lookup — used only when a Student row
+        somehow lacks the denormalised department field. New students
+        always have it; this only protects legacy seed rows.
+        """
+        if not proposed_course_ids:
+            any_course = (
+                await self.db.execute(
+                    select(Course).where(
+                        Course.is_deleted == False  # noqa: E712
+                    ).limit(1)
+                )
+            ).scalar_one_or_none()
+            return any_course.department if any_course else "Unknown"
+        first_course = (
+            await self.db.execute(
+                select(Course).where(Course.id == proposed_course_ids[0])
+            )
+        ).scalar_one_or_none()
+        return first_course.department if first_course else "Unknown"
 
 
 class OnboardingService:

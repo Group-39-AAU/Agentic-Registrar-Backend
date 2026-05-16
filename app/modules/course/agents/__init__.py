@@ -18,6 +18,7 @@ extends :class:`app.ai.base.BaseAgent`.
 from app.modules.course.agents.academic_advisory_agent import (
     AcademicAdvisoryAgent,
     Advice,
+    ConsultationResult,
     GapAnalysis,
 )
 from app.modules.course.agents.academic_scheduling_agent import (
@@ -44,6 +45,7 @@ __all__ = [
     "Advice",
     "AllocationResult",
     "ComplianceCheckResult",
+    "ConsultationResult",
     "CourseBaseAgent",
     "CurriculumComplianceAgent",
     "EnrollmentAdjustmentAgent",

@@ -8,10 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.llm_client import LLMUnavailableError
 from app.core.dependencies import get_current_user, get_email_service
 from app.database.session import get_db
 from app.modules.auth.models import User
-from app.modules.course.models import ClassScheduleSlot, Instructor
+from app.modules.course.models import (
+    AdvisoryRecommendation, ClassScheduleSlot, Instructor,
+)
 from app.modules.programs.models import AcademicProgram
 from app.modules.course.exceptions import (
     AdjustmentDeniedError,
@@ -31,9 +34,13 @@ from app.modules.course.schemas import (
     AddDropOverrideRequest,
     AddDropRequestCreate,
     AddDropRequestResponse,
+    AdvisoryConsultAddDropRequest,
+    AdvisoryConsultResponse,
     AdvisoryEvaluateRequest,
     AdvisoryRecommendationRead,
     AdvisoryReviewCloseRequest,
+    ConsultationRecommendedCourse,
+    GraduationImpactRead,
     AssignInstructorToSlotRequest,
     AvailableCoursesRequest,
     AvailableCoursesResponse,
@@ -825,6 +832,172 @@ async def list_high_risk_advisory_queue(
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+
+
+# ── Demand-driven LLM consultations ──────────────────────────────
+#
+# Three student-initiated entry points to the AcademicAdvisoryAgent's
+# Gemini-backed consult flow. Hard-fail contract: if the LLM cannot
+# answer (no GEMINI_API_KEY, timeout, API error, malformed JSON), we
+# return 503 ServiceUnavailable rather than silently degrading to
+# the rule engine — these endpoints exist precisely to deliver the
+# deep graduation-trajectory analysis the rule engine cannot.
+
+
+def _to_consult_response(
+    rec: AdvisoryRecommendation,
+) -> AdvisoryConsultResponse:
+    """
+    Project a persisted AdvisoryRecommendation row into the consult
+    response shape. Reads the LLM-specific fields (graduation_impact,
+    consultation_mode, the recommended_courses LLM-shape) and surfaces
+    the warnings + filtered_recommendations that the agent stuffed
+    into ``gap_analysis`` for the consult flow.
+    """
+    gap = rec.gap_analysis or {}
+    grad = rec.graduation_impact or {}
+    return AdvisoryConsultResponse(
+        recommendation_id=rec.id,
+        student_id=rec.student_id,
+        term_id=rec.term_id,
+        mode=rec.consultation_mode,
+        verdict=str(gap.get("verdict") or "NEEDS_REVIEW"),
+        risk_status=rec.risk_status,
+        narrative=rec.risk_explanation,
+        recommended_courses=[
+            ConsultationRecommendedCourse(
+                course_code=str(item.get("course_code", "")),
+                title=str(item.get("title", "")),
+                credit_hours=int(item.get("credit_hours") or 0),
+                is_core=bool(item.get("is_core", False)),
+                reason=str(item.get("reason", "")),
+                requires_override=item.get("requires_override"),
+            )
+            for item in (rec.recommended_courses or [])
+            if isinstance(item, dict)
+        ],
+        warnings=[str(w) for w in (gap.get("warnings") or [])],
+        graduation_impact=GraduationImpactRead(
+            semesters_remaining=grad.get("semesters_remaining"),
+            on_track=grad.get("on_track"),
+            expected_graduation_semester=grad.get(
+                "expected_graduation_semester"
+            ),
+            delay_semesters=grad.get("delay_semesters"),
+            critical_path_courses=list(
+                grad.get("critical_path_courses") or []
+            ),
+        ),
+        filtered_recommendations=list(
+            gap.get("filtered_recommendations") or []
+        ),
+        created_at=rec.created_at,
+    )
+
+
+@router.post(
+    "/advisory/consult/pre-registration",
+    response_model=AdvisoryConsultResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def consult_pre_registration(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    "What should I take this semester?" — no body needed. Server
+    reads the student's profile, the open AcademicTerm, the student's
+    completed courses + CGPA from the Grade ledger, and the
+    department curriculum; the LLM returns a recommended plan +
+    graduation-trajectory analysis.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = AdvisoryService(db)
+    try:
+        rec = await svc.consult_pre_registration(student_id=student.id)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except LLMUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Advisory LLM unavailable: {exc.reason}",
+        )
+    return _to_consult_response(rec)
+
+
+@router.post(
+    "/advisory/consult/registration-plan",
+    response_model=AdvisoryConsultResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def consult_registration_plan(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    "Is my current draft sound?" — no body needed. Server reads the
+    student's in-progress Registration for the open term and
+    validates the active course set against curriculum + history.
+    Returns 404 when the student has no draft (they should hit
+    /advisory/consult/pre-registration instead).
+    """
+    student = await _resolve_student(db, current_user)
+    svc = AdvisoryService(db)
+    try:
+        rec = await svc.consult_registration_plan(student_id=student.id)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except LLMUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Advisory LLM unavailable: {exc.reason}",
+        )
+    return _to_consult_response(rec)
+
+
+@router.post(
+    "/advisory/consult/add-drop",
+    response_model=AdvisoryConsultResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def consult_add_drop(
+    payload: AdvisoryConsultAddDropRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Two operating modes:
+
+      - **Guided** ("if I add X / drop Y, am I still on track?") —
+        body carries one or both of ``add_course_ids`` and
+        ``drop_course_ids``; the agent evaluates that specific
+        hypothetical against the current registration.
+      - **Proactive** ("what, if anything, should I change?") —
+        body is empty (or both lists empty); the agent reviews the
+        active registration against the curriculum + history and
+        either recommends concrete adds / drops with reasons, or
+        confirms the plan is already healthy.
+
+    In both modes the server finds the student's REGISTERED /
+    ADD_DROP_WINDOW registration in the open term. Returns 404 when
+    the student has no active registration.
+    """
+    student = await _resolve_student(db, current_user)
+    svc = AdvisoryService(db)
+    try:
+        rec = await svc.consult_add_drop(
+            student_id=student.id,
+            add_course_ids=payload.add_course_ids,
+            drop_course_ids=payload.drop_course_ids,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except LLMUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Advisory LLM unavailable: {exc.reason}",
+        )
+    return _to_consult_response(rec)
 
 
 @router.post(

@@ -132,6 +132,25 @@ class RiskStatus(str, Enum):
     HIGH = "HIGH"
 
 
+class ConsultationMode(str, Enum):
+    """
+    Discriminator for the demand-driven advisory consultations exposed
+    to students. Persisted on AdvisoryRecommendation rows so the same
+    table holds both rule-engine submit-time evaluations (mode is
+    NULL — legacy) and LLM-powered demand consultations.
+
+      - PRE_REGISTRATION : student has no draft yet, asks "what should
+                           I take this term?"
+      - REGISTRATION_PLAN: student has a proposed list, asks "is this
+                           plan sound?"
+      - ADD_DROP         : student is mid-term, asks "if I add X /
+                           drop Y, am I still on track to graduate?"
+    """
+    PRE_REGISTRATION = "PRE_REGISTRATION"
+    REGISTRATION_PLAN = "REGISTRATION_PLAN"
+    ADD_DROP = "ADD_DROP"
+
+
 class RegistrationStatus(str, Enum):
     """
     Per-student-per-term registration lifecycle.

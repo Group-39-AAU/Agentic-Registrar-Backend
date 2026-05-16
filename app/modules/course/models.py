@@ -26,17 +26,17 @@ from datetime import date, datetime, time
 from typing import Optional
 
 from sqlalchemy import (
-    JSON, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer,
-    String, Text, Time, UniqueConstraint,
+    JSON, Boolean, CheckConstraint, Date, DateTime, Enum, Float, ForeignKey,
+    Integer, String, Text, Time, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteBase
 from app.shared.enums import (
-    AcademicPhase, AddDropAction, AddDropRequestStatus, EnrollmentStatus,
-    OfficerRole, RegistrationStatus, RiskStatus, ScheduleConflictStatus,
-    ScheduleConflictType, SponsorshipType,
+    AcademicPhase, AddDropAction, AddDropRequestStatus, ConsultationMode, EnrollmentStatus,
+    GradeLetter, GradeSubmissionStatus, OfficerRole, RegistrationStatus,
+    RiskStatus, ScheduleConflictStatus, ScheduleConflictType, SponsorshipType,
 )
 
 
@@ -740,6 +740,28 @@ class AdvisoryRecommendation(Base):
         JSON, nullable=False, default=dict
     )
 
+    # Demand-driven consultation discriminator. NULL = legacy submit-time
+    # rule-based evaluation (the AcademicAdvisoryAgent.process_task path).
+    # Non-NULL = LLM-backed consultation initiated by the student through
+    # the /advisory/consult/* endpoints, where the value identifies which
+    # of the three modes was invoked.
+    consultation_mode: Mapped[Optional[ConsultationMode]] = mapped_column(
+        nullable=True, index=True,
+    )
+    # LLM-produced graduation-trajectory analysis. NULL on legacy rows.
+    # Shape (informational, not enforced at the column level):
+    #   {
+    #     "semesters_remaining": int,
+    #     "on_track": bool,
+    #     "expected_graduation_semester": int,
+    #     "delay_semesters": int,            # 0 if on track
+    #     "critical_path_courses": [str],    # course codes
+    #     "warnings": [str],
+    #   }
+    graduation_impact: Mapped[Optional[dict]] = mapped_column(
+        JSON, nullable=True,
+    )
+
     # Officer-review fields (HITL escalation gate for HIGH risk).
     requires_officer_review: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, index=True,
@@ -868,4 +890,128 @@ class ScheduleConflict(Base):
     )
     other_section: Mapped[Optional["Section"]] = relationship(
         foreign_keys=[other_section_id], lazy="selectin",
+    )
+
+
+# ── Track B precursor — Grade ledger ─────────────────────────────
+
+
+class Grade(SoftDeleteBase):
+    """
+    Per-student per-course per-term grade record.
+
+    Lives in Track A so the Academic Advisory Agent can resolve a
+    student's CGPA + completed-course set server-side without
+    asking the caller to provide them. Shape is Track-B-aligned so
+    the grading lifecycle can extend rather than replace it:
+
+      - ``status`` advances DRAFT → SUBMITTED → FLAGGED → AUTHORISED
+        → REJECTED (SDS Table 60 lifecycle). Only AUTHORISED grades
+        count toward CGPA.
+      - ``letter_grade`` is nullable until SUBMITTED so an instructor
+        can save partial drafts.
+      - ``numeric_score`` is the underlying 0–100 score; the letter
+        grade is the official outcome but the score is preserved for
+        anomaly detection (AssessmentValidationAgent).
+      - ``credit_hours`` is snapshotted from the Course at submission
+        time so curriculum credit-hour edits do not retroactively
+        change a past CGPA.
+      - ``grade_points`` caches ``credit_hours × points(letter_grade)``
+        so CGPA computation is a SUM/SUM in one query.
+
+    UniqueConstraint(student_id, course_id, term_id) prevents two
+    grades for the same (student, course, term) — re-grading lands
+    via a status transition (REJECTED → DRAFT → ...), not a new row.
+    """
+
+    __tablename__ = "grades"
+
+    student_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("students.id"),
+        nullable=False,
+        index=True,
+    )
+    course_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("courses.id"),
+        nullable=False,
+        index=True,
+    )
+    term_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("academic_terms.id"),
+        nullable=False,
+        index=True,
+    )
+    section_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sections.id"),
+        nullable=True,
+        index=True,
+    )
+
+    # GradeLetter member NAMES diverge from VALUES (e.g. ``A_MINUS`` →
+    # ``"A-"``), and SQLAlchemy's default enum binding uses ``.name``
+    # which would mismatch the Postgres enum literals from the
+    # migration ("A", "A-", "B+", ...). ``values_callable`` forces the
+    # bind to use ``.value`` so the canonical letter goes to the DB.
+    letter_grade: Mapped[Optional[GradeLetter]] = mapped_column(
+        Enum(
+            GradeLetter,
+            name="gradeletter",
+            values_callable=lambda enum_cls: [m.value for m in enum_cls],
+            create_type=False,
+        ),
+        nullable=True,
+    )
+    numeric_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+    )
+    credit_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    grade_points: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+    )
+
+    status: Mapped[GradeSubmissionStatus] = mapped_column(
+        nullable=False,
+        default=GradeSubmissionStatus.DRAFT,
+        index=True,
+    )
+
+    # Submission trail. ``entered_by_id`` is the instructor User row;
+    # ``authorised_by_id`` is the officer who flipped the grade to
+    # AUTHORISED (SRS Course-FR-09). Both nullable until the
+    # corresponding lifecycle transition fires.
+    entered_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True,
+    )
+    entered_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    authorised_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True,
+    )
+    authorised_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    student: Mapped["Student"] = relationship(lazy="selectin")
+    course: Mapped["Course"] = relationship(lazy="selectin")
+    term: Mapped["AcademicTerm"] = relationship(lazy="selectin")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "student_id", "course_id", "term_id",
+            name="uq_grade_per_student_course_term",
+        ),
+        CheckConstraint(
+            "numeric_score IS NULL OR "
+            "(numeric_score >= 0 AND numeric_score <= 100)",
+            name="ck_grade_score_range",
+        ),
+        CheckConstraint(
+            "credit_hours BETWEEN 1 AND 12",
+            name="ck_grade_credit_hours_range",
+        ),
     )

@@ -35,16 +35,19 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 from app.core.security import hash_password
+from datetime import datetime, timezone
+
 from app.modules.auth.models import User
 from app.modules.course.models import (
     AcademicTerm, AdvisoryRecommendation, Classroom, Course,
-    CoursePrerequisite, Instructor, InstructorAssignment, Registration,
+    CoursePrerequisite, Grade, Instructor, InstructorAssignment, Registration,
     RegistrationCourse, RegistrationStatusHistory, Student,
     CourseManagementOfficer,
 )
+from app.modules.course.grade_points import points_for
 from app.shared.enums import (
-    AcademicPhase, EnrollmentStatus, OfficerRole, RegistrationStatus,
-    RiskStatus, SponsorshipType, UserRole,
+    AcademicPhase, EnrollmentStatus, GradeLetter, GradeSubmissionStatus, 
+    OfficerRole, RegistrationStatus, RiskStatus, SponsorshipType, UserRole,
 )
 
 
@@ -1346,6 +1349,148 @@ async def _seed_bulk_se_upper_year_cohorts(
         print("⚠️  Bulk SE upper-year cohorts already present — skipping.")
 
 
+# ══════════════════════════════════════════════════════════════
+#  Grades — academic history backing the advisory consult flow
+# ══════════════════════════════════════════════════════════════
+# The Academic Advisory Agent's demand-driven consult endpoints
+# resolve a student's CGPA + completed-course set from the Grade
+# ledger. To make the consult flow demoable end-to-end we backfill
+# AUTHORISED grades for every prior semester of every seeded student
+# whose ``current_semester`` is greater than 1.
+#
+# The grade for a given (student, course) is deterministic from the
+# student id + course code so re-running the seed produces the same
+# CGPA every time. The distribution is biased mildly toward B's so
+# the average student lands around CGPA 3.0 — comfortably above the
+# Warning floor (2.0) but not so high that everyone looks like a
+# Distinction candidate.
+
+# Cycle of letter grades used by the deterministic per-student
+# distribution. Skipping I and NG because they are edge-case marks
+# that route through AcademicStandingAgent.handleEdgeCase rather
+# than counting toward CGPA — irrelevant for the advisory baseline.
+_SEED_GRADE_CYCLE = (
+    GradeLetter.A,
+    GradeLetter.B_PLUS,
+    GradeLetter.B,
+    GradeLetter.B_MINUS,
+    GradeLetter.C_PLUS,
+    GradeLetter.A_MINUS,
+    GradeLetter.B,
+    GradeLetter.C,
+)
+
+
+def _seeded_letter_for(
+    student_id: str, course_code: str,
+) -> GradeLetter:
+    """Deterministic grade picker — same input → same letter every run."""
+    bucket = (hash(f"{student_id}:{course_code}") & 0xFFFF) % len(
+        _SEED_GRADE_CYCLE
+    )
+    return _SEED_GRADE_CYCLE[bucket]
+
+
+async def _seed_grades(
+    session: AsyncSession,
+    terms: list[AcademicTerm],
+    courses_by_code: dict[str, Course],
+) -> None:
+    """
+    Seed AUTHORISED grades for every seeded student's completed
+    semesters. Each row is keyed by ``_uid("grade", student_id,
+    course_code)`` so the seed is idempotent.
+
+    Track-B-aligned shape: status=AUTHORISED, instructor entered,
+    officer authorised, grade_points cached. Track B's grade-entry
+    pipeline will use the same fields when it ships.
+    """
+    students = (await session.execute(select(Student))).scalars().all()
+    instructors = (await session.execute(select(Instructor))).scalars().all()
+    officers = (
+        await session.execute(select(CourseManagementOfficer))
+    ).scalars().all()
+    if not students or not instructors or not officers:
+        print("⚠️  Skipping grades — no students/instructors/officers seeded.")
+        return
+
+    instructor_user_id = instructors[0].user_id
+    officer_user_id = officers[0].user_id
+    # Anchor every seeded grade to the earliest term so completed
+    # semesters predate the currently-open registration term.
+    history_term = min(terms, key=lambda t: t.start_date)
+
+    existing = (await session.execute(select(Grade))).scalars().all()
+    existing_pairs = {(g.student_id, g.course_id, g.term_id) for g in existing}
+
+    new_count = 0
+    for student in students:
+        if student.current_semester <= 1:
+            continue   # nothing to backfill — they have no prior terms
+        if not student.department:
+            continue   # legacy row without denormalised department
+        for sem in range(1, student.current_semester):
+            # Use SLOT 1 only — backfilling all 4 slots × every prior
+            # semester explodes the row count and a single course per
+            # semester is enough to give the agent a CGPA + a few
+            # completed courses to reason against.
+            for slot in range(1, 5):
+                code = _course_code(student.department, sem, slot)
+                course = courses_by_code.get(code)
+                if course is None:
+                    continue
+                key = (student.id, course.id, history_term.id)
+                if key in existing_pairs:
+                    continue
+
+                letter = _seeded_letter_for(student.student_id, code)
+                pts = points_for(letter)
+                grade_points = (
+                    pts * course.credit_hours if pts is not None else None
+                )
+                # Roughly map letters to underlying scores so Track B's
+                # anomaly detector has plausible numeric_score data.
+                numeric = {
+                    GradeLetter.A:        92.0,
+                    GradeLetter.A_MINUS:  87.0,
+                    GradeLetter.B_PLUS:   83.0,
+                    GradeLetter.B:        78.0,
+                    GradeLetter.B_MINUS:  73.0,
+                    GradeLetter.C_PLUS:   68.0,
+                    GradeLetter.C:        63.0,
+                    GradeLetter.C_MINUS:  58.0,
+                    GradeLetter.D:        53.0,
+                    GradeLetter.F:        40.0,
+                }.get(letter)
+
+                session.add(Grade(
+                    id=_uid("grade", student.student_id, code),
+                    student_id=student.id,
+                    course_id=course.id,
+                    term_id=history_term.id,
+                    letter_grade=letter,
+                    numeric_score=numeric,
+                    credit_hours=course.credit_hours,
+                    grade_points=grade_points,
+                    status=GradeSubmissionStatus.AUTHORISED,
+                    entered_by_id=instructor_user_id,
+                    entered_at=datetime.now(timezone.utc),
+                    authorised_by_id=officer_user_id,
+                    authorised_at=datetime.now(timezone.utc),
+                ))
+                new_count += 1
+
+    await session.commit()
+    if new_count:
+        print(
+            f"✅ Seeded {new_count} AUTHORISED grade rows backfilling "
+            f"{len([s for s in students if s.current_semester > 1])} "
+            "students' prior-semester history."
+        )
+    else:
+        print("⚠️  All backfill grades already present — skipping.")
+
+
 async def seed() -> None:
     engine = create_async_engine(DATABASE_URL, echo=False)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -1374,6 +1519,10 @@ async def seed() -> None:
         await _seed_bulk_se_upper_year_cohorts(
             session, open_term, courses_by_code,
         )
+        # Backfill prior-semester grades so the advisory consult
+        # endpoints have CGPA + completed-course history to reason
+        # over without the caller providing anything.
+        await _seed_grades(session, terms, courses_by_code)
 
     await engine.dispose()
     print("\n🎉 Course Management seed complete (Phase 0 + Track A samples).")
