@@ -28,10 +28,30 @@ from app.modules.course.exceptions import (
     GradeBatchNotEditableError, IncompleteGradeSubmissionError,
     InvalidBreakdownError, UnauthorizedActorError,
 )
+from app.modules.course.grading.agents import GradingMonitorAgent
 from app.modules.course.grading.models import (
     AssessmentBreakdown, AssessmentComponent, GradeBatch,
     StudentComponentScore,
 )
+
+
+class _ApproveLLM:
+    """
+    Minimal stand-in for :class:`LLMClient` used by PR 2 tests that
+    just need the submit flow to succeed (the agent's verdict isn't
+    what the test is asserting). Always APPROVE.
+    """
+
+    async def review_grade_batch_as_dh(self, review_payload):
+        return {
+            "verdict": "APPROVE",
+            "flags": [],
+            "reasoning": "PR 2 test stub — always APPROVE.",
+        }
+
+
+def _approve_agent() -> GradingMonitorAgent:
+    return GradingMonitorAgent(llm_client=_ApproveLLM())
 from app.modules.course.grading.schemas import (
     AssessmentBreakdownCreate, AssessmentComponentCreate,
     BulkScoreWrite, ScoreCellWrite,
@@ -575,7 +595,7 @@ async def test_submit_happy_path_writes_grades_and_approves(
 ):
     """End-to-end: enter all cells, submit, verify Grade rows + verdict."""
     w = grading_scenario
-    svc = InstructorGradingService(async_session)
+    svc = InstructorGradingService(async_session, grading_agent=_approve_agent())
     bd = await svc.upsert_breakdown(
         user_id=w["instr_user"].id,
         section_id=w["section"].id, course_id=w["course"].id,

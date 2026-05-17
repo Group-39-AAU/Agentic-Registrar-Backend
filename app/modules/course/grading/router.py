@@ -38,7 +38,8 @@ from app.modules.course.exceptions import (
 )
 from app.modules.course.grading.schemas import (
     AssessmentBreakdownCreate, AssessmentBreakdownResponse,
-    BulkScoreWrite, GradeBatchResponse, GradeBatchSubmitResponse,
+    BulkScoreWrite, GradeAgentReviewResponse, GradeBatchResponse,
+    GradeBatchSubmitResponse, InstructorJustificationRequest,
     InstructorSectionAssignmentResponse, SectionCourseRosterResponse,
 )
 from app.modules.course.grading.service import InstructorGradingService
@@ -354,15 +355,26 @@ async def submit_batch(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    DRAFT → SUBMITTED (or FLAGGED if the agent flags it; PR 2 stub
-    always APPROVES). The endpoint:
+    DRAFT → SUBMITTED (or FLAGGED if the LLM-driven
+    GradingMonitorAgent flags it). The endpoint:
 
       1. Refuses if any roster student is missing any component score
          (422 with a structured ``missing`` list for the UI to highlight).
       2. Computes weighted_pct + AAU letter per student.
       3. Upserts ``Grade`` rows at status=SUBMITTED.
-      4. Asks the grading-monitor agent for a verdict.
-      5. Returns the verdict and per-student outcomes.
+      4. Asks the GradingMonitorAgent (LLM as department head, with
+         deterministic tool evidence) for a verdict.
+      5. Persists the verdict + tool findings + LLM reasoning into
+         ``grade_agent_reviews``.
+      6. Returns the verdict and per-student outcomes.
+
+    Possible ``agent_verdict`` values:
+      - APPROVE  → batch transitions to SUBMITTED (awaits DH auth).
+      - FLAG     → batch transitions to FLAGGED. Instructor calls
+                   POST ``/justify`` (with a written reason) or POST
+                   ``/reopen`` (to edit scores) to iterate.
+      - PENDING  → LLM was unavailable. Batch stays SUBMITTED; the
+                   DH workflow (PR 4) will re-trigger the agent.
 
     409 if the batch isn't in DRAFT.
     """
@@ -370,6 +382,109 @@ async def submit_batch(
     svc = InstructorGradingService(db)
     try:
         return await svc.submit_batch(
+            user_id=current_user.id, batch_id=batch_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+# ══════════════════════════════════════════════════════════════
+#  PR 3 — Iteration loop after a FLAG
+# ══════════════════════════════════════════════════════════════
+
+
+@router.post(
+    "/batches/{batch_id}/justify",
+    response_model=GradeBatchSubmitResponse,
+    summary="Attach instructor justification to a FLAGGED batch and re-run agent",
+)
+async def submit_justification(
+    batch_id: uuid.UUID,
+    payload: InstructorJustificationRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The instructor writes a justification (10-4000 chars) explaining
+    why the agent's prior FLAG concerns are unfounded. The agent is
+    re-run with the justification appended to its context; the LLM
+    may APPROVE on this iteration or maintain the FLAG with a
+    refined explanation.
+
+    ``iteration_count`` bumps; a new ``grade_agent_reviews`` row is
+    appended. From any status other than FLAGGED this is a 409.
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.submit_justification(
+            user_id=current_user.id,
+            batch_id=batch_id,
+            justification=payload.justification,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+@router.post(
+    "/batches/{batch_id}/reopen",
+    response_model=GradeBatchResponse,
+    summary="Move a FLAGGED batch back to DRAFT so scores can be edited",
+)
+async def reopen_batch(
+    batch_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Use when the instructor accepts the agent's flag and wants to
+    correct grades rather than justify them. Status FLAGGED → DRAFT;
+    ``iteration_count`` bumps so the next submit's agent run records
+    on the right iteration. The breakdown stays locked (cell values
+    survive); ``DELETE /scores`` is the path for a full reset.
+
+    409 if the batch isn't FLAGGED.
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.reopen_batch(
+            user_id=current_user.id, batch_id=batch_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+# ══════════════════════════════════════════════════════════════
+#  PR 3 — Agent review history (instructor read; DH in PR 4)
+# ══════════════════════════════════════════════════════════════
+
+
+@router.get(
+    "/batches/{batch_id}/agent-reviews",
+    response_model=list[GradeAgentReviewResponse],
+    summary="Append-only history of GradingMonitorAgent runs for this batch",
+)
+async def list_agent_reviews(
+    batch_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns every agent run on this batch, most-recent-first. Each
+    row carries the verdict (APPROVE / FLAG / PENDING), the LLM's
+    plain-English reasoning, the structured flags, the full tool
+    context the LLM saw, and which agent instance ran. Useful to
+    the instructor for understanding the last verdict, and to the
+    department head (PR 4) for seeing the full iteration history.
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.list_agent_reviews(
             user_id=current_user.id, batch_id=batch_id,
         )
     except Exception as exc:

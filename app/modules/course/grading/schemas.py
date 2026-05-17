@@ -277,14 +277,53 @@ class GradeBatchSubmitResponse(BaseModel):
     """
     Reply to ``POST /batches/{bid}/submit``. Carries the new batch
     status, the computed per-student outcomes, and the agent's
-    verdict (PR 2: always APPROVE from the stub; PR 3: real LLM
-    verdict).
+    verdict.
+
+    ``agent_verdict`` is ``APPROVE`` / ``FLAG`` / ``PENDING``;
+    ``PENDING`` means the LLM call failed and the agent needs a
+    manual re-trigger (PR 4 endpoint). The batch stays at SUBMITTED
+    in that case; nothing is deadlocked.
     """
     batch_id: uuid.UUID
     status: GradeSubmissionStatus
     iteration: int
     submitted_at: datetime
-    agent_verdict: Literal["APPROVE", "FLAG"]
-    agent_flags: list[str]
+    agent_verdict: Literal["APPROVE", "FLAG", "PENDING"]
+    agent_flags: list[dict] = Field(default_factory=list)
     agent_reasoning: str
     grades: list[SubmittedGradeRow]
+
+
+# ══════════════════════════════════════════════════════════════
+#  Agent review history (PR 3 — DH/instructor read)
+# ══════════════════════════════════════════════════════════════
+
+
+class GradeAgentReviewResponse(BaseModel):
+    """One row of the append-only agent-review history for a batch."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    iteration: int
+    verdict: Literal["APPROVE", "FLAG", "PENDING"]
+    flags: list[dict]
+    llm_reasoning: Optional[str]
+    tool_findings: dict
+    agent_id: str
+    created_at: datetime
+
+
+# ══════════════════════════════════════════════════════════════
+#  Justify + reopen (PR 3 — instructor iteration loop)
+# ══════════════════════════════════════════════════════════════
+
+
+class InstructorJustificationRequest(BaseModel):
+    """
+    POST body for ``/batches/{bid}/justify``. The instructor explains
+    in writing why the agent's prior flags are unfounded. The agent
+    is re-run with the justification appended to its context and may
+    APPROVE on iteration 2+.
+    """
+    justification: str = Field(min_length=10, max_length=4000)
+

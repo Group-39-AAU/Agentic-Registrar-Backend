@@ -44,14 +44,18 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    CheckConstraint, DateTime, Enum, Float, ForeignKey, Integer, String,
+    JSON, CheckConstraint, DateTime, Enum, Float, ForeignKey, Integer, String,
     Text, UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteBase
 from app.shared.enums import GradeSubmissionStatus
+
+
+# JSONB on Postgres for indexability; JSON falls back on SQLite (tests).
+_JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
 
 
 # ── Breakdown editor ─────────────────────────────────────────────
@@ -284,5 +288,65 @@ class StudentComponentScore(Base):
         CheckConstraint(
             "score IS NULL OR score >= 0",
             name="ck_score_non_negative",
+        ),
+    )
+
+
+# ── Agent audit trail ────────────────────────────────────────────
+
+
+class GradeAgentReview(Base):
+    """
+    One row per ``GradingMonitorAgent`` run on a batch. Append-only:
+    re-running the agent (after the instructor edits scores or
+    attaches a justification) writes a NEW row, never updates an
+    existing one. The instructor's UI shows the latest; the
+    department head's UI (PR 4) shows the full iteration history.
+
+    ``verdict`` is the agent's APPROVE / FLAG decision. ``PENDING``
+    is the special value written when the LLM call failed — the
+    deterministic ``tool_findings`` are still saved so the DH can
+    see what the agent was looking at, but the verdict and
+    ``llm_reasoning`` are deferred to a manual re-run.
+
+    ``tool_findings`` is the deterministic context dictionary the
+    tool layer compiled (class statistics, per-component stats,
+    outliers, distribution, missing-cell check, breakdown integrity,
+    roster summary). The LLM saw exactly this payload when it
+    decided.
+
+    ``flags`` is the structured list of concerns the LLM (or the
+    PENDING fallback) raised — each entry is
+    ``{type, severity, message, affected_student_ids?}``.
+    """
+
+    __tablename__ = "grade_agent_reviews"
+
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("grade_batches.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    iteration: Mapped[int] = mapped_column(Integer, nullable=False)
+    verdict: Mapped[str] = mapped_column(String(20), nullable=False)
+    tool_findings: Mapped[dict] = mapped_column(
+        _JSON_TYPE, nullable=False,
+    )
+    llm_reasoning: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
+    flags: Mapped[list] = mapped_column(
+        _JSON_TYPE, nullable=False, default=list,
+    )
+    agent_id: Mapped[str] = mapped_column(String(120), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "verdict IN ('APPROVE', 'FLAG', 'PENDING')",
+            name="ck_grade_agent_review_verdict",
+        ),
+        CheckConstraint(
+            "iteration >= 1",
+            name="ck_grade_agent_review_iteration_positive",
         ),
     )

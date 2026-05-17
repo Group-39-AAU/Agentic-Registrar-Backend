@@ -35,10 +35,12 @@ import math
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.llm_client import LLMClient
 from app.modules.course.exceptions import (
     BreakdownLockedError, EntityNotFoundError, GradeBatchNotEditableError,
     IncompleteGradeSubmissionError, InvalidBreakdownError,
@@ -48,10 +50,12 @@ from app.modules.course.grade_points import points_for
 from app.modules.course.models import (
     ClassScheduleSlot, Course, Grade, Instructor, Section,
 )
-from app.modules.course.grading.agent_stub import review_batch_stub
+from app.modules.course.grading.agents import (
+    GradingMonitorAgent, GradingReview,
+)
 from app.modules.course.grading.letter_scale import letter_for_numeric
 from app.modules.course.grading.models import (
-    AssessmentBreakdown, AssessmentComponent, GradeBatch,
+    AssessmentBreakdown, AssessmentComponent, GradeAgentReview, GradeBatch,
     StudentComponentScore,
 )
 from app.modules.course.grading.roster import (
@@ -59,8 +63,9 @@ from app.modules.course.grading.roster import (
 )
 from app.modules.course.grading.schemas import (
     AssessmentBreakdownCreate, AssessmentBreakdownResponse,
-    AssessmentComponentResponse, BulkScoreWrite, GradeBatchResponse,
-    GradeBatchSubmitResponse, InstructorSectionAssignmentResponse,
+    AssessmentComponentResponse, BulkScoreWrite, GradeAgentReviewResponse,
+    GradeBatchResponse, GradeBatchSubmitResponse,
+    InstructorSectionAssignmentResponse,
     RosterStudentResponse, SectionCourseRosterResponse,
     StudentBatchRowResponse, StudentScoreCellResponse, SubmittedGradeRow,
 )
@@ -80,8 +85,30 @@ class InstructorGradingService:
     the effective roster of each pair.
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        grading_agent: Optional[GradingMonitorAgent] = None,
+    ) -> None:
         self.db = db
+        # Lazy default: build the production agent (with the default
+        # LLM client) on first use. Tests inject a stub agent so they
+        # don't depend on the GEMINI_API_KEY being set.
+        self._agent = grading_agent
+
+    def _resolve_agent(self) -> GradingMonitorAgent:
+        """
+        Lazily build the production :class:`GradingMonitorAgent`
+        with the default LLM client. Cached on the instance so a
+        single request only constructs it once.
+        """
+        if self._agent is None:
+            from app.ai.llm_client import build_default_llm_client
+            self._agent = GradingMonitorAgent(
+                llm_client=build_default_llm_client(),
+            )
+        return self._agent
 
     # ── Resolve the calling user to an Instructor row ──
 
@@ -907,17 +934,29 @@ class InstructorGradingService:
             user_id=user_id, now=now,
         )
 
-        # Run the agent (stub in PR 2 — always APPROVE).
-        verdict = await review_batch_stub(batch_id=batch.id)
-
-        # Transition batch state.
-        batch.status = (
-            GradeSubmissionStatus.SUBMITTED
-            if verdict.verdict == "APPROVE"
-            else GradeSubmissionStatus.FLAGGED
-        )
+        # Capture the submission timestamp on the batch BEFORE the
+        # agent runs so the deadline-status tool sees it.
         batch.submitted_at = now
         batch.submitted_by_id = user_id
+        await self.db.flush()
+
+        # Always-LLM agent — verdict comes from the LLM. On failure
+        # the agent returns PENDING and the batch stays SUBMITTED.
+        agent = self._resolve_agent()
+        review = await agent.review_batch(db=self.db, batch_id=batch.id)
+        await self._persist_agent_review(
+            batch=batch, review=review, agent=agent,
+        )
+
+        # Transition batch state per the LLM verdict.
+        if review.verdict == "APPROVE":
+            batch.status = GradeSubmissionStatus.SUBMITTED
+        elif review.verdict == "FLAG":
+            batch.status = GradeSubmissionStatus.FLAGGED
+        else:  # PENDING
+            # Stay at SUBMITTED — the DH re-trigger path (PR 4) will
+            # produce a real verdict later.
+            batch.status = GradeSubmissionStatus.SUBMITTED
         await self.db.flush()
         await self.db.commit()
 
@@ -926,9 +965,9 @@ class InstructorGradingService:
             status=batch.status,
             iteration=batch.iteration_count,
             submitted_at=now,
-            agent_verdict=verdict.verdict,
-            agent_flags=verdict.flags,
-            agent_reasoning=verdict.reasoning,
+            agent_verdict=review.verdict,
+            agent_flags=review.flags,
+            agent_reasoning=review.reasoning,
             grades=[
                 SubmittedGradeRow(
                     student_id=o["student_id"],
@@ -940,6 +979,41 @@ class InstructorGradingService:
                 for o in outcomes
             ],
         )
+
+    async def _persist_agent_review(
+        self,
+        *,
+        batch: GradeBatch,
+        review: GradingReview,
+        agent: GradingMonitorAgent,
+    ) -> GradeAgentReview:
+        """
+        Append one row to ``grade_agent_reviews`` and audit-log it.
+        Append-only — never updates an existing row.
+        """
+        row = GradeAgentReview(
+            batch_id=batch.id,
+            iteration=batch.iteration_count,
+            verdict=review.verdict,
+            tool_findings=review.tool_findings,
+            llm_reasoning=review.reasoning or None,
+            flags=review.flags,
+            agent_id=review.agent_id,
+        )
+        self.db.add(row)
+        await self.db.flush()
+        await agent._log_action(
+            self.db,
+            action="grading_agent_review",
+            resource_type="GradeBatch",
+            resource_id=batch.id,
+            decision=review.verdict,
+            metadata={
+                "iteration": batch.iteration_count,
+                "flag_count": len(review.flags),
+            },
+        )
+        return row
 
     @staticmethod
     def _compute_outcomes(
@@ -1030,3 +1104,226 @@ class InstructorGradingService:
                 row.entered_at = now
                 row.section_id = batch.section_id
         await self.db.flush()
+
+    # ── PR 3 — iteration loop (justify / reopen) ───────────────
+
+    async def submit_justification(
+        self,
+        *,
+        user_id: uuid.UUID,
+        batch_id: uuid.UUID,
+        justification: str,
+    ) -> GradeBatchSubmitResponse:
+        """
+        Attach an instructor justification to a FLAGGED batch and
+        re-run the agent. The justification is appended to the
+        agent's context so the LLM can reconsider its prior FLAG in
+        light of the new information.
+
+        Bumps ``iteration_count`` and writes a fresh
+        ``grade_agent_reviews`` row. The verdict on iteration 2+ may
+        be APPROVE (in which case the batch moves to SUBMITTED) or
+        another FLAG (the DH ultimately decides in PR 4).
+
+        Allowed only from status FLAGGED — a FLAGGED batch is what
+        an instructor justification is for. From any other state
+        this is a 409.
+        """
+        batch = (
+            await self.db.execute(
+                select(GradeBatch).where(
+                    GradeBatch.id == batch_id,
+                    GradeBatch.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if batch is None:
+            raise EntityNotFoundError("GradeBatch", str(batch_id))
+        if batch.status != GradeSubmissionStatus.FLAGGED:
+            raise GradeBatchNotEditableError(batch.status.value)
+
+        _instructor, section, course = await self._resolve_owned_pair_or_403(
+            user_id=user_id,
+            section_id=batch.section_id, course_id=batch.course_id,
+        )
+
+        batch.instructor_justification = justification.strip()
+        batch.iteration_count += 1
+        await self.db.flush()
+
+        # Re-run the agent. Context now includes the justification
+        # (the agent picks it up from batch.instructor_justification).
+        agent = self._resolve_agent()
+        review = await agent.review_batch(db=self.db, batch_id=batch.id)
+        await self._persist_agent_review(
+            batch=batch, review=review, agent=agent,
+        )
+
+        if review.verdict == "APPROVE":
+            batch.status = GradeSubmissionStatus.SUBMITTED
+        # FLAG / PENDING → leave status as FLAGGED. The DH workflow
+        # (PR 4) is what moves a FLAGGED batch out either way.
+
+        await self.db.flush()
+        await self.db.commit()
+
+        # Recompute the outcomes from the existing scores for the
+        # response payload — the per-student letters didn't change
+        # (no score edits) but the caller wants them anyway.
+        roster = await derive_section_course_roster(
+            self.db, section_id=batch.section_id, course_id=batch.course_id,
+        )
+        components = sorted(
+            (await self.db.execute(
+                select(AssessmentComponent).where(
+                    AssessmentComponent.breakdown_id == batch.breakdown_id,
+                )
+            )).scalars().all(),
+            key=lambda c: c.order_index,
+        )
+        scores = (await self.db.execute(
+            select(StudentComponentScore).where(
+                StudentComponentScore.batch_id == batch.id,
+            )
+        )).scalars().all()
+        score_by_cell = {
+            (s.student_id, s.component_id): s.score for s in scores
+        }
+        outcomes = self._compute_outcomes(
+            roster=roster, components=components,
+            score_by_cell=score_by_cell,
+        )
+
+        return GradeBatchSubmitResponse(
+            batch_id=batch.id,
+            status=batch.status,
+            iteration=batch.iteration_count,
+            submitted_at=batch.submitted_at or datetime.now(timezone.utc),
+            agent_verdict=review.verdict,
+            agent_flags=review.flags,
+            agent_reasoning=review.reasoning,
+            grades=[
+                SubmittedGradeRow(
+                    student_id=o["student_id"],
+                    student_number=o["student_number"],
+                    full_name=o["full_name"],
+                    numeric_score=o["numeric"],
+                    letter_grade=o["letter"],
+                )
+                for o in outcomes
+            ],
+        )
+
+    async def reopen_batch(
+        self,
+        *,
+        user_id: uuid.UUID,
+        batch_id: uuid.UUID,
+    ) -> GradeBatchResponse:
+        """
+        Move a FLAGGED batch back to DRAFT so the instructor can
+        edit scores again. The breakdown stays locked (history of
+        scores survives in the cells); to reset the breakdown the
+        instructor must additionally call ``DELETE /scores``.
+
+        Bumps ``iteration_count`` so the next submit's agent review
+        lands on the right iteration row.
+
+        Use this when the instructor accepts the agent's flag and
+        wants to correct grades rather than justify them. From any
+        status other than FLAGGED this is a 409.
+        """
+        batch = (
+            await self.db.execute(
+                select(GradeBatch).where(
+                    GradeBatch.id == batch_id,
+                    GradeBatch.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if batch is None:
+            raise EntityNotFoundError("GradeBatch", str(batch_id))
+        if batch.status != GradeSubmissionStatus.FLAGGED:
+            raise GradeBatchNotEditableError(batch.status.value)
+
+        _instructor, section, course = await self._resolve_owned_pair_or_403(
+            user_id=user_id,
+            section_id=batch.section_id, course_id=batch.course_id,
+        )
+
+        batch.status = GradeSubmissionStatus.DRAFT
+        batch.iteration_count += 1
+        # Clear submission-time fields so a fresh submit records anew.
+        batch.submitted_at = None
+        batch.submitted_by_id = None
+        # Keep instructor_justification on the row for the audit trail.
+
+        await self.db.flush()
+        await self.db.commit()
+
+        breakdown = (
+            await self.db.execute(
+                select(AssessmentBreakdown).where(
+                    AssessmentBreakdown.id == batch.breakdown_id,
+                )
+            )
+        ).scalar_one()
+        return await self._build_batch_response(
+            batch=batch, breakdown=breakdown, section=section, course=course,
+        )
+
+    # ── PR 3 — agent-review history read ────────────────────────
+
+    async def list_agent_reviews(
+        self,
+        *,
+        user_id: uuid.UUID,
+        batch_id: uuid.UUID,
+    ) -> list[GradeAgentReviewResponse]:
+        """
+        Append-only history of every agent run for this batch.
+        Most-recent-first so the UI shows the latest verdict at the
+        top.
+        """
+        batch = (
+            await self.db.execute(
+                select(GradeBatch).where(
+                    GradeBatch.id == batch_id,
+                    GradeBatch.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if batch is None:
+            raise EntityNotFoundError("GradeBatch", str(batch_id))
+        # Ownership gate — only the assigned instructor (and later,
+        # the DH; PR 4 adds that role check) can read the history.
+        await self._resolve_owned_pair_or_403(
+            user_id=user_id,
+            section_id=batch.section_id, course_id=batch.course_id,
+        )
+
+        rows = (await self.db.execute(
+            select(GradeAgentReview)
+            .where(GradeAgentReview.batch_id == batch_id)
+            # iteration is the authoritative ordering; created_at is
+            # only a tiebreak (rapid same-iteration reruns from a
+            # retry loop). SQLite truncates timestamps to seconds in
+            # some drivers, so iteration must come first.
+            .order_by(
+                GradeAgentReview.iteration.desc(),
+                GradeAgentReview.created_at.desc(),
+            )
+        )).scalars().all()
+        return [
+            GradeAgentReviewResponse(
+                id=r.id,
+                iteration=r.iteration,
+                verdict=r.verdict,
+                flags=r.flags or [],
+                llm_reasoning=r.llm_reasoning,
+                tool_findings=r.tool_findings or {},
+                agent_id=r.agent_id,
+                created_at=r.created_at,
+            )
+            for r in rows
+        ]

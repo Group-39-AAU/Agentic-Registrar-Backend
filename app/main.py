@@ -32,7 +32,7 @@ from app.modules.course.models import (                                         
     ScheduleConflict,
 )
 from app.modules.course.grading.models import (                                   # noqa: F401
-    AssessmentBreakdown, AssessmentComponent, GradeBatch,
+    AssessmentBreakdown, AssessmentComponent, GradeAgentReview, GradeBatch,
     StudentComponentScore,
 )
 
