@@ -1221,17 +1221,23 @@ class InstructorGradingService:
         batch_id: uuid.UUID,
     ) -> GradeBatchResponse:
         """
-        Move a FLAGGED batch back to DRAFT so the instructor can
-        edit scores again. The breakdown stays locked (history of
-        scores survives in the cells); to reset the breakdown the
-        instructor must additionally call ``DELETE /scores``.
+        Move a FLAGGED or REJECTED batch back to DRAFT so the
+        instructor can edit scores again. The breakdown stays locked
+        (history of scores survives in the cells); to reset the
+        breakdown the instructor must additionally call
+        ``DELETE /scores``.
 
         Bumps ``iteration_count`` so the next submit's agent review
         lands on the right iteration row.
 
-        Use this when the instructor accepts the agent's flag and
-        wants to correct grades rather than justify them. From any
-        status other than FLAGGED this is a 409.
+        Two entry points use this:
+
+          - Instructor accepts the agent's FLAG and wants to fix
+            scores rather than justify (FLAGGED → DRAFT).
+          - DH REJECTS the batch and the instructor needs to redo
+            the work (REJECTED → DRAFT).
+
+        From any other status this is a 409.
         """
         batch = (
             await self.db.execute(
@@ -1243,7 +1249,10 @@ class InstructorGradingService:
         ).scalar_one_or_none()
         if batch is None:
             raise EntityNotFoundError("GradeBatch", str(batch_id))
-        if batch.status != GradeSubmissionStatus.FLAGGED:
+        if batch.status not in {
+            GradeSubmissionStatus.FLAGGED,
+            GradeSubmissionStatus.REJECTED,
+        }:
             raise GradeBatchNotEditableError(batch.status.value)
 
         _instructor, section, course = await self._resolve_owned_pair_or_403(

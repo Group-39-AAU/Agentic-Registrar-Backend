@@ -350,3 +350,60 @@ class GradeAgentReview(Base):
             name="ck_grade_agent_review_iteration_positive",
         ),
     )
+
+
+# ── Department-head authorisation decisions ─────────────────────
+
+
+class GradeAuthorisationDecision(Base):
+    """
+    One immutable row per terminal department-head decision on a
+    batch. Append-only: an "overturn" writes a NEW row, never edits
+    an existing one. The (batch, decision-time) pair is the audit
+    trail; the latest row decides current status.
+
+    ``decision`` records both the outcome (authorised / rejected) and
+    whether the DH agreed with or overrode the agent's prior
+    verdict, so the full chain is reconstructable:
+
+      AUTHORISED              — agent APPROVED + DH agrees
+      REJECTED                — agent FLAGGED + DH agrees → instructor redo
+      OVERRODE_AGENT_APPROVAL — agent APPROVED + DH rejects → instructor redo
+      OVERRODE_AGENT_FLAG     — agent FLAGGED + DH authorises → grades official
+
+    ``justification`` is required for every decision except
+    ``AUTHORISED`` (accepting a clean APPROVE needs no written
+    reason). Service layer enforces this.
+    """
+
+    __tablename__ = "grade_authorisation_decisions"
+
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("grade_batches.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    iteration: Mapped[int] = mapped_column(Integer, nullable=False)
+    decision: Mapped[str] = mapped_column(String(40), nullable=False)
+    department_head_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"),
+        nullable=False, index=True,
+    )
+    decision_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    justification: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "decision IN ('AUTHORISED', 'REJECTED', "
+            "'OVERRODE_AGENT_APPROVAL', 'OVERRODE_AGENT_FLAG')",
+            name="ck_authorisation_decision_value",
+        ),
+        CheckConstraint(
+            "iteration >= 1",
+            name="ck_authorisation_iteration_positive",
+        ),
+    )

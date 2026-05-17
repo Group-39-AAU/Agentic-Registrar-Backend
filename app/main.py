@@ -32,8 +32,8 @@ from app.modules.course.models import (                                         
     ScheduleConflict,
 )
 from app.modules.course.grading.models import (                                   # noqa: F401
-    AssessmentBreakdown, AssessmentComponent, GradeAgentReview, GradeBatch,
-    StudentComponentScore,
+    AssessmentBreakdown, AssessmentComponent, GradeAgentReview,
+    GradeAuthorisationDecision, GradeBatch, StudentComponentScore,
 )
 
 from app.modules.auth.router import router as auth_router

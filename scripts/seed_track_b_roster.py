@@ -66,12 +66,12 @@ from app.core.config import settings
 from app.core.security import hash_password
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    AcademicTerm, ClassScheduleSlot, Course, Instructor,
-    InstructorAssignment, Registration, RegistrationCourse,
+    AcademicTerm, ClassScheduleSlot, Course, CourseManagementOfficer,
+    Instructor, InstructorAssignment, Registration, RegistrationCourse,
     Section, Student, StudentScheduleAddition,
 )
 from app.shared.enums import (
-    AcademicPhase, EnrollmentStatus, RegistrationStatus,
+    AcademicPhase, EnrollmentStatus, OfficerRole, RegistrationStatus,
     SponsorshipType, UserRole,
 )
 
@@ -105,6 +105,11 @@ SECONDARY_COURSE_CREDITS = 3
 INSTRUCTOR_STAFF_ID = "STAFF/9991/15"
 INSTRUCTOR_FIRST = "Lemma"
 INSTRUCTOR_LAST = "Bekele"
+
+# Department Head for PR 4 (Track B authorisation workflow).
+DH_STAFF_ID = "REG/9999/15"
+DH_FIRST = "Almaz"
+DH_LAST = "Tilahun"
 
 # 6 originals in Section A (one will drop CS101, one is draft)
 SECTION_A_STUDENTS = [
@@ -237,6 +242,44 @@ async def _ensure_instructor(session: AsyncSession) -> Instructor:
     session.add(instructor)
     await session.flush()
     return instructor
+
+
+async def _ensure_department_head(
+    session: AsyncSession,
+) -> CourseManagementOfficer:
+    """
+    Idempotent: get-or-create the Department-Head officer used by
+    PR 4 manual tests. Login: registrar-officer-dh@aau.edu.et /
+    password123 (role = DEPARTMENT_HEAD).
+    """
+    existing = (
+        await session.execute(
+            select(CourseManagementOfficer).where(
+                CourseManagementOfficer.staff_id == DH_STAFF_ID,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    slug = DH_STAFF_ID.lower().replace("/", "-")
+    user = await _ensure_user(
+        session,
+        email=f"{slug}@aau.edu.et",
+        first_name=DH_FIRST,
+        last_name=DH_LAST,
+        role=UserRole.REGISTRAR_OFFICER,
+        user_uid=_uid("user", "officer", DH_STAFF_ID),
+    )
+    officer = CourseManagementOfficer(
+        id=_uid("officer", DH_STAFF_ID),
+        user_id=user.id,
+        staff_id=DH_STAFF_ID,
+        role=OfficerRole.DEPARTMENT_HEAD,
+        authorization_level=5,
+    )
+    session.add(officer)
+    await session.flush()
+    return officer
 
 
 async def _ensure_instructor_assignment(
@@ -513,6 +556,10 @@ async def seed(session: AsyncSession) -> None:
     instructor = await _ensure_instructor(session)
     print(f"   instructor:    {INSTRUCTOR_FIRST} {INSTRUCTOR_LAST} ({instructor.id})")
     print(f"                  login: staff-9991-15@aau.edu.et / password123")
+
+    dh = await _ensure_department_head(session)
+    print(f"   dept head:     {DH_FIRST} {DH_LAST} ({dh.id})")
+    print(f"                  login: reg-9999-15@aau.edu.et / password123")
 
     await _ensure_instructor_assignment(
         session, instructor=instructor, course=course, term=term,

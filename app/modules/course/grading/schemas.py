@@ -32,7 +32,7 @@ Later PRs append agent-review and authorisation shapes here.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -326,4 +326,165 @@ class InstructorJustificationRequest(BaseModel):
     APPROVE on iteration 2+.
     """
     justification: str = Field(min_length=10, max_length=4000)
+
+
+# ══════════════════════════════════════════════════════════════
+#  PR 4 — Department-head workflow
+# ══════════════════════════════════════════════════════════════
+
+
+class DepartmentHeadQueueEntry(BaseModel):
+    """
+    Compact summary for the DH review queue. One entry per
+    ``GradeBatch`` awaiting a DH decision (status SUBMITTED or
+    FLAGGED). Ordered by ``submitted_at`` ascending so the oldest
+    batch surfaces first.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    batch_id: uuid.UUID
+    section_id: uuid.UUID
+    section_code: str
+    section_department: str
+    section_semester: int
+    course_id: uuid.UUID
+    course_code: str
+    course_title: str
+    term_id: uuid.UUID
+    term_name: str
+    instructor_id: uuid.UUID
+    instructor_name: str
+    status: GradeSubmissionStatus
+    iteration_count: int
+    submitted_at: Optional[datetime]
+    # Convenience: the latest agent verdict for the batch ("APPROVE",
+    # "FLAG", "PENDING", or None if no agent has run yet).
+    latest_agent_verdict: Optional[Literal["APPROVE", "FLAG", "PENDING"]]
+    flag_count: int  # number of flags in the latest agent review
+    has_instructor_justification: bool
+    roster_total: int
+
+
+class GradeAuthorisationDecisionResponse(BaseModel):
+    """One immutable row of the DH decision audit trail."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    iteration: int
+    decision: Literal[
+        "AUTHORISED", "REJECTED",
+        "OVERRODE_AGENT_APPROVAL", "OVERRODE_AGENT_FLAG",
+    ]
+    department_head_id: uuid.UUID
+    decision_at: datetime
+    justification: Optional[str]
+
+
+class GradeBatchReviewPacketResponse(BaseModel):
+    """
+    Full DH review packet for one batch. Combines the live batch
+    view (breakdown + score matrix + per-student computed letters)
+    with every agent run and every DH decision so the DH has the
+    complete history in one response.
+    """
+    batch: GradeBatchResponse
+    per_student_grades: list["SubmittedGradeRow"]
+    agent_reviews: list[GradeAgentReviewResponse]
+    decisions: list[GradeAuthorisationDecisionResponse]
+
+
+class DepartmentHeadDecisionRequest(BaseModel):
+    """
+    POST body for ``/officer/batches/{bid}/authorise`` and
+    ``/officer/batches/{bid}/reject``.
+
+    ``justification`` is required for everything except accepting a
+    clean agent APPROVE (the only "no reason needed" path). Service
+    layer enforces the per-decision rule; this schema just gives the
+    field an upper bound when present.
+    """
+    justification: Optional[str] = Field(
+        default=None, max_length=4000,
+    )
+
+
+class DepartmentHeadDecisionResponse(BaseModel):
+    """Reply from authorise / reject — the new batch state + the audit row."""
+    batch_id: uuid.UUID
+    new_status: GradeSubmissionStatus
+    decision: Literal[
+        "AUTHORISED", "REJECTED",
+        "OVERRODE_AGENT_APPROVAL", "OVERRODE_AGENT_FLAG",
+    ]
+    decision_id: uuid.UUID
+    decision_at: datetime
+    department_head_id: uuid.UUID
+
+
+class AgentRerunResponse(BaseModel):
+    """
+    Reply from ``POST /officer/batches/{bid}/rerun-agent``. Carries
+    the new verdict + reasoning if the LLM came back, or PENDING if
+    it's still unavailable.
+    """
+    batch_id: uuid.UUID
+    new_status: GradeSubmissionStatus
+    iteration: int
+    agent_verdict: Literal["APPROVE", "FLAG", "PENDING"]
+    agent_flags: list[dict]
+    agent_reasoning: str
+
+
+# ══════════════════════════════════════════════════════════════
+#  PR 4 — Student transcript
+# ══════════════════════════════════════════════════════════════
+
+
+class TranscriptComponentScore(BaseModel):
+    """One component contribution to a course grade in the transcript."""
+    name: str
+    weight: float
+    max_score: float
+    score: Optional[float]
+    weighted_contribution: Optional[float]
+
+
+class TranscriptCourseEntry(BaseModel):
+    """
+    One AUTHORISED grade in a student's transcript. ``has_breakdown``
+    is False for legacy ``Grade`` rows that pre-date Track B (no
+    associated ``GradeBatch``) — for those, the components list is
+    empty but the letter and numeric are still surfaced.
+    """
+    course_id: uuid.UUID
+    course_code: str
+    course_title: str
+    credit_hours: int
+    letter_grade: GradeLetter
+    numeric_score: Optional[float]
+    grade_points: Optional[float]
+    has_breakdown: bool
+    components: list[TranscriptComponentScore]
+
+
+class TranscriptTermEntry(BaseModel):
+    """All AUTHORISED grades for one term, plus the per-term GPA."""
+    term_id: uuid.UUID
+    term_name: str
+    term_phase: str
+    term_start_date: date
+    term_end_date: date
+    courses: list[TranscriptCourseEntry]
+    term_gpa: Optional[float]   # weighted average of grade_points / credit_hours
+    total_credit_hours: int
+
+
+class TranscriptResponse(BaseModel):
+    """The student-facing transcript — every term grouped, with CGPA."""
+    student_id: uuid.UUID
+    student_number: str
+    full_name: str
+    terms: list[TranscriptTermEntry]
+    cgpa: Optional[float]
+    total_credit_hours_completed: int
 

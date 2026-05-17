@@ -28,21 +28,33 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from typing import Optional
+
 from app.core.dependencies import get_current_user
 from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.course.exceptions import (
-    BreakdownLockedError, EntityNotFoundError, GradeBatchNotEditableError,
-    IncompleteGradeSubmissionError, InvalidBreakdownError,
-    UnauthorizedActorError,
+    BreakdownLockedError, DepartmentHeadRoleRequiredError,
+    EntityNotFoundError, GradeBatchNotEditableError,
+    GradeBatchNotReviewableError, IncompleteGradeSubmissionError,
+    InvalidBreakdownError, JustificationRequiredError,
+    StudentProfileRequiredError, UnauthorizedActorError,
 )
+from app.modules.course.grading.dh_service import DepartmentHeadGradingService
 from app.modules.course.grading.schemas import (
-    AssessmentBreakdownCreate, AssessmentBreakdownResponse,
-    BulkScoreWrite, GradeAgentReviewResponse, GradeBatchResponse,
+    AgentRerunResponse, AssessmentBreakdownCreate,
+    AssessmentBreakdownResponse, BulkScoreWrite,
+    DepartmentHeadDecisionRequest, DepartmentHeadDecisionResponse,
+    DepartmentHeadQueueEntry, GradeAgentReviewResponse,
+    GradeBatchResponse, GradeBatchReviewPacketResponse,
     GradeBatchSubmitResponse, InstructorJustificationRequest,
     InstructorSectionAssignmentResponse, SectionCourseRosterResponse,
+    TranscriptResponse, TranscriptTermEntry,
 )
 from app.modules.course.grading.service import InstructorGradingService
+from app.modules.course.grading.transcript_service import (
+    StudentTranscriptService,
+)
 from app.shared.enums import UserRole
 
 
@@ -145,6 +157,10 @@ def _raise_grading_errors(exc: Exception) -> None:
     """
     if isinstance(exc, UnauthorizedActorError):
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail) from exc
+    if isinstance(exc, DepartmentHeadRoleRequiredError):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    if isinstance(exc, StudentProfileRequiredError):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
     if isinstance(exc, EntityNotFoundError):
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -154,6 +170,12 @@ def _raise_grading_errors(exc: Exception) -> None:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     if isinstance(exc, GradeBatchNotEditableError):
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    if isinstance(exc, GradeBatchNotReviewableError):
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    if isinstance(exc, JustificationRequiredError):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc),
+        ) from exc
     if isinstance(exc, InvalidBreakdownError):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
@@ -431,7 +453,7 @@ async def submit_justification(
 @router.post(
     "/batches/{batch_id}/reopen",
     response_model=GradeBatchResponse,
-    summary="Move a FLAGGED batch back to DRAFT so scores can be edited",
+    summary="Move a FLAGGED or REJECTED batch back to DRAFT for editing",
 )
 async def reopen_batch(
     batch_id: uuid.UUID,
@@ -439,13 +461,18 @@ async def reopen_batch(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Use when the instructor accepts the agent's flag and wants to
-    correct grades rather than justify them. Status FLAGGED → DRAFT;
+    Two entry points use this:
+
+      - Instructor accepts the agent's FLAG and wants to fix scores
+        rather than justify them (FLAGGED → DRAFT).
+      - The department head REJECTED the batch and the instructor
+        needs to redo it (REJECTED → DRAFT).
+
     ``iteration_count`` bumps so the next submit's agent run records
     on the right iteration. The breakdown stays locked (cell values
     survive); ``DELETE /scores`` is the path for a full reset.
 
-    409 if the batch isn't FLAGGED.
+    409 if the batch isn't FLAGGED or REJECTED.
     """
     _require_instructor(current_user)
     svc = InstructorGradingService(db)
@@ -486,6 +513,256 @@ async def list_agent_reviews(
     try:
         return await svc.list_agent_reviews(
             user_id=current_user.id, batch_id=batch_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+# ══════════════════════════════════════════════════════════════
+#  PR 4 — Department-head workflow
+# ══════════════════════════════════════════════════════════════
+#
+# Auth: every route below requires the calling user to be either
+# an officer with role=DEPARTMENT_HEAD or a UserRole.ADMIN. The
+# check lives in the service layer (mirroring how Track A gates
+# DH-only endpoints) so the rule travels with the code that
+# enforces it.
+
+
+@router.get(
+    "/officer/queue",
+    response_model=list[DepartmentHeadQueueEntry],
+    summary="Batches awaiting department-head decision (SUBMITTED or FLAGGED)",
+)
+async def list_dh_queue(
+    term_id: Optional[uuid.UUID] = None,
+    department: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Sorted oldest-first by ``submitted_at`` so the most overdue
+    batch surfaces at the top. Each entry carries enough metadata
+    (course, instructor, latest agent verdict, flag count, roster
+    size) for the DH to triage without fetching the full packet.
+
+    Optional filters: ``term_id`` and ``department``.
+
+    403 if the caller is not a department head (or admin).
+    """
+    svc = DepartmentHeadGradingService(db)
+    try:
+        return await svc.list_queue(
+            user_id=current_user.id,
+            term_id=term_id, department=department,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+@router.get(
+    "/officer/batches/{batch_id}",
+    response_model=GradeBatchReviewPacketResponse,
+    summary="Full department-head review packet for one batch",
+)
+async def get_dh_review_packet(
+    batch_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the full payload the DH needs to make a decision:
+
+      - The live batch (breakdown + per-student score matrix).
+      - Per-student computed letters (the official outcome each
+        roster member would receive if the DH authorises).
+      - The append-only history of every agent run (with verdict,
+        flags, reasoning, full tool findings).
+      - Every prior department-head decision on this batch.
+    """
+    svc = DepartmentHeadGradingService(db)
+    try:
+        return await svc.get_review_packet(
+            user_id=current_user.id, batch_id=batch_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+@router.post(
+    "/officer/batches/{batch_id}/authorise",
+    response_model=DepartmentHeadDecisionResponse,
+    summary="Authorise a batch — grades become official",
+)
+async def authorise_batch(
+    batch_id: uuid.UUID,
+    payload: DepartmentHeadDecisionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Final acceptance:
+
+      - SUBMITTED → AUTHORISED  (decision = AUTHORISED;
+        ``justification`` optional — accepting a clean
+        agent-APPROVE needs no written reason)
+      - FLAGGED   → AUTHORISED  (decision = OVERRODE_AGENT_FLAG;
+        ``justification`` REQUIRED — the DH is overriding the
+        agent's concerns and the audit trail needs to record why)
+
+    Side effects: every per-student ``Grade`` row is stamped
+    AUTHORISED, ``authorised_by_id`` / ``authorised_at`` populated,
+    and the immutable audit row is appended.
+
+    409 if the batch isn't in SUBMITTED or FLAGGED.
+    422 if overriding a FLAG without a justification.
+    """
+    svc = DepartmentHeadGradingService(db)
+    try:
+        return await svc.authorise(
+            user_id=current_user.id,
+            batch_id=batch_id,
+            justification=payload.justification,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+@router.post(
+    "/officer/batches/{batch_id}/reject",
+    response_model=DepartmentHeadDecisionResponse,
+    summary="Reject a batch — sends it back to the instructor with a reason",
+)
+async def reject_batch(
+    batch_id: uuid.UUID,
+    payload: DepartmentHeadDecisionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Final rejection — the instructor must redo the work:
+
+      - FLAGGED   → REJECTED  (decision = REJECTED — DH agrees
+        with the agent's flag)
+      - SUBMITTED → REJECTED  (decision = OVERRODE_AGENT_APPROVAL —
+        DH disagrees with the agent's approval)
+
+    ``justification`` is REQUIRED on both paths — the instructor
+    reads it and uses it to fix the batch. The instructor's next
+    step is ``POST /batches/{bid}/reopen`` (REJECTED → DRAFT) to
+    edit scores.
+
+    409 if the batch isn't in SUBMITTED or FLAGGED.
+    422 if the justification is missing.
+    """
+    svc = DepartmentHeadGradingService(db)
+    try:
+        return await svc.reject(
+            user_id=current_user.id,
+            batch_id=batch_id,
+            justification=payload.justification or "",
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+@router.post(
+    "/officer/batches/{batch_id}/rerun-agent",
+    response_model=AgentRerunResponse,
+    summary="Re-invoke the GradingMonitorAgent (typically after a PENDING verdict)",
+)
+async def rerun_agent(
+    batch_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The DH triggers a fresh agent run. Use when the prior agent
+    verdict was PENDING (LLM was unavailable) and the DH wants the
+    agent's actual judgement before deciding. Writes a new
+    ``grade_agent_reviews`` row; transitions the batch's status to
+    SUBMITTED (on APPROVE) or FLAGGED (on FLAG) — does NOT write a
+    DH-decision row.
+
+    409 if the batch isn't in SUBMITTED or FLAGGED.
+    """
+    svc = DepartmentHeadGradingService(db)
+    try:
+        return await svc.rerun_agent(
+            user_id=current_user.id, batch_id=batch_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+# ══════════════════════════════════════════════════════════════
+#  PR 4 — Student transcript
+# ══════════════════════════════════════════════════════════════
+
+
+def _require_student(current_user: User) -> None:
+    if current_user.role != UserRole.STUDENT:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only enrolled students may view a transcript through this endpoint.",
+        )
+
+
+@router.get(
+    "/me/transcript",
+    response_model=TranscriptResponse,
+    summary="Calling student's transcript across every term",
+)
+async def get_my_transcript(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Every AUTHORISED grade the student has received, grouped by
+    term (newest first). For each course where a Track-B
+    ``GradeBatch`` exists, the per-component breakdown comes
+    through with the student's raw scores and weighted contribution.
+
+    SUBMITTED / FLAGGED / REJECTED / DRAFT grades are invisible —
+    only AUTHORISED grades reach the student.
+    """
+    _require_student(current_user)
+    svc = StudentTranscriptService(db)
+    try:
+        return await svc.get_transcript(user_id=current_user.id)
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+@router.get(
+    "/me/terms/{term_id}/grades",
+    response_model=TranscriptTermEntry,
+    summary="Calling student's grades for a specific term",
+)
+async def get_my_term_grades(
+    term_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    AUTHORISED grades only, for the given term. Useful for a
+    one-term view in the student portal without loading the full
+    transcript.
+
+    404 if the term doesn't exist.
+    """
+    _require_student(current_user)
+    svc = StudentTranscriptService(db)
+    try:
+        return await svc.get_term_grades(
+            user_id=current_user.id, term_id=term_id,
         )
     except Exception as exc:
         _raise_grading_errors(exc)

@@ -170,3 +170,60 @@ class IncompleteGradeSubmissionError(Exception):
             f"{len(missing)} student(s) are missing one or more "
             f"component scores."
         )
+
+
+class DepartmentHeadRoleRequiredError(Exception):
+    """
+    Raised when a non-DH caller tries to invoke a department-head
+    grading endpoint (queue, packet, authorise, reject, rerun-agent).
+    Router maps to HTTP 403.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Only an officer with role=DEPARTMENT_HEAD may take this "
+            "action on a grade batch."
+        )
+
+
+class GradeBatchNotReviewableError(Exception):
+    """
+    Raised when the DH tries to authorise / reject a batch whose
+    status isn't SUBMITTED or FLAGGED. AUTHORISED and REJECTED are
+    terminal; DRAFT means the instructor hasn't submitted yet.
+    Router maps to HTTP 409.
+    """
+
+    def __init__(self, current_status: str) -> None:
+        self.current_status = current_status
+        super().__init__(
+            f"Grade batch is in {current_status}; only SUBMITTED or "
+            f"FLAGGED batches accept a department-head decision."
+        )
+
+
+class JustificationRequiredError(Exception):
+    """
+    Raised when a DH reject / override decision lacks the required
+    written justification. Router maps to HTTP 422.
+    """
+
+    def __init__(self, decision: str) -> None:
+        self.decision = decision
+        super().__init__(
+            f"A written justification is required for decision "
+            f"'{decision}'."
+        )
+
+
+class StudentProfileRequiredError(Exception):
+    """
+    Raised when a user without a Student row hits the
+    transcript / per-term grades endpoints. Router maps to HTTP 403.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Calling user has no student profile — transcript is "
+            "available only to enrolled students."
+        )

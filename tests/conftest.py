@@ -50,8 +50,8 @@ from app.modules.course.models import (                                 # noqa: 
     ScheduleConflict,
 )
 from app.modules.course.grading.models import (                         # noqa: F401
-    AssessmentBreakdown, AssessmentComponent, GradeAgentReview, GradeBatch,
-    StudentComponentScore,
+    AssessmentBreakdown, AssessmentComponent, GradeAgentReview,
+    GradeAuthorisationDecision, GradeBatch, StudentComponentScore,
 )
 
 from app.database.base import Base
