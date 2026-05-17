@@ -1366,10 +1366,12 @@ async def _seed_bulk_se_upper_year_cohorts(
 # Distinction candidate.
 
 # Cycle of letter grades used by the deterministic per-student
-# distribution. Skipping I and NG because they are edge-case marks
-# that route through AcademicStandingAgent.handleEdgeCase rather
-# than counting toward CGPA — irrelevant for the advisory baseline.
+# distribution. Skipping I, NG, W, DO, P because they are
+# administrative marks that don't count toward CGPA (Senate Art
+# 90.7.4 / 90.7.6) — irrelevant for the advisory baseline. A+ is
+# included so Track C standing tests can hit the "top of scale" path.
 _SEED_GRADE_CYCLE = (
+    GradeLetter.A_PLUS,
     GradeLetter.A,
     GradeLetter.B_PLUS,
     GradeLetter.B,
@@ -1448,19 +1450,22 @@ async def _seed_grades(
                 grade_points = (
                     pts * course.credit_hours if pts is not None else None
                 )
-                # Roughly map letters to underlying scores so Track B's
-                # anomaly detector has plausible numeric_score data.
+                # Roughly map letters to underlying scores per AAU
+                # Senate Art 90.1 cutoffs so Track B's anomaly
+                # detector has plausible numeric_score data and the
+                # numeric → letter round-trip is consistent.
                 numeric = {
-                    GradeLetter.A:        92.0,
-                    GradeLetter.A_MINUS:  87.0,
-                    GradeLetter.B_PLUS:   83.0,
-                    GradeLetter.B:        78.0,
-                    GradeLetter.B_MINUS:  73.0,
-                    GradeLetter.C_PLUS:   68.0,
-                    GradeLetter.C:        63.0,
-                    GradeLetter.C_MINUS:  58.0,
-                    GradeLetter.D:        53.0,
-                    GradeLetter.F:        40.0,
+                    GradeLetter.A_PLUS:   95.0,   # [90, 100]
+                    GradeLetter.A:        86.0,   # [83, 90)
+                    GradeLetter.A_MINUS:  81.0,   # [80, 83)
+                    GradeLetter.B_PLUS:   77.0,   # [75, 80)
+                    GradeLetter.B:        71.0,   # [68, 75)
+                    GradeLetter.B_MINUS:  66.0,   # [65, 68)
+                    GradeLetter.C_PLUS:   62.0,   # [60, 65)
+                    GradeLetter.C:        55.0,   # [50, 60)
+                    GradeLetter.C_MINUS:  47.0,   # [45, 50)
+                    GradeLetter.D:        42.0,   # [40, 45)
+                    GradeLetter.F:        30.0,   # < 40
                 }.get(letter)
 
                 session.add(Grade(

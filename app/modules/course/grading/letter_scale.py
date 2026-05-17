@@ -8,23 +8,24 @@ letter via :func:`letter_for_numeric`. The reverse mapping
 :mod:`app.modules.course.grade_points` and is used by Track A's
 CGPA calculator.
 
-Cutoffs follow the AAU Senate undergraduate scale:
+Cutoffs follow **AAU Senate Legislation Article 90.1** verbatim:
 
-    score >= 90 → A
-    score >= 85 → A-
-    score >= 80 → B+
-    score >= 75 → B
-    score >= 70 → B-
-    score >= 65 → C+
-    score >= 60 → C
-    score >= 55 → C-
-    score >= 50 → D
-    score <  50 → F
+    [90, 100] → A+   (4.00, Excellent / First class with Great distinction)
+    [83, 90)  → A    (4.00, Excellent)
+    [80, 83)  → A-   (3.75)
+    [75, 80)  → B+   (3.50, Very Good / First class with distinction)
+    [68, 75)  → B    (3.00, Good / Second class)
+    [65, 68)  → B-   (2.75)
+    [60, 65)  → C+   (2.50, Satisfactory)
+    [50, 60)  → C    (2.00)
+    [45, 50)  → C-   (1.75, Unsatisfactory / Low class)
+    [40, 45)  → D    (1.00, Very Poor)
+    [<40]     → F    (0.00, Fail)
 
-The boundaries are inclusive on the lower side (a flat 90.0 is an A,
-not an A-), and the mapping is total over [0, 100] — there is no
-gap, no ambiguity. ``I`` and ``NG`` are administrative outcomes
-recorded by a separate path; they never come out of this function.
+Boundaries are inclusive on the lower side (a flat 90.0 is A+, a flat
+83.0 is A) and the mapping is total over [0, 100]. The administrative
+marks I, NG, W, DO, P are recorded by separate paths (Art 90.7) and
+never come out of this function.
 """
 from __future__ import annotations
 
@@ -32,34 +33,34 @@ from app.shared.enums import GradeLetter
 
 
 # Pairs of (lower bound inclusive, letter), ordered HIGH → LOW so the
-# first match is the highest-applicable letter. A list keeps the
-# ordering stable and makes the mapping easy to audit at a glance.
+# first match is the highest-applicable letter.
 _LETTER_CUTOFFS: list[tuple[float, GradeLetter]] = [
-    (90.0, GradeLetter.A),
-    (85.0, GradeLetter.A_MINUS),
-    (80.0, GradeLetter.B_PLUS),
-    (75.0, GradeLetter.B),
-    (70.0, GradeLetter.B_MINUS),
-    (65.0, GradeLetter.C_PLUS),
-    (60.0, GradeLetter.C),
-    (55.0, GradeLetter.C_MINUS),
-    (50.0, GradeLetter.D),
+    (90.0, GradeLetter.A_PLUS),
+    (83.0, GradeLetter.A),
+    (80.0, GradeLetter.A_MINUS),
+    (75.0, GradeLetter.B_PLUS),
+    (68.0, GradeLetter.B),
+    (65.0, GradeLetter.B_MINUS),
+    (60.0, GradeLetter.C_PLUS),
+    (50.0, GradeLetter.C),
+    (45.0, GradeLetter.C_MINUS),
+    (40.0, GradeLetter.D),
     (0.0,  GradeLetter.F),
 ]
 
 
 def letter_for_numeric(numeric_score: float) -> GradeLetter:
     """
-    Map a 0–100 numeric score to its AAU letter grade.
+    Map a 0–100 numeric score to its AAU letter grade per Senate Art 90.1.
 
     Scores marginally outside [0, 100] (e.g. 100.0001 from float
-    rounding of the weighted sum) clamp to A; negative scores clamp
+    rounding of the weighted sum) clamp to A+; negative scores clamp
     to F. Callers should already have validated component scores
     against ``max_score`` before getting here; this is a defence in
     depth rather than the primary guard.
     """
     if numeric_score >= 100:
-        return GradeLetter.A
+        return GradeLetter.A_PLUS
     for lower, letter in _LETTER_CUTOFFS:
         if numeric_score >= lower:
             return letter
