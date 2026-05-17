@@ -31,6 +31,10 @@ from app.modules.course.models import (                                         
     AddDropRequest, AdvisoryRecommendation, PrerequisiteOverride,
     ScheduleConflict,
 )
+from app.modules.course.grading.models import (                                   # noqa: F401
+    AssessmentBreakdown, AssessmentComponent, GradeAgentReview,
+    GradeAuthorisationDecision, GradeBatch, StudentComponentScore,
+)
 
 from app.modules.auth.router import router as auth_router
 from app.modules.programs.router import router as programs_router
@@ -41,6 +45,7 @@ from app.modules.undergraduate.ranking.router import router as ranking_router
 from app.modules.undergraduate.ranking.review_router import router as review_router
 from app.modules.undergraduate.enrollment.router import router as enrollment_router
 from app.modules.course.router import router as course_router
+from app.modules.course.grading.router import router as grading_router
 
 
 def create_app() -> FastAPI:
@@ -73,6 +78,7 @@ def create_app() -> FastAPI:
     app.include_router(review_router, prefix=settings.API_V1_PREFIX)
     app.include_router(enrollment_router, prefix=settings.API_V1_PREFIX)
     app.include_router(course_router, prefix=settings.API_V1_PREFIX)
+    app.include_router(grading_router, prefix=settings.API_V1_PREFIX)
 
     # ── Event Subscriptions ──
     from app.shared.events import subscribe

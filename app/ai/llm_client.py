@@ -247,6 +247,153 @@ _CONSULTATION_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 
+# Static system prompt for the Track B grading-monitor flow. The
+# tool layer compiles a deterministic context dict; the LLM reasons
+# as a department head and emits a structured verdict + flags +
+# narrative. Held as a module constant so Gemini's implicit cache
+# (when active) can reuse it across calls.
+_GRADING_REVIEW_SYSTEM_PROMPT = (
+    "You are an academic department head at Addis Ababa University "
+    "reviewing a grade submission from one of your instructors. Your "
+    "job is to safeguard academic integrity and ensure fair, "
+    "defensible grading.\n\n"
+    "You will receive a JSON object describing:\n"
+    "  - course        : code, title, credit_hours, semester, department\n"
+    "  - section       : code, term name, term phase\n"
+    "  - breakdown     : the instructor's assessment plan (components,\n"
+    "                    weights, max scores) and whether the weights\n"
+    "                    correctly sum to 100\n"
+    "  - roster        : total students, original cohort, students who\n"
+    "                    joined via add/drop, is_small_class flag\n"
+    "  - class_stats   : n, mean, median, stddev, min, max, pass rate\n"
+    "  - distribution  : letter-grade histogram (A, A-, ..., F)\n"
+    "  - components    : per-component mean/stddev (normalised to %)\n"
+    "                    so you can see WHICH component drives the\n"
+    "                    overall picture\n"
+    "  - outliers      : students whose final score is more than\n"
+    "                    2.5 standard deviations from the mean (both\n"
+    "                    above and below). These are *candidates* —\n"
+    "                    not necessarily problems.\n"
+    "  - identical_clusters: any final-score values shared by multiple\n"
+    "                    students, with counts. Surfaced as a pattern;\n"
+    "                    YOU decide if it's suspicious or legitimate.\n"
+    "  - missing       : any (student, component) cells with no score.\n"
+    "                    Should be empty in a normal submit.\n"
+    "  - history       : prior-term mean and pass rate for THIS course\n"
+    "                    if any authorised grades exist. May be\n"
+    "                    {has_history: false}.\n"
+    "  - deadline      : whether the submission was on time relative\n"
+    "                    to the term's end date.\n"
+    "  - iteration     : which run this is (1 = first submit; 2+ = the\n"
+    "                    instructor re-submitted after a prior FLAG).\n"
+    "  - instructor_justification : only present from iteration 2+;\n"
+    "                    the instructor's written explanation of why\n"
+    "                    the prior FLAG concerns are unfounded.\n\n"
+    "Reason through the submission like a thoughtful department head:\n"
+    "  - Is the distribution defensible, or does it suggest unfair\n"
+    "    grading, grade inflation, mass-failure, or rubber-stamping?\n"
+    "  - Are the outliers genuine or do they look like data-entry\n"
+    "    errors?\n"
+    "  - Does the pattern of identical scores indicate a legitimate\n"
+    "    component (e.g. an all-or-nothing attendance grade) or\n"
+    "    suspicious uniformity?\n"
+    "  - Is the submission on time?\n"
+    "  - How does this term compare to historical performance, where\n"
+    "    available?\n"
+    "  - On iteration 2+: does the instructor's justification\n"
+    "    adequately explain the prior concerns?\n\n"
+    "Context-sensitive guidance:\n"
+    "  - A small class (n < 10) makes statistical anomalies less\n"
+    "    meaningful — weight your judgment accordingly.\n"
+    "  - High pass rates are not inherently bad. Judge them against\n"
+    "    course difficulty and historical baseline.\n"
+    "  - 2.5σ outliers in either direction are worth examining but\n"
+    "    may be perfectly legitimate (a top student, a struggling\n"
+    "    student).\n"
+    "  - All-identical grades are unusual but valid for binary\n"
+    "    components (attendance, participation).\n"
+    "  - Late submission alone is not a FLAG-worthy anomaly; combined\n"
+    "    with other patterns it might be.\n\n"
+    "Decide either APPROVE (forward to department head for final\n"
+    "authorisation) or FLAG (ask the instructor to review and either\n"
+    "correct the grades or provide a written justification).\n\n"
+    "OUTPUT: respond with one JSON object that conforms to the\n"
+    "response schema you have been given. Do not add prose outside\n"
+    "the JSON. Be specific in flags and reasoning — a human reads\n"
+    "this verbatim."
+)
+
+
+_GRADING_REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {
+            "type": "string",
+            "enum": ["APPROVE", "FLAG"],
+            "description": (
+                "APPROVE = the submission looks defensible; forward "
+                "to the department head for final authorisation. "
+                "FLAG = at least one concern requires the instructor "
+                "to review, correct, or justify before authorisation."
+            ),
+        },
+        "flags": {
+            "type": "array",
+            "description": (
+                "Specific concerns. Empty array on APPROVE. Each "
+                "flag should be specific (cite the metric or the "
+                "students) and actionable. On a FLAG verdict, this "
+                "array MUST contain at least one entry."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "description": (
+                            "Short category tag — examples: "
+                            "DISTRIBUTION_SUSPICIOUS, MASS_FAILURE, "
+                            "GRADE_INFLATION, OUTLIER_DATA_ENTRY, "
+                            "IDENTICAL_SCORES, MISSING_GRADES, "
+                            "LATE_SUBMISSION, HISTORICAL_DRIFT."
+                        ),
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["LOW", "MEDIUM", "HIGH"],
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": (
+                            "Plain-English explanation a human "
+                            "instructor or department head reads."
+                        ),
+                    },
+                    "affected_students": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Student numbers (e.g. UGR/0123/15) "
+                            "relevant to this flag, if any."
+                        ),
+                    },
+                },
+                "required": ["type", "severity", "message"],
+            },
+        },
+        "reasoning": {
+            "type": "string",
+            "description": (
+                "Plain-English explanation of how you reached the "
+                "verdict. A department head reads this verbatim. "
+                "Cite the specific metrics that drove your decision."
+            ),
+        },
+    },
+    "required": ["verdict", "flags", "reasoning"],
+}
+
+
 class LLMClient:
     """
     Async narrative generator backed by the Gemini Generative AI API.
@@ -437,6 +584,107 @@ class LLMClient:
                 "advisory_consult_llm_invalid_json",
                 extra={
                     "agent_layer": "advisory_consult",
+                    "raw_excerpt": raw_text[:500],
+                },
+            )
+            raise LLMUnavailableError(
+                "Gemini response was not valid JSON despite "
+                "structured-output mode."
+            ) from exc
+
+
+    async def review_grade_batch_as_dh(
+        self,
+        review_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Reason over a deterministic grading context as the department
+        head and return a structured verdict (APPROVE | FLAG), a list
+        of flags, and a plain-English explanation.
+
+        Hard-fail contract: any failure (no API key, SDK unavailable,
+        timeout, API error, malformed JSON) raises
+        :class:`LLMUnavailableError`. The GradingMonitorAgent catches
+        that and records a PENDING review row so the department head
+        can manually re-trigger — there is NO rule-based fallback,
+        per the user's explicit instruction that this agent must
+        always be LLM-driven.
+        """
+        if genai is None:
+            raise LLMUnavailableError(
+                "google-genai SDK is not installed in this environment."
+            )
+
+        user_payload = json.dumps(review_payload, default=str)
+        config = genai_types.GenerateContentConfig(
+            system_instruction=_GRADING_REVIEW_SYSTEM_PROMPT,
+            max_output_tokens=self._max_tokens,
+            temperature=0.3,
+            response_mime_type="application/json",
+            response_schema=_GRADING_REVIEW_RESPONSE_SCHEMA,
+        )
+        print("\n=== GRADING REVIEW LLM CALL ===")
+        print(f"System Prompt:\n{_GRADING_REVIEW_SYSTEM_PROMPT}")
+        print(f"\nUser Context/Payload:\n{user_payload}")
+        print("=== END GRADING REVIEW LLM CALL ===\n")
+        try:
+            response = await asyncio.wait_for(
+                self._client.aio.models.generate_content(
+                    model=self._model,
+                    contents=user_payload,
+                    config=config,
+                ),
+                timeout=self._timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            logger.warning(
+                "grading_review_llm_timeout",
+                extra={
+                    "agent_layer": "grading_review",
+                    "timeout_seconds": self._timeout,
+                },
+            )
+            raise LLMUnavailableError(
+                f"Grading-review LLM call timed out after {self._timeout}s."
+            ) from exc
+        except genai_errors.APIError as exc:
+            logger.warning(
+                "grading_review_llm_failed",
+                extra={
+                    "agent_layer": "grading_review",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            raise LLMUnavailableError(
+                f"Gemini API error: {type(exc).__name__}: {exc}"
+            ) from exc
+        except Exception as exc:
+            logger.warning(
+                "grading_review_llm_unexpected_error",
+                extra={
+                    "agent_layer": "grading_review",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            raise LLMUnavailableError(
+                f"Unexpected LLM error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        raw_text = _extract_text(response)
+        print(f"LLM Response:\n{raw_text}")
+        if not raw_text:
+            raise LLMUnavailableError(
+                "Gemini returned an empty response body."
+            )
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "grading_review_llm_invalid_json",
+                extra={
+                    "agent_layer": "grading_review",
                     "raw_excerpt": raw_text[:500],
                 },
             )
