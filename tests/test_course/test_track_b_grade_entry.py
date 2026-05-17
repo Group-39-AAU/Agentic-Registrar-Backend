@@ -628,7 +628,8 @@ async def test_submit_happy_path_writes_grades_and_approves(
     assert result.agent_verdict == "APPROVE"
     assert result.status is GradeSubmissionStatus.SUBMITTED
     assert len(result.grades) == 3
-    assert all(g.letter_grade is GradeLetter.A for g in result.grades)
+    # 100.0 maps to A+ under Senate Art 90.1 ([90, 100] = A+, 4.00).
+    assert all(g.letter_grade is GradeLetter.A_PLUS for g in result.grades)
     assert all(g.numeric_score == 100.0 for g in result.grades)
 
     # Grade rows landed in the Track A table at SUBMITTED status.
@@ -640,8 +641,8 @@ async def test_submit_happy_path_writes_grades_and_approves(
     )).scalars().all()
     assert len(grades) == 3
     assert all(g.status is GradeSubmissionStatus.SUBMITTED for g in grades)
-    assert all(g.letter_grade is GradeLetter.A for g in grades)
-    # grade_points = credit_hours (3) × 4.0 (A) = 12.0
+    assert all(g.letter_grade is GradeLetter.A_PLUS for g in grades)
+    # grade_points = credit_hours (3) × 4.0 (A+) = 12.0
     assert all(g.grade_points == 12.0 for g in grades)
     assert all(g.entered_by_id == w["instr_user"].id for g in grades)
 
@@ -650,13 +651,13 @@ async def test_submit_mixed_outcomes_compute_correctly(
     async_session, grading_scenario,
 ):
     """
-    Mixed grades — confirm the weighted_pct math.
+    Mixed grades — confirm the weighted_pct math under Senate Art 90.1.
 
       Quiz weight 30, max 10. Mid weight 30, max 50. Final weight 40, max 100.
 
-    Student 1 (perfect):     10/10  + 50/50  + 100/100 → 30+30+40 = 100 → A
-    Student 2 (middling):    7/10   + 35/50  + 70/100  → 21+21+28 = 70  → B-
-    Student 3 (failing):     2/10   + 10/50  + 30/100  →  6+ 6+12 = 24  → F
+    Student 1 (perfect):     10/10  + 50/50  + 100/100 → 30+30+40 = 100 → A+
+    Student 2 (middling):    7/10   + 35/50  + 70/100  → 21+21+28 = 70  → B   ([68, 75))
+    Student 3 (failing):     2/10   + 10/50  + 30/100  →  6+ 6+12 = 24  → F   (<40)
     """
     w = grading_scenario
     svc = InstructorGradingService(async_session)
@@ -693,9 +694,9 @@ async def test_submit_mixed_outcomes_compute_correctly(
     )
     by_sn = {g.student_number: g for g in result.grades}
     assert by_sn["UGR/0001/15"].numeric_score == 100.0
-    assert by_sn["UGR/0001/15"].letter_grade is GradeLetter.A
+    assert by_sn["UGR/0001/15"].letter_grade is GradeLetter.A_PLUS
     assert by_sn["UGR/0002/15"].numeric_score == 70.0
-    assert by_sn["UGR/0002/15"].letter_grade is GradeLetter.B_MINUS
+    assert by_sn["UGR/0002/15"].letter_grade is GradeLetter.B
     assert by_sn["UGR/0003/15"].numeric_score == 24.0
     assert by_sn["UGR/0003/15"].letter_grade is GradeLetter.F
 

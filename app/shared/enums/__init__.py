@@ -182,10 +182,23 @@ class RegistrationStatus(str, Enum):
 class GradeLetter(str, Enum):
     """
     AAU letter-grade scale used by Track B (grading lifecycle).
-    Includes the special non-numeric marks I (Incomplete) and NG
-    (No Grade) that route an academic-status calculation through
-    AcademicStandingAgent.handleEdgeCase per SDS Table 75.
+
+    Senate Legislation Article 90.1 — the eleven letters with numeric
+    point values that count toward GPA (A+ through F), plus the
+    administrative marks that don't participate in GPA computation:
+
+      I  — Incomplete       (Art 90.7.1, converted from NG)
+      NG — No Grade         (Art 90.7, must be converted before submission)
+      W  — Withdrawn        (Art 90.7.2, formal withdrawal within 8 weeks)
+      DO — Dropout          (Art 90.7.3, no formal withdrawal)
+      P  — Pass (non-credit) (Art 90.7.6, P/F non-credit work)
+
+    Per Art 90.7.4 and 90.7.6, none of I/NG/W/DO/P play any part in
+    the computation of the semester grade point average. The
+    AcademicStandingAgent (Track C) handles I as an edge case that
+    holds the term status for officer review.
     """
+    A_PLUS = "A+"
     A = "A"
     A_MINUS = "A-"
     B_PLUS = "B+"
@@ -196,8 +209,11 @@ class GradeLetter(str, Enum):
     C_MINUS = "C-"
     D = "D"
     F = "F"
-    I = "I"   # Incomplete
+    I = "I"    # Incomplete
     NG = "NG"  # No Grade
+    W = "W"    # Withdrawn
+    DO = "DO"  # Dropout
+    P = "P"    # Pass (non-credit only)
 
 
 class GradeSubmissionStatus(str, Enum):
