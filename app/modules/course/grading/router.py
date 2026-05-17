@@ -1,15 +1,25 @@
 """
 Track B (Grading) — FastAPI routes.
 
-Mounted from ``app.modules.course.router`` so every grading route sits
-under the existing ``/courses`` prefix. PR 1 ships two reads:
+Mounted from ``app.main`` under the ``/courses/grading`` prefix.
+
+PR 1 ships two reads (instructor surface):
 
     GET  /courses/grading/me/sections?term_id={uuid}
     GET  /courses/grading/sections/{section_id}/courses/{course_id}/roster
 
-Both are instructor-only; ownership of the (section, course) pair is
-enforced inside the service layer, not in the route handler, so the
-same rules apply if other paths reuse the service later.
+PR 2 adds the breakdown editor + grade-entry batch lifecycle (still
+instructor-only):
+
+    POST /courses/grading/sections/{sid}/courses/{cid}/breakdown
+    GET  /courses/grading/sections/{sid}/courses/{cid}/breakdown
+    POST /courses/grading/sections/{sid}/courses/{cid}/batch
+    PUT  /courses/grading/batches/{bid}/scores
+    POST /courses/grading/batches/{bid}/submit
+
+Ownership of the (section, course) pair is enforced inside the
+service layer, not in the route handler, so the same rules apply if
+other paths reuse the service later.
 """
 from __future__ import annotations
 
@@ -22,9 +32,13 @@ from app.core.dependencies import get_current_user
 from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.course.exceptions import (
-    EntityNotFoundError, UnauthorizedActorError,
+    BreakdownLockedError, EntityNotFoundError, GradeBatchNotEditableError,
+    IncompleteGradeSubmissionError, InvalidBreakdownError,
+    UnauthorizedActorError,
 )
 from app.modules.course.grading.schemas import (
+    AssessmentBreakdownCreate, AssessmentBreakdownResponse,
+    BulkScoreWrite, GradeBatchResponse, GradeBatchSubmitResponse,
     InstructorSectionAssignmentResponse, SectionCourseRosterResponse,
 )
 from app.modules.course.grading.service import InstructorGradingService
@@ -116,3 +130,248 @@ async def get_section_course_roster(
             status.HTTP_404_NOT_FOUND,
             f"{exc.entity} {exc.entity_id} not found",
         ) from exc
+
+
+# ══════════════════════════════════════════════════════════════
+#  PR 2 — Breakdown editor + grade-entry batch
+# ══════════════════════════════════════════════════════════════
+
+
+def _raise_grading_errors(exc: Exception) -> None:
+    """
+    Shared mapper from grading-specific domain exceptions to HTTP
+    statuses. Re-raises anything it doesn't recognise.
+    """
+    if isinstance(exc, UnauthorizedActorError):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail) from exc
+    if isinstance(exc, EntityNotFoundError):
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"{exc.entity} {exc.entity_id} not found",
+        ) from exc
+    if isinstance(exc, BreakdownLockedError):
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    if isinstance(exc, GradeBatchNotEditableError):
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    if isinstance(exc, InvalidBreakdownError):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
+        ) from exc
+    if isinstance(exc, IncompleteGradeSubmissionError):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": "incomplete_grade_submission",
+                "message": str(exc),
+                "missing": exc.missing,
+            },
+        ) from exc
+
+
+# ── Breakdown CRUD ──
+
+
+@router.post(
+    "/sections/{section_id}/courses/{course_id}/breakdown",
+    response_model=AssessmentBreakdownResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Create or replace the assessment breakdown for a (section, course)",
+)
+async def upsert_breakdown(
+    section_id: uuid.UUID,
+    course_id: uuid.UUID,
+    payload: AssessmentBreakdownCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The breakdown is the instructor's plan for how the final grade
+    is composed. Components' weights must sum to exactly 100.
+
+    A second POST that replaces the breakdown bumps ``version`` and
+    is allowed only while ``locked_at`` is null (no component scores
+    saved yet). Once any score is entered the breakdown locks and a
+    further POST returns 409.
+
+    422 if the payload is invalid (weights don't sum to 100, duplicate
+    component names, weight out of (0,100]).
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.upsert_breakdown(
+            user_id=current_user.id,
+            section_id=section_id, course_id=course_id,
+            payload=payload,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+@router.get(
+    "/sections/{section_id}/courses/{course_id}/breakdown",
+    response_model=AssessmentBreakdownResponse,
+    summary="Read the assessment breakdown for a (section, course)",
+)
+async def get_breakdown(
+    section_id: uuid.UUID,
+    course_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """404 if no breakdown has been POSTed for this pair yet."""
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.get_breakdown(
+            user_id=current_user.id,
+            section_id=section_id, course_id=course_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+# ── Batch get-or-create + reads ──
+
+
+@router.post(
+    "/sections/{section_id}/courses/{course_id}/batch",
+    response_model=GradeBatchResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get (or lazily create) the grade batch for a (section, course)",
+)
+async def get_or_create_batch(
+    section_id: uuid.UUID,
+    course_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Idempotent: returns the existing batch, or creates an empty DRAFT
+    one if none exists yet. The response carries the current score
+    matrix (one cell per (roster student × component)) so the UI can
+    render the grade-entry grid in a single request.
+
+    404 if no breakdown has been created for the pair yet.
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.get_or_create_batch(
+            user_id=current_user.id,
+            section_id=section_id, course_id=course_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+# ── Score upsert (draft save) ──
+
+
+@router.put(
+    "/batches/{batch_id}/scores",
+    response_model=GradeBatchResponse,
+    summary="Bulk-upsert one or more (student, component) score cells",
+)
+async def upsert_scores(
+    batch_id: uuid.UUID,
+    payload: BulkScoreWrite,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Save partial work without committing the batch. Validates that
+    every cell's student is on the live roster and that the score is
+    within ``[0, component.max_score]``. The first non-null save
+    locks the breakdown.
+
+    409 if the batch is no longer in DRAFT.
+    422 if any cell is malformed (unknown student, unknown component,
+    score over max_score).
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.upsert_scores(
+            user_id=current_user.id,
+            batch_id=batch_id, payload=payload,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+# ── Clear scores + unlock breakdown ──
+
+
+@router.delete(
+    "/batches/{batch_id}/scores",
+    response_model=GradeBatchResponse,
+    summary="Wipe all entered scores and unlock the breakdown for re-upload",
+)
+async def delete_all_scores(
+    batch_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Destructive: clears every (student × component) cell for the
+    batch and resets the breakdown's lock. Use this when the
+    instructor needs to change the breakdown after already entering
+    some scores.
+
+    The batch row itself is preserved (same id, status stays DRAFT)
+    so any saved frontend reference keeps working.
+
+    409 if the batch is not in DRAFT (post-submit edits go through
+    the iteration / DH-review path, not this one).
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.delete_all_scores(
+            user_id=current_user.id, batch_id=batch_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+# ── Submit ──
+
+
+@router.post(
+    "/batches/{batch_id}/submit",
+    response_model=GradeBatchSubmitResponse,
+    summary="Submit the batch — computes letters and runs the agent",
+)
+async def submit_batch(
+    batch_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    DRAFT → SUBMITTED (or FLAGGED if the agent flags it; PR 2 stub
+    always APPROVES). The endpoint:
+
+      1. Refuses if any roster student is missing any component score
+         (422 with a structured ``missing`` list for the UI to highlight).
+      2. Computes weighted_pct + AAU letter per student.
+      3. Upserts ``Grade`` rows at status=SUBMITTED.
+      4. Asks the grading-monitor agent for a verdict.
+      5. Returns the verdict and per-student outcomes.
+
+    409 if the batch isn't in DRAFT.
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.submit_batch(
+            user_id=current_user.id, batch_id=batch_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise

@@ -49,6 +49,10 @@ from app.modules.course.models import (                                 # noqa: 
     AddDropRequest, AdvisoryRecommendation, PrerequisiteOverride,
     ScheduleConflict,
 )
+from app.modules.course.grading.models import (                         # noqa: F401
+    AssessmentBreakdown, AssessmentComponent, GradeBatch,
+    StudentComponentScore,
+)
 
 from app.database.base import Base
 

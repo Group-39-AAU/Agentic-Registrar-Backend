@@ -10,15 +10,34 @@ PR 1 surface: the two instructor reads.
     ORIGINAL (registered into the section's cohort) or ADDED (joined
     this section's slot via an approved add/drop batch).
 
-Later PRs append breakdown / batch / agent-review / authorisation
-shapes here.
+PR 2 surface: breakdown editor + grade-entry batch.
+
+  * AssessmentComponentCreate / Response  — one weighted row of the
+    breakdown.
+  * AssessmentBreakdownCreate / Response  — POST body and read view
+    of a (section, course) breakdown. The sum-of-weights == 100
+    invariant is validated server-side.
+  * GradeBatchResponse                    — read view of the workflow
+    object, including the current score matrix and per-student
+    completion status.
+  * StudentScoreCellResponse              — one cell of the score
+    matrix (one component × one student).
+  * ScoreCellWrite / BulkScoreWrite       — PUT body for upserting
+    one or many score cells in a single round trip.
+  * GradeBatchSubmitResponse              — what comes back from
+    submit (verdict + per-student computed letter + numeric).
+
+Later PRs append agent-review and authorisation shapes here.
 """
 from __future__ import annotations
 
 import uuid
-from typing import Optional
+from datetime import datetime
+from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.shared.enums import GradeLetter, GradeSubmissionStatus
 
 
 # ══════════════════════════════════════════════════════════════
@@ -100,3 +119,172 @@ class SectionCourseRosterResponse(BaseModel):
     added_count: int
 
     students: list[RosterStudentResponse]
+
+
+# ══════════════════════════════════════════════════════════════
+#  Assessment breakdown — PR 2
+# ══════════════════════════════════════════════════════════════
+
+
+class AssessmentComponentCreate(BaseModel):
+    """
+    One row of the POSTed breakdown body.
+
+    ``max_score`` defaults to the component's ``weight`` when omitted:
+    if an instructor says "Quiz weight 10", we assume they grade
+    the quiz out of 10 too, so the raw score IS the weighted
+    contribution (no mental arithmetic, no scaling). When the two
+    scales differ (e.g. "Mid out of 50, worth 30%") the instructor
+    sets ``max_score`` explicitly.
+    """
+    name: str = Field(min_length=1, max_length=120)
+    weight: float = Field(gt=0, le=100)
+    # Optional in the payload; resolved to ``weight`` by the validator
+    # below before the service ever sees it. Must be positive when
+    # provided.
+    max_score: Optional[float] = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _default_max_score_to_weight(self) -> "AssessmentComponentCreate":
+        if self.max_score is None:
+            # Pydantic models are frozen against __setattr__ only when
+            # ``frozen=True``; ours isn't, so a direct assignment is fine.
+            self.max_score = self.weight
+        return self
+
+
+class AssessmentBreakdownCreate(BaseModel):
+    """
+    POST body for ``/sections/{sid}/courses/{cid}/breakdown``. The
+    service rejects any payload whose ``sum(components.weight) != 100``
+    (within floating-point tolerance) — this is the policy invariant
+    from the Track B checklist (lines 121, 156).
+    """
+    components: list[AssessmentComponentCreate] = Field(
+        min_length=1,
+        description="At least one component; weights must sum to 100.",
+    )
+
+
+class AssessmentComponentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    weight: float
+    max_score: float
+    order_index: int
+
+
+class AssessmentBreakdownResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    section_id: uuid.UUID
+    course_id: uuid.UUID
+    instructor_id: uuid.UUID
+    term_id: uuid.UUID
+    version: int
+    locked_at: Optional[datetime]
+    components: list[AssessmentComponentResponse]
+
+
+# ══════════════════════════════════════════════════════════════
+#  Grade batch — PR 2
+# ══════════════════════════════════════════════════════════════
+
+
+class StudentScoreCellResponse(BaseModel):
+    """One cell of the (student × component) score matrix."""
+    model_config = ConfigDict(from_attributes=True)
+
+    student_id: uuid.UUID
+    component_id: uuid.UUID
+    score: Optional[float]
+
+
+class StudentBatchRowResponse(BaseModel):
+    """
+    Per-student aggregate row for the UI: one student's full score
+    set for the batch, plus a ``is_complete`` flag indicating whether
+    every component has a non-null score.
+    """
+    student_id: uuid.UUID
+    student_number: str
+    full_name: str
+    is_added_via_drop: bool
+    is_complete: bool
+    scores: list[StudentScoreCellResponse]
+
+
+class GradeBatchResponse(BaseModel):
+    """Read view of one grade batch, including the live score matrix."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    section_id: uuid.UUID
+    section_code: str
+    course_id: uuid.UUID
+    course_code: str
+    course_title: str
+    course_credit_hours: int
+    term_id: uuid.UUID
+    instructor_id: uuid.UUID
+    breakdown_id: uuid.UUID
+    status: GradeSubmissionStatus
+    iteration_count: int
+    submitted_at: Optional[datetime]
+    instructor_justification: Optional[str]
+
+    breakdown: AssessmentBreakdownResponse
+    rows: list[StudentBatchRowResponse]
+
+
+# ── Score upsert ──
+
+
+class ScoreCellWrite(BaseModel):
+    """One score cell in a bulk-upsert payload."""
+    student_id: uuid.UUID
+    component_id: uuid.UUID
+    # Nullable so the instructor can "blank out" a cell back to
+    # unentered. Negative scores rejected.
+    score: Optional[float] = Field(default=None, ge=0)
+
+
+class BulkScoreWrite(BaseModel):
+    """
+    PUT body for ``/batches/{bid}/scores``. The service validates
+    each cell against the component's ``max_score`` and the roster
+    membership (no scores for students who aren't on the roster).
+    """
+    cells: list[ScoreCellWrite] = Field(min_length=1)
+
+
+# ── Submit ──
+
+
+class SubmittedGradeRow(BaseModel):
+    """Per-student outcome after the submit-time weighted computation."""
+    student_id: uuid.UUID
+    student_number: str
+    full_name: str
+    numeric_score: float
+    letter_grade: GradeLetter
+
+
+class GradeBatchSubmitResponse(BaseModel):
+    """
+    Reply to ``POST /batches/{bid}/submit``. Carries the new batch
+    status, the computed per-student outcomes, and the agent's
+    verdict (PR 2: always APPROVE from the stub; PR 3: real LLM
+    verdict).
+    """
+    batch_id: uuid.UUID
+    status: GradeSubmissionStatus
+    iteration: int
+    submitted_at: datetime
+    agent_verdict: Literal["APPROVE", "FLAG"]
+    agent_flags: list[str]
+    agent_reasoning: str
+    grades: list[SubmittedGradeRow]

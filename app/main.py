@@ -31,6 +31,10 @@ from app.modules.course.models import (                                         
     AddDropRequest, AdvisoryRecommendation, PrerequisiteOverride,
     ScheduleConflict,
 )
+from app.modules.course.grading.models import (                                   # noqa: F401
+    AssessmentBreakdown, AssessmentComponent, GradeBatch,
+    StudentComponentScore,
+)
 
 from app.modules.auth.router import router as auth_router
 from app.modules.programs.router import router as programs_router
