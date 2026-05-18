@@ -665,6 +665,28 @@ class StandingService:
                 Grade.is_deleted == False,  # noqa: E712
             )
         )).scalars().all()
+
+        # Standing for term T is reproducible: it must reflect the
+        # student's record as of the END of term T. Any grade from a
+        # term whose start_date is strictly AFTER the target term's
+        # start_date is "in the future" relative to this standing and
+        # must be excluded from the CGPA basis. Otherwise re-computing
+        # a past term's standing later (after more grades land) would
+        # silently change the answer.
+        grade_term_ids = {g.term_id for g in grades}
+        grade_term_rows = (
+            (await self.db.execute(
+                select(AcademicTerm).where(AcademicTerm.id.in_(grade_term_ids))
+            )).scalars().all()
+            if grade_term_ids else []
+        )
+        term_start_by_id = {t.id: t.start_date for t in grade_term_rows}
+        cutoff = term.start_date
+        grades = [
+            g for g in grades
+            if term_start_by_id.get(g.term_id, cutoff) <= cutoff
+        ]
+
         course_ids = list({g.course_id for g in grades})
         courses_by_id: dict[uuid.UUID, Course] = {}
         if course_ids:

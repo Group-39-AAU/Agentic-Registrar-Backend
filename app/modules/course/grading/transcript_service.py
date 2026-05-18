@@ -35,6 +35,7 @@ from app.modules.course.grading.schemas import (
 from app.modules.course.models import (
     AcademicTerm, Course, Grade, Student,
 )
+from app.modules.course.standing.models import AcademicStanding
 from app.shared.enums import GradeSubmissionStatus
 
 
@@ -102,8 +103,22 @@ class StudentTranscriptService:
         grades = await self._load_authorised_grades(
             student.id, term_id=term_id,
         )
-        entry = await self._compose_term_entry(term, grades)
-        return entry
+        # Single-term standing lookup so the transcript entry carries
+        # the official AAU status when one has been authorised.
+        standing = (await self.db.execute(
+            select(AcademicStanding).where(
+                AcademicStanding.student_id == student.id,
+                AcademicStanding.term_id == term_id,
+                AcademicStanding.final_status.is_not(None),
+                AcademicStanding.is_deleted == False,  # noqa: E712
+            )
+        )).scalar_one_or_none()
+        standings_by_term = (
+            {term_id: standing} if standing is not None else {}
+        )
+        return await self._compose_term_entry(
+            term, grades, standings_by_term=standings_by_term,
+        )
 
     # ── Helpers ─────────────────────────────────────────────────
 
@@ -151,12 +166,27 @@ class StudentTranscriptService:
         )).scalars().all()
         term_by_id = {t.id: t for t in terms}
 
+        # Bulk-load every authorised AcademicStanding for this student
+        # across the terms in the transcript so per-term entries
+        # surface the official status without N+1 queries.
+        standing_rows = (await self.db.execute(
+            select(AcademicStanding).where(
+                AcademicStanding.student_id == student.id,
+                AcademicStanding.term_id.in_(by_term.keys()),
+                AcademicStanding.final_status.is_not(None),
+                AcademicStanding.is_deleted == False,  # noqa: E712
+            )
+        )).scalars().all()
+        standings_by_term = {s.term_id: s for s in standing_rows}
+
         entries: list[TranscriptTermEntry] = []
         for term_id, term_grades in by_term.items():
             term = term_by_id.get(term_id)
             if term is None:  # tombstoned term row
                 continue
-            entries.append(await self._compose_term_entry(term, term_grades))
+            entries.append(await self._compose_term_entry(
+                term, term_grades, standings_by_term=standings_by_term,
+            ))
 
         # Sort terms newest first (start_date desc).
         entries.sort(key=lambda e: e.term_start_date, reverse=True)
@@ -181,7 +211,11 @@ class StudentTranscriptService:
         )
 
     async def _compose_term_entry(
-        self, term: AcademicTerm, grades: list[Grade],
+        self,
+        term: AcademicTerm,
+        grades: list[Grade],
+        *,
+        standings_by_term: Optional[dict[uuid.UUID, AcademicStanding]] = None,
     ) -> TranscriptTermEntry:
         # Hydrate course metadata and the optional Track B breakdown
         # in one pass per course id.
@@ -230,6 +264,9 @@ class StudentTranscriptService:
             if total_credit > 0 else None
         )
 
+        standing = (
+            standings_by_term.get(term.id) if standings_by_term else None
+        )
         return TranscriptTermEntry(
             term_id=term.id,
             term_name=term.term_name,
@@ -239,6 +276,12 @@ class StudentTranscriptService:
             courses=course_entries,
             term_gpa=term_gpa,
             total_credit_hours=total_credit,
+            academic_status=(
+                standing.final_status if standing is not None else None
+            ),
+            academic_status_authorised_at=(
+                standing.authorised_at if standing is not None else None
+            ),
         )
 
     async def _load_component_breakdown(
