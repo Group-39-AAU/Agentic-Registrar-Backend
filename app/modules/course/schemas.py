@@ -171,6 +171,11 @@ class RegistrationCourseRead(BaseModel):
     catalog row (code, title, credit_hours, semester, department) so
     the portal can render the registration without a second
     round-trip to the curriculum endpoint.
+
+    ``pending_drop`` is set by the add/drop picker when this course
+    is on a DROP request that hasn't yet reached a terminal state
+    (APPLIED / REJECTED / CANCELLED). Defaults to ``False`` for
+    consumers that don't populate it.
     """
     model_config = ConfigDict(from_attributes=True)
 
@@ -178,6 +183,7 @@ class RegistrationCourseRead(BaseModel):
     course_id: uuid.UUID
     section_id: Optional[uuid.UUID] = None
     is_dropped: bool
+    pending_drop: bool = False
     course: Optional[CourseResponse] = None
 
 
@@ -224,6 +230,32 @@ class RegistrationResponse(BaseModel):
     @property
     def active_course_count(self) -> int:
         return sum(1 for c in self.courses if not c.is_dropped)
+
+
+class AddDropPickerResponse(BaseModel):
+    """
+    Snapshot for the add/drop picker UI. Resolves the calling
+    student's registration for the currently-open AcademicTerm and
+    splits its course links into two action buckets:
+
+      * ``active_courses``  — ``is_dropped=false`` rows. Candidates
+        for DROP. Items where ``pending_drop=true`` already have a
+        DROP request in flight (batch not yet APPLIED / REJECTED /
+        CANCELLED) — the UI should mark those distinctly.
+      * ``dropped_courses`` — ``is_dropped=true`` rows on the same
+        registration. Candidates for re-ADD.
+
+    404 when no term is open OR no registration exists for the open
+    term.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    registration_id: uuid.UUID
+    term_id: uuid.UUID
+    term_name: str
+    registration_status: RegistrationStatus
+    active_courses: list[RegistrationCourseRead] = Field(default_factory=list)
+    dropped_courses: list[RegistrationCourseRead] = Field(default_factory=list)
 
 
 # ══════════════════════════════════════════════════════════════
