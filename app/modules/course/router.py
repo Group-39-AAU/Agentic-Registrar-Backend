@@ -32,6 +32,7 @@ from app.modules.course.schemas import (
     AcademicTermResponse,
     AddDropBatchCreate,
     AddDropBatchResponse,
+    AddDropPickerResponse,
     AddDropRequestResponse,
     AdvisoryConsultAddDropRequest,
     AdvisoryConsultResponse,
@@ -660,6 +661,122 @@ async def get_student_schedule_by_id(
 
 
 @router.get(
+    "/sections/{section_id}/schedule",
+    response_model=SectionScheduleResponse,
+    summary="Weekly schedule for a section",
+    response_description=(
+        "Section metadata + every ClassScheduleSlot on the section, "
+        "sorted by day_of_week then start_time."
+    ),
+)
+async def get_section_schedule_by_id(
+    section_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer/admin lookup of a cohort section's weekly timetable.
+
+    **Auth:** `REGISTRAR_OFFICER` or `ADMIN` only — anyone else gets
+    `403`. Use `GET /me/schedule` (student) or
+    `GET /instructors/me/schedule` (instructor) for self-views.
+
+    **Path params:** `section_id` — the cohort section.
+
+    **Response shape** (`SectionScheduleResponse`):
+    - `term_id` — the section's academic term.
+    - `student_id` — always `null` on this endpoint.
+    - `section` — `{section_id, section_code, department, semester,
+      capacity, enrolled_count}`.
+    - `slots[]` — each item: `course_code`, `course_title`,
+      `day_of_week` (MON–FRI), `start_time` / `end_time` (`HH:MM`),
+      `instructor_id` (nullable when unassigned), `room` (per-slot —
+      a cohort may meet in different rooms during the week).
+    - `pending_additions[]` — always empty here; only populated by
+      `/me/schedule`.
+
+    An empty `slots[]` means the scheduling agent has not run for
+    this section's department yet — call
+    `POST /officer/schedule/generate` to build the timetable.
+
+    **Errors:**
+    - `401` — missing / expired JWT.
+    - `403` — caller is not officer/admin.
+    - `404` — section does not exist (or is soft-deleted).
+    - `422` — malformed `section_id` UUID.
+    """
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only registrar officers or admins may look up section schedules.",
+        )
+    svc = SchedulingService(db)
+    try:
+        return await svc.get_section_schedule(section_id)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.get(
+    "/sections/{section_id}/students",
+    response_model=list[StudentResponse],
+    summary="Roster of students allocated to a section",
+    response_description=(
+        "List of Student rows whose Registration.section_id matches, "
+        "sorted by student_id ascending."
+    ),
+)
+async def list_section_students(
+    section_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer/admin roster lookup. Resolves the cohort by joining
+    `students` to non-deleted `registrations` where
+    `registration.section_id = {section_id}` — so the result reflects
+    the AcademicSchedulingAgent's current allocation. Students who
+    were moved to a different section by add/drop drop off this list
+    automatically.
+
+    **Auth:** `REGISTRAR_OFFICER` or `ADMIN` only — anyone else gets
+    `403`. Instructors should use the per-course roster at
+    `GET /courses/grading/sections/{section_id}/courses/{course_id}/roster`
+    instead, which is scoped to the courses they teach.
+
+    **Path params:** `section_id` — the cohort section.
+
+    **Response shape** — `list[StudentResponse]`. Each row:
+    - `id` — `students.id` (course-management PK).
+    - `user_id` — `users.id` (auth identity).
+    - `student_id` — UGR id string (e.g. `"UGR/0001/14"`).
+    - `full_name` — display name.
+    - `current_semester` — 1–10.
+    - `enrollment_status` — `ACTIVE` | `SUSPENDED` | `GRADUATED`
+      | `WITHDRAWN`.
+
+    An empty list means the agent has not allocated anyone to this
+    section yet — call `POST /officer/sections/allocate` first.
+
+    **Errors:**
+    - `401` — missing / expired JWT.
+    - `403` — caller is not officer/admin.
+    - `404` — section does not exist (or is soft-deleted).
+    - `422` — malformed `section_id` UUID.
+    """
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only registrar officers or admins may look up section students.",
+        )
+    svc = SchedulingService(db)
+    try:
+        return await svc.list_section_students(section_id)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.get(
     "/instructors/me/schedule",
     response_model=list[InstructorScheduleEntry],
     summary="Calling instructor's own weekly schedule",
@@ -818,6 +935,76 @@ async def list_my_add_drop_batches(
     student = await _resolve_student(db, current_user)
     svc = AddDropService(db)
     return await svc.list_batches_for_student(student.id)
+
+
+@router.get(
+    "/me/add-drop/picker",
+    response_model=AddDropPickerResponse,
+    summary="Add/drop picker snapshot for the calling student",
+    response_description=(
+        "Current open-term registration id + droppable + re-addable "
+        "course lists. Active items with an in-flight DROP request "
+        "are tagged pending_drop=true."
+    ),
+)
+async def get_my_add_drop_picker(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Single round trip for the add/drop UI. Resolves the calling
+    student's registration for the currently-open AcademicTerm and
+    returns the registration id plus both action buckets the picker
+    needs to render.
+
+    **Auth:** any authenticated student. The endpoint always operates
+    on the caller's own registration — there is no student-id
+    parameter.
+
+    **Response shape** (`AddDropPickerResponse`):
+    - `registration_id` — pass this verbatim to
+      `POST /add-drop/batches` when submitting changes.
+    - `term_id`, `term_name` — the open AcademicTerm.
+    - `registration_status` — `REGISTRATION_OPEN` | `REGISTERED` |
+      `ADD_DROP_WINDOW` | `CANCELLED`.
+    - `active_courses[]` — registration links where
+      `is_dropped=false`. **Candidates for DROP.** Each item also
+      carries `pending_drop: bool` — `true` when a DROP request for
+      the same course exists on a non-terminal batch
+      (`PENDING_AGENT` / `AGENT_APPROVED` / `AGENT_DENIED`). The UI
+      should render those as "awaiting approval" rather than offering
+      another DROP button to avoid duplicate submissions.
+    - `dropped_courses[]` — registration links where
+      `is_dropped=true`. **Candidates for re-ADD.**
+
+    Each item in both lists is a `RegistrationCourseRead`:
+    `id` (the `registration_courses.id`), `course_id`, `section_id`
+    (nullable until allocation), `is_dropped`, `pending_drop`,
+    and `course` — the nested `CourseResponse`
+    (`code`, `title`, `credit_hours`, `semester`, `department`).
+
+    **Submitting an ADD or DROP:** pass `registration_id` and a list
+    of `{course_id, action}` items to
+    `POST /add-drop/batches`. The agent runs curriculum / semester
+    parity / prereqs / credit-envelope checks and parks the batch
+    at `AGENT_APPROVED` or `AGENT_DENIED` — **the registration is
+    not mutated** until an officer approves (or overrides a denial)
+    via `POST /officer/add-drop/batches/{batch_id}/approve` or
+    `/override`.
+
+    **Errors:**
+    - `401` — missing / expired JWT.
+    - `403` — caller has no student profile.
+    - `404` — no AcademicTerm has `is_open=true`, or the student has
+      no `registrations` row for the open term (hit
+      `POST /me/register` first).
+    """
+    student = await _resolve_student(db, current_user)
+    svc = RegistrationService(db)
+    try:
+        return await svc.get_add_drop_picker(student.id)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
 
 
 @router.get(

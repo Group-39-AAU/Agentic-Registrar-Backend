@@ -416,6 +416,96 @@ class RegistrationService:
             "courses": courses,
         }
 
+    async def get_add_drop_picker(self, student_id: uuid.UUID) -> dict:
+        """
+        Resolve the calling student's registration for the currently-
+        open AcademicTerm and split its course links into the two
+        add/drop action buckets the portal needs (active = droppable,
+        dropped = re-addable). Single round trip for the picker UI.
+
+        Active items where a DROP request is already in flight (an
+        ``AddDropRequest`` row with action=DROP attached to a batch
+        whose status is not yet APPLIED / REJECTED / CANCELLED) are
+        tagged ``pending_drop=True`` so the UI can render them as
+        "awaiting approval" instead of offering another DROP button.
+
+        Raises ``EntityNotFoundError`` when no term is currently open
+        or the student has no registration row for that term.
+        """
+        student = (
+            await self.db.execute(
+                select(Student).where(Student.id == student_id)
+            )
+        ).scalar_one_or_none()
+        if student is None:
+            raise EntityNotFoundError("Student", str(student_id))
+
+        open_term = (
+            await self.db.execute(
+                select(AcademicTerm).where(
+                    AcademicTerm.is_open == True,    # noqa: E712
+                    AcademicTerm.is_deleted == False,  # noqa: E712
+                ).order_by(AcademicTerm.start_date.asc())
+            )
+        ).scalars().first()
+        if open_term is None:
+            raise EntityNotFoundError("AcademicTerm", "open")
+
+        registration = await self.registrations.get_for_student_and_term(
+            student_id, open_term.id,
+        )
+        if registration is None:
+            raise EntityNotFoundError(
+                "Registration",
+                f"student={student.student_id}, term='{open_term.term_name}'",
+            )
+
+        # course_ids on this registration that have a non-terminal
+        # DROP request in flight. AGENT_DENIED is non-terminal too —
+        # an officer can still override it.
+        pending_drop_course_ids: set[uuid.UUID] = set(
+            (
+                await self.db.execute(
+                    select(AddDropRequest.course_id)
+                    .join(AddDropBatch, AddDropBatch.id == AddDropRequest.batch_id)
+                    .where(
+                        AddDropBatch.registration_id == registration.id,
+                        AddDropBatch.is_deleted == False,  # noqa: E712
+                        AddDropRequest.action == AddDropAction.DROP,
+                        AddDropBatch.status.in_([
+                            AddDropBatchStatus.PENDING_AGENT,
+                            AddDropBatchStatus.AGENT_APPROVED,
+                            AddDropBatchStatus.AGENT_DENIED,
+                        ]),
+                    )
+                )
+            ).scalars().all()
+        )
+
+        active: list[dict] = []
+        dropped: list[dict] = []
+        for rc in registration.courses:
+            payload = {
+                "id": rc.id,
+                "course_id": rc.course_id,
+                "is_dropped": rc.is_dropped,
+                "pending_drop": (
+                    not rc.is_dropped
+                    and rc.course_id in pending_drop_course_ids
+                ),
+                "course": rc.course,
+            }
+            (dropped if rc.is_dropped else active).append(payload)
+
+        return {
+            "registration_id": registration.id,
+            "term_id": open_term.id,
+            "term_name": open_term.term_name,
+            "registration_status": registration.status,
+            "active_courses": active,
+            "dropped_courses": dropped,
+        }
+
     async def _semester_for_term(
         self, student: Student, target_term: AcademicTerm,
     ) -> Optional[int]:
@@ -1646,6 +1736,41 @@ class SchedulingService:
         """
         return await self._section_schedule_payload(
             section_id=section_id, term_id=None, student_id=None,
+        )
+
+    async def list_section_students(
+        self,
+        section_id: uuid.UUID,
+    ) -> list[Student]:
+        """
+        Students allocated to ``section_id``. Resolved off
+        ``Registration.section_id`` so the list reflects the agent's
+        current cohort allocation. ``EntityNotFoundError`` when the
+        Section itself does not exist.
+        """
+        section = (
+            await self.db.execute(
+                select(Section).where(
+                    Section.id == section_id,
+                    Section.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if section is None:
+            raise EntityNotFoundError("Section", str(section_id))
+
+        return list(
+            (
+                await self.db.execute(
+                    select(Student).join(
+                        Registration, Registration.student_id == Student.id,
+                    ).where(
+                        Registration.section_id == section_id,
+                        Registration.is_deleted == False,  # noqa: E712
+                        Student.is_deleted == False,  # noqa: E712
+                    ).order_by(Student.student_id.asc())
+                )
+            ).scalars().all()
         )
 
     async def _section_schedule_payload(
