@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.logging import get_logger, write_audit_log
 from app.modules.course.agents import (
@@ -428,6 +429,9 @@ class RegistrationService:
         whose status is not yet APPLIED / REJECTED / CANCELLED) are
         tagged ``pending_drop=True`` so the UI can render them as
         "awaiting approval" instead of offering another DROP button.
+        Dropped items where an ADD request is in flight are tagged
+        ``pending_add=True`` symmetrically so the re-add picker can
+        disable that row.
 
         Raises ``EntityNotFoundError`` when no term is currently open
         or the student has no registration row for that term.
@@ -461,26 +465,29 @@ class RegistrationService:
             )
 
         # course_ids on this registration that have a non-terminal
-        # DROP request in flight. AGENT_DENIED is non-terminal too —
-        # an officer can still override it.
-        pending_drop_course_ids: set[uuid.UUID] = set(
-            (
-                await self.db.execute(
-                    select(AddDropRequest.course_id)
-                    .join(AddDropBatch, AddDropBatch.id == AddDropRequest.batch_id)
-                    .where(
-                        AddDropBatch.registration_id == registration.id,
-                        AddDropBatch.is_deleted == False,  # noqa: E712
-                        AddDropRequest.action == AddDropAction.DROP,
-                        AddDropBatch.status.in_([
-                            AddDropBatchStatus.PENDING_AGENT,
-                            AddDropBatchStatus.AGENT_APPROVED,
-                            AddDropBatchStatus.AGENT_DENIED,
-                        ]),
-                    )
+        # request in flight, split by action. AGENT_DENIED is
+        # non-terminal too — an officer can still override it.
+        in_flight_rows = (
+            await self.db.execute(
+                select(AddDropRequest.course_id, AddDropRequest.action)
+                .join(AddDropBatch, AddDropBatch.id == AddDropRequest.batch_id)
+                .where(
+                    AddDropBatch.registration_id == registration.id,
+                    AddDropBatch.is_deleted == False,  # noqa: E712
+                    AddDropBatch.status.in_([
+                        AddDropBatchStatus.PENDING_AGENT,
+                        AddDropBatchStatus.AGENT_APPROVED,
+                        AddDropBatchStatus.AGENT_DENIED,
+                    ]),
                 )
-            ).scalars().all()
-        )
+            )
+        ).all()
+        pending_drop_course_ids: set[uuid.UUID] = {
+            cid for cid, action in in_flight_rows if action == AddDropAction.DROP
+        }
+        pending_add_course_ids: set[uuid.UUID] = {
+            cid for cid, action in in_flight_rows if action == AddDropAction.ADD
+        }
 
         active: list[dict] = []
         dropped: list[dict] = []
@@ -493,9 +500,46 @@ class RegistrationService:
                     not rc.is_dropped
                     and rc.course_id in pending_drop_course_ids
                 ),
+                "pending_add": (
+                    rc.is_dropped
+                    and rc.course_id in pending_add_course_ids
+                ),
                 "course": rc.course,
             }
             (dropped if rc.is_dropped else active).append(payload)
+
+        # Catalog courses the student can ADD for the first time:
+        # same-department rows not already on this registration (in
+        # any state) and not previously completed with a passing
+        # grade. Lets the picker offer past/future curriculum courses
+        # the student never took, not just re-adds of dropped rows.
+        on_registration_ids = {rc.course_id for rc in registration.courses}
+        completed_ids = await GradeRepository(self.db).completed_course_ids(
+            student.id,
+        )
+        excluded_ids = on_registration_ids | completed_ids
+
+        catalog_filters = [Course.is_deleted == False]  # noqa: E712
+        if student.department is not None:
+            catalog_filters.append(Course.department == student.department)
+        catalog_rows = list(
+            (
+                await self.db.execute(
+                    select(Course)
+                    .where(*catalog_filters)
+                    .order_by(Course.semester.asc(), Course.code.asc())
+                )
+            ).scalars().all()
+        )
+        catalog: list[dict] = [
+            {
+                "course_id": c.id,
+                "pending_add": c.id in pending_add_course_ids,
+                "course": c,
+            }
+            for c in catalog_rows
+            if c.id not in excluded_ids
+        ]
 
         return {
             "registration_id": registration.id,
@@ -504,6 +548,7 @@ class RegistrationService:
             "registration_status": registration.status,
             "active_courses": active,
             "dropped_courses": dropped,
+            "catalog_courses": catalog,
         }
 
     async def _semester_for_term(
@@ -2338,8 +2383,26 @@ class AddDropService:
             },
         )
         await self.db.commit()
-        await self.db.refresh(batch)
-        return batch
+        return await self._reload_batch_for_response(batch.id)
+
+    async def _reload_batch_for_response(
+        self, batch_id: uuid.UUID,
+    ) -> AddDropBatch:
+        """
+        Re-fetch a batch with items + items.course eagerly loaded so
+        the FastAPI/Pydantic serializer never triggers an async lazy
+        load on a session that may have just committed. Items
+        created in-memory via ``self.db.add(...)`` don't get
+        selectin populated by the implicit relationship loader —
+        explicit re-query is the safe path.
+        """
+        return (
+            await self.db.execute(
+                select(AddDropBatch)
+                .where(AddDropBatch.id == batch_id)
+                .options(*self._batch_eager_load_opts())
+            )
+        ).scalar_one()
 
     async def _overridden_prereq_course_ids(
         self, registration_id: uuid.UUID,
@@ -2465,8 +2528,7 @@ class AddDropService:
             metadata={"justification": justification.strip()},
         )
         await self.db.commit()
-        await self.db.refresh(batch)
-        return batch
+        return await self._reload_batch_for_response(batch.id)
 
     # ── Apply (shared by approve + override) ────────────────────
 
@@ -2513,8 +2575,7 @@ class AddDropService:
         )
         await self._notify_student_batch(registration, batch)
         await self.db.commit()
-        await self.db.refresh(batch)
-        return batch
+        return await self._reload_batch_for_response(batch.id)
 
     async def _apply_item(
         self, request: AddDropRequest, registration: Registration,
@@ -2592,13 +2653,29 @@ class AddDropService:
                 "add/drop batch."
             )
 
+    @staticmethod
+    def _batch_eager_load_opts() -> tuple:
+        """
+        Eager-load options every endpoint serializing an ``AddDropBatch``
+        needs so Pydantic's ``AddDropBatchResponse`` (which reads
+        ``items[*].course_code`` / ``course_title`` / ``course_credit_hours``)
+        doesn't trigger an async lazy-load on the un-loaded ``course``
+        relationship (MissingGreenlet).
+        """
+        return (
+            selectinload(AddDropBatch.items)
+            .selectinload(AddDropRequest.course),
+        )
+
     async def _get_batch_or_404(self, batch_id: uuid.UUID) -> AddDropBatch:
         batch = (
             await self.db.execute(
-                select(AddDropBatch).where(
+                select(AddDropBatch)
+                .where(
                     AddDropBatch.id == batch_id,
                     AddDropBatch.is_deleted == False,  # noqa: E712
                 )
+                .options(*self._batch_eager_load_opts())
             )
         ).scalar_one_or_none()
         if batch is None:
@@ -2658,10 +2735,12 @@ class AddDropService:
     ) -> Optional[AddDropBatch]:
         return (
             await self.db.execute(
-                select(AddDropBatch).where(
+                select(AddDropBatch)
+                .where(
                     AddDropBatch.id == batch_id,
                     AddDropBatch.is_deleted == False,  # noqa: E712
                 )
+                .options(*self._batch_eager_load_opts())
             )
         ).scalar_one_or_none()
 
@@ -2671,10 +2750,13 @@ class AddDropService:
         return list(
             (
                 await self.db.execute(
-                    select(AddDropBatch).where(
+                    select(AddDropBatch)
+                    .where(
                         AddDropBatch.student_id == student_id,
                         AddDropBatch.is_deleted == False,  # noqa: E712
-                    ).order_by(AddDropBatch.created_at.desc())
+                    )
+                    .order_by(AddDropBatch.created_at.desc())
+                    .options(*self._batch_eager_load_opts())
                 )
             ).scalars().all()
         )
@@ -2698,10 +2780,13 @@ class AddDropService:
         return list(
             (
                 await self.db.execute(
-                    select(AddDropBatch).where(
+                    select(AddDropBatch)
+                    .where(
                         AddDropBatch.status.in_(target),
                         AddDropBatch.is_deleted == False,  # noqa: E712
-                    ).order_by(AddDropBatch.created_at.asc())
+                    )
+                    .order_by(AddDropBatch.created_at.asc())
+                    .options(*self._batch_eager_load_opts())
                 )
             ).scalars().all()
         )

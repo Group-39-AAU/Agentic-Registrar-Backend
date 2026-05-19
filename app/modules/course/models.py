@@ -23,7 +23,7 @@ Tables 55–84 (detailed design).
 
 import uuid
 from datetime import date, datetime, time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import (
     JSON, Boolean, CheckConstraint, Date, DateTime, Enum, Float, ForeignKey,
@@ -39,6 +39,9 @@ from app.shared.enums import (
     RegistrationStatus, RiskStatus, ScheduleConflictStatus,
     ScheduleConflictType, SponsorshipType,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — import only for typing
+    from app.modules.auth.models import User
 
 
 # ── Academic Calendar ────────────────────────────────────────────
@@ -776,6 +779,19 @@ class AddDropRequest(SoftDeleteBase):
     registration: Mapped["Registration"] = relationship(lazy="selectin")
     course: Mapped["Course"] = relationship(lazy="selectin")
 
+    # ── Display helpers (Pydantic reads these via from_attributes) ──
+    @property
+    def course_code(self) -> Optional[str]:
+        return self.course.code if self.course is not None else None
+
+    @property
+    def course_title(self) -> Optional[str]:
+        return self.course.title if self.course is not None else None
+
+    @property
+    def course_credit_hours(self) -> Optional[int]:
+        return self.course.credit_hours if self.course is not None else None
+
 
 class AddDropBatch(SoftDeleteBase):
     """
@@ -844,6 +860,34 @@ class AddDropBatch(SoftDeleteBase):
     )
     registration: Mapped["Registration"] = relationship(lazy="selectin")
     student: Mapped["Student"] = relationship(lazy="selectin")
+    officer: Mapped[Optional["User"]] = relationship(
+        "User", foreign_keys=[officer_id], lazy="selectin",
+    )
+
+    # ── Display helpers (Pydantic reads these via from_attributes) ──
+    @property
+    def student_name(self) -> Optional[str]:
+        return self.student.full_name if self.student is not None else None
+
+    @property
+    def student_number(self) -> Optional[str]:
+        """AAU-formatted student id (e.g. ``UGR/1234/15``)."""
+        return self.student.student_id if self.student is not None else None
+
+    @property
+    def term_name(self) -> Optional[str]:
+        if self.registration is None or self.registration.term is None:
+            return None
+        return self.registration.term.term_name
+
+    @property
+    def officer_name(self) -> Optional[str]:
+        if self.officer is None:
+            return None
+        first = (self.officer.first_name or "").strip()
+        last = (self.officer.last_name or "").strip()
+        full = f"{first} {last}".strip()
+        return full or self.officer.email
 
 
 # ── Track A — Advisory ───────────────────────────────────────────

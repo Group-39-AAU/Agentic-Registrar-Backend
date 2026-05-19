@@ -942,9 +942,11 @@ async def list_my_add_drop_batches(
     response_model=AddDropPickerResponse,
     summary="Add/drop picker snapshot for the calling student",
     response_description=(
-        "Current open-term registration id + droppable + re-addable "
-        "course lists. Active items with an in-flight DROP request "
-        "are tagged pending_drop=true."
+        "Current open-term registration id + three lists: droppable "
+        "(active_courses), re-addable (dropped_courses), and "
+        "first-time-addable catalog courses for the student's "
+        "department (catalog_courses). Items with an in-flight DROP "
+        "or ADD request are tagged pending_drop / pending_add."
     ),
 )
 async def get_my_add_drop_picker(
@@ -975,13 +977,27 @@ async def get_my_add_drop_picker(
       should render those as "awaiting approval" rather than offering
       another DROP button to avoid duplicate submissions.
     - `dropped_courses[]` — registration links where
-      `is_dropped=true`. **Candidates for re-ADD.**
+      `is_dropped=true`. **Candidates for re-ADD.** Each item also
+      carries `pending_add: bool` — `true` when an ADD request for
+      the same course exists on a non-terminal batch
+      (`PENDING_AGENT` / `AGENT_APPROVED` / `AGENT_DENIED`). The UI
+      should render those as "awaiting approval" rather than offering
+      another ADD button to avoid duplicate submissions.
+    - `catalog_courses[]` — department-matching `Course` rows the
+      student has **not** registered for (in any state) and has not
+      previously completed with a passing grade. **Candidates for a
+      first-time ADD**, covering past / current / future curriculum
+      semesters. Each item is a `CatalogAddableRead` (`course_id`,
+      `pending_add`, `course`) — no registration-link id because no
+      `registration_courses` row exists yet. `pending_add` mirrors
+      the in-flight semantics above.
 
-    Each item in both lists is a `RegistrationCourseRead`:
-    `id` (the `registration_courses.id`), `course_id`, `section_id`
-    (nullable until allocation), `is_dropped`, `pending_drop`,
-    and `course` — the nested `CourseResponse`
-    (`code`, `title`, `credit_hours`, `semester`, `department`).
+    `active_courses` and `dropped_courses` items are
+    `RegistrationCourseRead`: `id` (the `registration_courses.id`),
+    `course_id`, `section_id` (nullable until allocation),
+    `is_dropped`, `pending_drop`, `pending_add`, and `course` — the
+    nested `CourseResponse` (`code`, `title`, `credit_hours`,
+    `semester`, `department`).
 
     **Submitting an ADD or DROP:** pass `registration_id` and a list
     of `{course_id, action}` items to
