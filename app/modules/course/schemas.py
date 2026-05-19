@@ -174,8 +174,9 @@ class RegistrationCourseRead(BaseModel):
 
     ``pending_drop`` is set by the add/drop picker when this course
     is on a DROP request that hasn't yet reached a terminal state
-    (APPLIED / REJECTED / CANCELLED). Defaults to ``False`` for
-    consumers that don't populate it.
+    (APPLIED / REJECTED / CANCELLED). ``pending_add`` is the
+    symmetric flag for re-ADD requests on a previously-dropped row.
+    Both default to ``False`` for consumers that don't populate them.
     """
     model_config = ConfigDict(from_attributes=True)
 
@@ -184,6 +185,7 @@ class RegistrationCourseRead(BaseModel):
     section_id: Optional[uuid.UUID] = None
     is_dropped: bool
     pending_drop: bool = False
+    pending_add: bool = False
     course: Optional[CourseResponse] = None
 
 
@@ -232,18 +234,37 @@ class RegistrationResponse(BaseModel):
         return sum(1 for c in self.courses if not c.is_dropped)
 
 
+class CatalogAddableRead(BaseModel):
+    """
+    A catalog course the student can ADD to their current registration
+    even though no ``RegistrationCourse`` row exists yet. Same shape
+    as ``RegistrationCourseRead`` minus the registration-link id, so
+    the picker UI can render both lists with the same row component.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    course_id: uuid.UUID
+    pending_add: bool = False
+    course: CourseResponse
+
+
 class AddDropPickerResponse(BaseModel):
     """
     Snapshot for the add/drop picker UI. Resolves the calling
     student's registration for the currently-open AcademicTerm and
-    splits its course links into two action buckets:
+    splits the addable / droppable choices into three buckets:
 
-      * ``active_courses``  — ``is_dropped=false`` rows. Candidates
-        for DROP. Items where ``pending_drop=true`` already have a
-        DROP request in flight (batch not yet APPLIED / REJECTED /
+      * ``active_courses``   — ``is_dropped=false`` registration rows.
+        Candidates for DROP. ``pending_drop=true`` means a DROP request
+        is already in flight (batch not yet APPLIED / REJECTED /
         CANCELLED) — the UI should mark those distinctly.
-      * ``dropped_courses`` — ``is_dropped=true`` rows on the same
+      * ``dropped_courses``  — ``is_dropped=true`` rows on the same
         registration. Candidates for re-ADD.
+      * ``catalog_courses``  — department-matching catalog courses
+        the student has neither registered for (in any state) nor
+        already completed with a passing grade. Candidates for a
+        first-time ADD. ``pending_add=true`` mirrors the in-flight
+        semantics for ADD requests on these never-registered courses.
 
     404 when no term is open OR no registration exists for the open
     term.
@@ -256,6 +277,7 @@ class AddDropPickerResponse(BaseModel):
     registration_status: RegistrationStatus
     active_courses: list[RegistrationCourseRead] = Field(default_factory=list)
     dropped_courses: list[RegistrationCourseRead] = Field(default_factory=list)
+    catalog_courses: list[CatalogAddableRead] = Field(default_factory=list)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -479,6 +501,12 @@ class AddDropRequestResponse(BaseModel):
     reason: Optional[str] = None
     override_by_id: Optional[uuid.UUID] = None
     override_justification: Optional[str] = None
+    # Display-only enrichments populated from the eagerly-loaded
+    # ``course`` relationship so officer UIs don't have to fan out to
+    # the catalog endpoint for each row.
+    course_code: Optional[str] = None
+    course_title: Optional[str] = None
+    course_credit_hours: Optional[int] = None
 
 
 class AddDropBatchResponse(BaseModel):
@@ -494,6 +522,13 @@ class AddDropBatchResponse(BaseModel):
     officer_decision_at: Optional[datetime] = None
     officer_justification: Optional[str] = None
     items: list[AddDropRequestResponse] = Field(default_factory=list)
+    # Display-only enrichments populated from the eagerly-loaded
+    # ``student`` + ``registration.term`` relationships so officer
+    # queues can render names instead of UUIDs.
+    student_name: Optional[str] = None
+    student_number: Optional[str] = None
+    term_name: Optional[str] = None
+    officer_name: Optional[str] = None
 
 
 class OfficerJustificationRequest(BaseModel):

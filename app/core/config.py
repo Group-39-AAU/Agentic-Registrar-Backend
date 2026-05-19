@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     # ── Authentication ───────────────────────────────────
     SECRET_KEY: str = "change-me-to-a-random-secret-key"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 1 day
     ALGORITHM: str = "HS256"
 
     # ── AI / Gemini (advisory narrative LLM) ─────────────
