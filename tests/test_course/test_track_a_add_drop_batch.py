@@ -14,7 +14,7 @@ two-step service workflow:
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 
 import pytest
 import pytest_asyncio
@@ -28,7 +28,8 @@ from app.modules.course.exceptions import (
 )
 from app.modules.course.grade_points import points_for
 from app.modules.course.models import (
-    Course, CoursePrerequisite, Grade, Registration, RegistrationCourse,
+    ClassScheduleSlot, Course, CoursePrerequisite, Grade, Registration,
+    RegistrationCourse, Section,
 )
 from app.modules.course.service import AddDropService
 from app.modules.course.services import PayMock
@@ -595,3 +596,154 @@ async def test_submit_batch_rejects_duplicate_course(
             student_user_id=cs_student.user_id,
             deadline=date(2099, 1, 1),
         )
+
+
+# ── Offered-in-term gate (ADD must have a section running it) ───
+
+
+async def _make_section_with_slot(session, *, term_id, course, code="A"):
+    """Helper: a section in ``term_id`` that actually teaches ``course``."""
+    section = Section(
+        term_id=term_id,
+        department=course.department,
+        semester=course.semester,
+        section_code=code,
+        capacity=30,
+        enrolled_count=0,
+    )
+    session.add(section)
+    await session.flush()
+    session.add(ClassScheduleSlot(
+        section_id=section.id,
+        course_id=course.id,
+        day_of_week="MON",
+        start_time=time(9, 30), end_time=time(10, 30),
+        room="R1",
+    ))
+    await session.flush()
+    return section
+
+
+async def test_add_blocked_when_course_not_offered_this_term(
+    async_session, cs_student, cs_registration, cs_catalog, paid_pay,
+):
+    """
+    ADD a curriculum-valid, right-parity, prereq-met course that NO
+    section teaches this term → AGENT_DENIED with an 'not offered'
+    reason. (CS202 is even-parity like the sem-2 student, prereq-free,
+    but no section runs it.)
+    """
+    agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
+    svc = AddDropService(async_session, adjustment_agent=agent)
+    batch = await svc.submit_batch(
+        registration_id=cs_registration.id,
+        items=[(cs_catalog["CS202"].id, AddDropAction.ADD)],
+        student_user_id=cs_student.user_id,
+        deadline=date(2099, 1, 1),
+    )
+    # CS202 is already on the cs_registration fixture, so this also
+    # trips "already on registration" — assert the offered reason
+    # is present regardless.
+    assert batch.status == AddDropBatchStatus.AGENT_DENIED
+    reasons = " ".join(
+        r for item in batch.agent_reasons for r in item.get("reasons", [])
+    )
+    assert "not offered by any section this term" in reasons
+
+
+async def test_add_allowed_when_a_section_offers_the_course(
+    async_session, cs_student, cs_registration, cs_catalog, seeded_term,
+    paid_pay,
+):
+    """
+    ADD a course that IS taught by a section this term → the offered
+    check passes. Use a fresh even-parity CS course (CS204) the
+    student isn't already registered for, with a section running it.
+    """
+    cs204 = Course(
+        code="CS204", title="CS 204", credit_hours=3, semester=2,
+        department="Computer Science",
+    )
+    async_session.add(cs204)
+    await async_session.flush()
+    await _make_section_with_slot(
+        async_session, term_id=seeded_term.id, course=cs204,
+    )
+    # Pad the registration so adding CS204 keeps the load inside the
+    # [12, 22] ECTS window — this test isolates the offered gate, not
+    # the credit floor. Baseline CS201+CS202 = 6; +12 pad = 18; +CS204
+    # (3) = 21 ≤ 22.
+    pad = Course(
+        code="CSPAD2", title="Pad", credit_hours=12, semester=2,
+        department="Computer Science",
+    )
+    async_session.add(pad)
+    await async_session.flush()
+    async_session.add(RegistrationCourse(
+        registration_id=cs_registration.id,
+        course_id=pad.id,
+        is_dropped=False,
+    ))
+    await async_session.flush()
+
+    agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
+    svc = AddDropService(async_session, adjustment_agent=agent)
+    batch = await svc.submit_batch(
+        registration_id=cs_registration.id,
+        items=[(cs204.id, AddDropAction.ADD)],
+        student_user_id=cs_student.user_id,
+        deadline=date(2099, 1, 1),
+    )
+    assert batch.status == AddDropBatchStatus.AGENT_APPROVED
+    # No "not offered" reason anywhere.
+    reasons = " ".join(
+        r for item in batch.agent_reasons for r in item.get("reasons", [])
+    )
+    assert "not offered" not in reasons
+
+
+async def test_offered_check_only_applies_to_add_not_drop(
+    async_session, cs_student, cs_registration, cs_catalog, seeded_term,
+    paid_pay,
+):
+    """
+    A DROP must not require the course to be offered this term — you
+    can always drop a course you're registered for. cs_registration
+    has CS201 + CS202 (6 ECTS) with no sections; dropping one should
+    still pass the offered gate (it doesn't apply to DROP). It WILL
+    trip the 12-ECTS floor, but never the offered reason.
+    """
+    agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
+    svc = AddDropService(async_session, adjustment_agent=agent)
+    batch = await svc.submit_batch(
+        registration_id=cs_registration.id,
+        items=[(cs_catalog["CS201"].id, AddDropAction.DROP)],
+        student_user_id=cs_student.user_id,
+        deadline=date(2099, 1, 1),
+    )
+    reasons = " ".join(
+        r for item in batch.agent_reasons for r in item.get("reasons", [])
+    )
+    assert "not offered" not in reasons
+
+
+async def test_agent_verify_offered_in_term_direct(
+    async_session, cs_student, seeded_term, cs_catalog, paid_pay,
+):
+    """Unit-level: the check passes only when a section runs the course."""
+    agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
+
+    # No section yet → fails.
+    miss = await agent.verify_offered_in_term(
+        async_session, seeded_term.id, cs_catalog["CS101"],
+    )
+    assert miss.passed is False
+
+    # Add a section running CS101 → passes.
+    await _make_section_with_slot(
+        async_session, term_id=seeded_term.id, course=cs_catalog["CS101"],
+    )
+    hit = await agent.verify_offered_in_term(
+        async_session, seeded_term.id, cs_catalog["CS101"],
+    )
+    assert hit.passed is True

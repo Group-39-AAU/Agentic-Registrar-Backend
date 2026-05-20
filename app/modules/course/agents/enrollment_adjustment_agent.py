@@ -42,7 +42,7 @@ from app.modules.course.agents.curriculum_compliance_agent import (
     ComplianceCheckResult, CurriculumComplianceAgent, MAX_CREDIT_LOAD_ECTS,
 )
 from app.modules.course.models import (
-    AddDropRequest, Course, Registration, Section, Student,
+    AddDropRequest, ClassScheduleSlot, Course, Registration, Section, Student,
 )
 from app.modules.course.services import PayMock, pay_mock
 from app.shared.enums import AddDropAction
@@ -443,6 +443,53 @@ class EnrollmentAdjustmentAgent(CourseBaseAgent):
             overridden_course_ids=overridden_course_ids or set(),
         )
 
+    async def verify_offered_in_term(
+        self,
+        session: AsyncSession,
+        term_id: uuid.UUID,
+        course: Course,
+    ) -> ComplianceCheckResult:
+        """
+        PASS when at least one Section in ``term_id`` actually teaches
+        ``course`` — i.e. there is a ClassScheduleSlot for the course
+        in a section belonging to this term.
+
+        Without this gate a student could ADD a course that passes
+        curriculum + parity + prereq checks yet is not run by any
+        section this term: the course would land permanently in
+        ``pending_additions`` with zero pickable options. Blocking it
+        up front keeps the add/drop verdict honest — you can only add
+        what you can actually be scheduled into.
+        """
+        offering_section_id = (
+            await session.execute(
+                select(ClassScheduleSlot.section_id).join(
+                    Section, Section.id == ClassScheduleSlot.section_id,
+                ).where(
+                    Section.term_id == term_id,
+                    Section.is_deleted == False,  # noqa: E712
+                    ClassScheduleSlot.course_id == course.id,
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if offering_section_id is None:
+            return ComplianceCheckResult(
+                passed=False,
+                reasons=[
+                    f"{course.code} is not offered by any section this "
+                    "term — there is no scheduled section to place you "
+                    "in. It cannot be added until a section runs it."
+                ],
+                details={"course_code": course.code, "term_id": str(term_id)},
+            )
+        return ComplianceCheckResult(
+            passed=True,
+            details={
+                "course_code": course.code,
+                "offering_section_id": str(offering_section_id),
+            },
+        )
+
     # ── process_batch (all-or-nothing) ───────────────────────────
 
     async def process_batch(
@@ -520,6 +567,12 @@ class EnrollmentAdjustmentAgent(CourseBaseAgent):
                         f"{course.code} is already on the registration; "
                         "nothing to add."
                     )
+                offered = await self.verify_offered_in_term(
+                    session, registration.term_id, course,
+                )
+                if not offered.passed:
+                    reasons.extend(offered.reasons)
+                    details.update(offered.details)
                 prereq = await self.verify_prerequisites(
                     session=session,
                     student_id=student.id,
