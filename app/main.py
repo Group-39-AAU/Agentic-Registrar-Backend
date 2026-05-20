@@ -50,6 +50,10 @@ from app.modules.undergraduate.enrollment.router import router as enrollment_rou
 from app.modules.course.router import router as course_router
 from app.modules.course.grading.router import router as grading_router
 from app.modules.course.standing.router import router as standing_router
+from app.modules.course.records.router import router as records_router
+from app.modules.course.exception_queue.router import (
+    router as exception_queue_router,
+)
 
 
 def create_app() -> FastAPI:
@@ -84,6 +88,8 @@ def create_app() -> FastAPI:
     app.include_router(course_router, prefix=settings.API_V1_PREFIX)
     app.include_router(grading_router, prefix=settings.API_V1_PREFIX)
     app.include_router(standing_router, prefix=settings.API_V1_PREFIX)
+    app.include_router(records_router, prefix=settings.API_V1_PREFIX)
+    app.include_router(exception_queue_router, prefix=settings.API_V1_PREFIX)
 
     # ── Event Subscriptions ──
     from app.shared.events import subscribe
