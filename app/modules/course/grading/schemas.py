@@ -333,6 +333,17 @@ class InstructorJustificationRequest(BaseModel):
 # ══════════════════════════════════════════════════════════════
 
 
+class QueueDepartmentOption(BaseModel):
+    """
+    One option for the DH queue's department-filter dropdown. Only
+    departments with at least one batch awaiting a decision appear,
+    so the dropdown can never select a value that yields an empty
+    queue. ``pending_count`` lets the UI show "Computer Science (3)".
+    """
+    department: str
+    pending_count: int
+
+
 class DepartmentHeadQueueEntry(BaseModel):
     """
     Compact summary for the DH review queue. One entry per

@@ -40,7 +40,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.auth.models import User
@@ -61,7 +61,7 @@ from app.modules.course.grading.schemas import (
     AgentRerunResponse, DepartmentHeadDecisionResponse,
     DepartmentHeadQueueEntry, GradeAgentReviewResponse,
     GradeAuthorisationDecisionResponse, GradeBatchReviewPacketResponse,
-    SubmittedGradeRow,
+    QueueDepartmentOption, SubmittedGradeRow,
 )
 from app.modules.course.models import (
     AcademicTerm, Course, CourseManagementOfficer, Grade, Instructor,
@@ -137,6 +137,51 @@ class DepartmentHeadGradingService:
         if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
             raise DepartmentHeadRoleRequiredError()
         return user
+
+    # ── Queue filter options ────────────────────────────────────
+
+    async def list_queue_departments(
+        self,
+        *,
+        user_id: uuid.UUID,
+        term_id: Optional[uuid.UUID] = None,
+    ) -> list[QueueDepartmentOption]:
+        """
+        Distinct departments that currently have at least one batch
+        awaiting a DH decision (status SUBMITTED or FLAGGED), with a
+        pending count each. Backs the queue's department-filter
+        dropdown so the frontend never has to type a free-text
+        department string. Optionally scoped to a term so the
+        dropdown matches the term the DH is viewing.
+
+        Sorted alphabetically by department for a stable dropdown.
+        """
+        await self._resolve_dh_or_403(user_id)
+
+        stmt = (
+            select(
+                Section.department,
+                func.count(GradeBatch.id),
+            )
+            .join(Section, Section.id == GradeBatch.section_id)
+            .where(
+                GradeBatch.status.in_({
+                    GradeSubmissionStatus.SUBMITTED,
+                    GradeSubmissionStatus.FLAGGED,
+                }),
+                GradeBatch.is_deleted == False,  # noqa: E712
+            )
+            .group_by(Section.department)
+            .order_by(Section.department.asc())
+        )
+        if term_id is not None:
+            stmt = stmt.where(GradeBatch.term_id == term_id)
+
+        rows = (await self.db.execute(stmt)).all()
+        return [
+            QueueDepartmentOption(department=dept, pending_count=count)
+            for dept, count in rows
+        ]
 
     # ── Queue ───────────────────────────────────────────────────
 
