@@ -48,8 +48,8 @@ from app.modules.course.grading.schemas import (
     DepartmentHeadQueueEntry, GradeAgentReviewResponse,
     GradeBatchResponse, GradeBatchReviewPacketResponse,
     GradeBatchSubmitResponse, InstructorJustificationRequest,
-    InstructorSectionAssignmentResponse, SectionCourseRosterResponse,
-    TranscriptResponse, TranscriptTermEntry,
+    InstructorSectionAssignmentResponse, QueueDepartmentOption,
+    SectionCourseRosterResponse, TranscriptResponse, TranscriptTermEntry,
 )
 from app.modules.course.grading.service import InstructorGradingService
 from app.modules.course.grading.transcript_service import (
@@ -528,6 +528,36 @@ async def list_agent_reviews(
 # check lives in the service layer (mirroring how Track A gates
 # DH-only endpoints) so the rule travels with the code that
 # enforces it.
+
+
+@router.get(
+    "/officer/queue/departments",
+    response_model=list[QueueDepartmentOption],
+    summary="Departments with pending batches — populates the queue filter dropdown",
+)
+async def list_queue_departments(
+    term_id: Optional[uuid.UUID] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the distinct departments that currently have at least
+    one batch awaiting a DH decision, each with a pending count.
+    The frontend uses this to build the queue's department-filter
+    dropdown so a DH never types a free-text department string
+    (no typos, no silent empty results). Optionally scoped to a
+    term to match the term the DH is viewing.
+
+    403 if the caller is not a department head (or admin).
+    """
+    svc = DepartmentHeadGradingService(db)
+    try:
+        return await svc.list_queue_departments(
+            user_id=current_user.id, term_id=term_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
 
 
 @router.get(

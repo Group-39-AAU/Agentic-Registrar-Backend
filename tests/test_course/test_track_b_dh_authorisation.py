@@ -291,6 +291,59 @@ async def test_queue_lists_submitted_and_flagged(
     assert entry.instructor_name == "Lemma Bekele"
 
 
+async def test_queue_departments_lists_only_pending(
+    async_session, dh_scenario,
+):
+    """The dropdown source returns departments with pending batches + counts."""
+    w = dh_scenario
+    svc = InstructorGradingService(async_session, grading_agent=_approve_agent())
+    _bd, batch = await _build_full_batch(
+        svc, w, score_grid=[(10, 50, 100), (9, 45, 90), (8, 40, 80)],
+    )
+    await svc.submit_batch(user_id=w["instr_user"].id, batch_id=batch.id)
+
+    dh = DepartmentHeadGradingService(async_session)
+    options = await dh.list_queue_departments(user_id=w["dh_user"].id)
+    assert len(options) == 1
+    assert options[0].department == "Computer Science"
+    assert options[0].pending_count == 1
+
+
+async def test_queue_departments_empty_when_nothing_pending(
+    async_session, dh_scenario,
+):
+    """No SUBMITTED/FLAGGED batches → empty dropdown."""
+    w = dh_scenario
+    dh = DepartmentHeadGradingService(async_session)
+    options = await dh.list_queue_departments(user_id=w["dh_user"].id)
+    assert options == []
+
+
+async def test_queue_departments_excludes_terminal_batches(
+    async_session, dh_scenario,
+):
+    """Once authorised, the department drops out of the dropdown."""
+    w = dh_scenario
+    svc = InstructorGradingService(async_session, grading_agent=_approve_agent())
+    _bd, batch = await _build_full_batch(
+        svc, w, score_grid=[(10, 50, 100), (9, 45, 90), (8, 40, 80)],
+    )
+    await svc.submit_batch(user_id=w["instr_user"].id, batch_id=batch.id)
+    dh = DepartmentHeadGradingService(async_session)
+    await dh.authorise(user_id=w["dh_user"].id, batch_id=batch.id)
+    options = await dh.list_queue_departments(user_id=w["dh_user"].id)
+    assert options == []
+
+
+async def test_queue_departments_denied_for_non_dh(
+    async_session, dh_scenario,
+):
+    w = dh_scenario
+    dh = DepartmentHeadGradingService(async_session)
+    with pytest.raises(DepartmentHeadRoleRequiredError):
+        await dh.list_queue_departments(user_id=w["other_user"].id)
+
+
 async def test_queue_excludes_authorised_and_rejected(
     async_session, dh_scenario,
 ):
