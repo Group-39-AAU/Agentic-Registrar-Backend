@@ -199,3 +199,67 @@ When you are ready to simulate completing the UAT in our system, open this link 
         text_body=text_body,
     )
 
+
+def build_password_reset_email(
+    to_email: EmailStr,
+    first_name: str,
+    reset_url: str,
+    *,
+    valid_minutes: int = 30,
+) -> EmailMessage:
+    """
+    Sent when a user requests a password reset via POST /auth/forgot-password.
+    Contains a single magic link with a short-lived JWT — clicking it lands
+    the user on /reset-password where they pick a new password.
+    """
+    app_name = settings.APP_NAME
+
+    html_body = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background-color:#f4f6f8;font-family:Georgia,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f4f6f8;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(15,23,42,0.08);">
+        <tr><td style="background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);padding:28px 32px;text-align:center;">
+          <p style="margin:0;color:#cbd5e1;font-size:13px;letter-spacing:0.12em;text-transform:uppercase;">{app_name}</p>
+          <h1 style="margin:12px 0 0;color:#ffffff;font-size:22px;font-weight:600;">Reset your password</h1>
+        </td></tr>
+        <tr><td style="padding:28px 32px 8px;color:#1e293b;font-size:16px;line-height:1.6;">
+          <p style="margin:0 0 16px;">Hi {first_name},</p>
+          <p style="margin:0 0 16px;">We received a request to reset the password on your portal account. Click the button below to choose a new password.</p>
+          <p style="margin:0 0 16px;color:#475569;">This link is valid for <strong>{valid_minutes} minutes</strong>. If you didn't request a reset, you can ignore this message — your password will stay the same.</p>
+        </td></tr>
+        <tr><td style="padding:0 32px 32px;text-align:center;">
+          <a href="{reset_url}" style="display:inline-block;padding:14px 32px;background:#1d4ed8;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;border-radius:999px;">Set a new password</a>
+        </td></tr>
+        <tr><td style="padding:0 32px 24px;color:#64748b;font-size:12px;line-height:1.5;">
+          If the button doesn't work, paste this link into your browser:<br>
+          <span style="word-break:break-all;color:#1d4ed8;">{reset_url}</span>
+        </td></tr>
+        <tr><td style="padding:16px 32px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;line-height:1.5;text-align:center;">
+          For security, never share this link with anyone.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    text_body = (
+        f"Hi {first_name},\n\n"
+        "We received a request to reset the password on your portal account.\n"
+        f"Open the link below within {valid_minutes} minutes to choose a new password:\n\n"
+        f"{reset_url}\n\n"
+        "If you didn't request a reset, you can ignore this message.\n\n"
+        f"— {app_name}"
+    )
+
+    return EmailMessage(
+        to_email=to_email,
+        subject="Reset your password",
+        html_body=html_body,
+        text_body=text_body,
+    )
+
