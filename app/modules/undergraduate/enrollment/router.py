@@ -12,14 +12,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_email_service
 from app.database.session import get_db
 from app.modules.auth.models import User
+from app.modules.course.exceptions import (
+    EntityNotFoundError,
+    StudentAlreadyOnboardedError,
+    UnauthorizedActorError,
+)
+from app.modules.course.service import OnboardingService
 from app.modules.undergraduate.enrollment.models import Enrollment
 from app.modules.undergraduate.enrollment.schemas import (
     EnrollmentListResponse,
     EnrollmentResponse,
     EnrollmentRunResponse,
+    OnboardingOutcome,
 )
 from app.modules.programs.models import AcademicProgram
 from app.modules.undergraduate.ranking.models import RankingResult
@@ -29,6 +36,7 @@ from app.modules.undergraduate.models import (
 )
 from app.modules.undergraduate.service import ApplicationService
 from app.modules.undergraduate.schemas import ApplicationStatusUpdate
+from app.shared.email import EmailService
 from app.shared.enums import (
     ApplicationStatus,
     DecisionType,
@@ -47,6 +55,7 @@ async def run_enrollment(
     term_id: uuid.UUID = Query(..., description="Admission term ID to enroll"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
 ):
     """
     Trigger the Enrollment & Onboarding Agent.
@@ -154,9 +163,25 @@ async def run_enrollment(
     compiled_graph = build_enrollment_graph()
     final_state = compiled_graph.invoke(initial_state)
 
-    # ── 7. Persist enrollment records ──
+    # ── 7. Persist enrollment records + auto-onboard each student ──
+    #
+    # Each iteration runs the full per-student pipeline so a failure
+    # on one student doesn't poison the rest:
+    #   1. INSERT Enrollment
+    #   2. change_status → ENROLLED (commits the session)
+    #   3. OnboardingService: mint 4-digit PIN, set must_change_password,
+    #      create Student row, email credentials (best-effort SMTP)
+    #
+    # Re-running /enrollment/run is safe: step (2) is short-circuited
+    # by the existing-enrollment filter above, and step (3) raises
+    # StudentAlreadyOnboardedError which we treat as "skip, already done".
+    import logging
+    log = logging.getLogger("enrollment.router")
+
     svc = ApplicationService(db)
-    enrollment_responses = []
+    onboarding_svc = OnboardingService(db, email_service=email_service)
+    onboarding_outcomes: list[OnboardingOutcome] = []
+    onboarded_count = 0
 
     for s in final_state["students"]:
         enrollment = Enrollment(
@@ -170,9 +195,9 @@ async def run_enrollment(
         )
         db.add(enrollment)
 
-        # Transition to ENROLLED. Cohort section assignment now lives
-        # entirely in course-management (see AcademicSchedulingAgent),
-        # so the trigger reason no longer carries a section letter.
+        # Transition to ENROLLED. change_status commits, so the
+        # Enrollment row is durable and addressable by id before
+        # onboarding tries to load it back.
         try:
             await svc.change_status(
                 s.application_id,
@@ -187,10 +212,57 @@ async def run_enrollment(
                 actor_role=UserRole.AGENT,
             )
         except Exception as e:
-            import logging
-            logging.getLogger("enrollment.router").warning(
+            log.warning(
                 "Failed to transition app %s: %s", s.application_id, e
             )
+            onboarding_outcomes.append(OnboardingOutcome(
+                application_id=s.application_id,
+                university_id=s.university_id,
+                onboarded=False,
+                detail=f"Status transition failed: {e}",
+            ))
+            continue
+
+        try:
+            await onboarding_svc.onboard_student_from_enrollment(
+                enrollment_id=enrollment.id,
+                officer_role=current_user.role,
+                officer_id=current_user.id,
+            )
+            onboarded_count += 1
+            onboarding_outcomes.append(OnboardingOutcome(
+                application_id=s.application_id,
+                university_id=s.university_id,
+                onboarded=True,
+                detail="Portal credentials issued and emailed.",
+            ))
+        except StudentAlreadyOnboardedError as exc:
+            onboarding_outcomes.append(OnboardingOutcome(
+                application_id=s.application_id,
+                university_id=s.university_id,
+                onboarded=False,
+                detail=f"Already onboarded as {exc.student_id}.",
+            ))
+        except (UnauthorizedActorError, EntityNotFoundError) as exc:
+            log.warning(
+                "Onboarding failed for %s: %s", s.application_id, exc
+            )
+            onboarding_outcomes.append(OnboardingOutcome(
+                application_id=s.application_id,
+                university_id=s.university_id,
+                onboarded=False,
+                detail=str(exc),
+            ))
+        except Exception as exc:
+            log.exception(
+                "Onboarding failed for %s", s.application_id
+            )
+            onboarding_outcomes.append(OnboardingOutcome(
+                application_id=s.application_id,
+                university_id=s.university_id,
+                onboarded=False,
+                detail=f"Unexpected error: {exc}",
+            ))
 
     await db.commit()
 
@@ -205,8 +277,14 @@ async def run_enrollment(
     return EnrollmentRunResponse(
         enrolled_count=len(final_state["students"]),
         skipped_count=skipped,
-        message=f"Enrolled {len(final_state['students'])} students. {skipped} skipped (already enrolled).",
+        onboarded_count=onboarded_count,
+        message=(
+            f"Enrolled {len(final_state['students'])} students "
+            f"({onboarded_count} onboarded with portal credentials). "
+            f"{skipped} skipped (already enrolled)."
+        ),
         enrollments=[EnrollmentResponse.model_validate(e) for e in fresh_enrollments],
+        onboarding_outcomes=onboarding_outcomes,
     )
 
 
