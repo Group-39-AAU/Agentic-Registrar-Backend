@@ -50,6 +50,24 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=8, max_length=128)
 
 
+class ForgotPasswordRequest(BaseModel):
+    """
+    Request: ask for a password-reset email. The endpoint always
+    responds 204 — we never reveal whether the email exists in the
+    database, so an attacker can't enumerate accounts.
+    """
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    """
+    Request: complete a password reset using the short-lived token
+    that was emailed to the user.
+    """
+    token: str = Field(..., min_length=10, max_length=4096)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 class UserResponse(BaseModel):
     """Response: public user profile."""
     model_config = ConfigDict(from_attributes=True)

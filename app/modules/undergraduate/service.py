@@ -294,8 +294,14 @@ class ApplicationService:
         application_id: uuid.UUID,
         data: CorrectionUpdateRequest,
         actor_id: uuid.UUID,
+        email_service: Optional[EmailService] = None,
     ) -> UndergraduateApplication:
-        """Allow applicant to update correction fields while in CHANGES_REQUESTED."""
+        """
+        Apply applicant's corrections while in CHANGES_REQUESTED, then
+        re-run credential verification. The agent transitions the
+        application to UAT_PENDING (PASS) or FLAGGED_FOR_REVIEW (FAIL)
+        so the journey doesn't dead-end on CHANGES_REQUESTED.
+        """
         application = await self._app_repo.get_by_id(application_id)
         if application is None:
             raise EntityNotFoundError("UndergraduateApplication", str(application_id))
@@ -334,6 +340,21 @@ class ApplicationService:
         application.remarks = (
             f"Student submitted corrections for fields: {', '.join(updated_fields)}"
         )
+
+        # Move out of CHANGES_REQUESTED so the credential agent can act,
+        # then re-run it. The agent itself does the PASS → AI_PRE_SCREENING
+        # → UAT_PENDING (creates UAT row + email) or FAIL → FLAGGED_FOR_REVIEW
+        # transition, so the applicant never gets stuck on this status again.
+        await self._transition_status(
+            application=application,
+            new_status=ApplicationStatus.UNDER_VERIFICATION,
+            actor_id=actor_id,
+            actor_role=UserRole.STUDENT,
+            trigger_reason=f"Applicant resubmitted corrections: {', '.join(updated_fields)}",
+        )
+        await self._db.flush()
+
+        await self._run_credential_verification_agent(application, email_service)
 
         await self._db.commit()
         await self._db.refresh(application)
@@ -558,13 +579,31 @@ class ApplicationService:
         if application is None:
             raise EntityNotFoundError("UndergraduateApplication", str(application_id))
 
-        eval_result = await self._db.execute(
+        # An application accumulates multiple AIEvaluation rows over its
+        # lifetime (intake validation → RECOMMEND_ADMIT, credential check
+        # → FLAG_FOR_REVIEW, etc.). Picking the most-recent row blindly
+        # can return an unrelated RECOMMEND_ADMIT verdict that came after
+        # the credential flag, hiding the actual reason. Prefer the most
+        # recent FLAG_FOR_REVIEW evaluation; fall back to the latest only
+        # when no flag verdict exists (legacy / odd-state data).
+        flag_result = await self._db.execute(
             select(AIEvaluation)
-            .where(AIEvaluation.application_id == application_id)
+            .where(
+                AIEvaluation.application_id == application_id,
+                AIEvaluation.recommended_decision == DecisionType.FLAG_FOR_REVIEW,
+            )
             .order_by(AIEvaluation.created_at.desc())
             .limit(1)
         )
-        latest_eval = eval_result.scalar_one_or_none()
+        latest_eval = flag_result.scalar_one_or_none()
+        if latest_eval is None:
+            fallback = await self._db.execute(
+                select(AIEvaluation)
+                .where(AIEvaluation.application_id == application_id)
+                .order_by(AIEvaluation.created_at.desc())
+                .limit(1)
+            )
+            latest_eval = fallback.scalar_one_or_none()
 
         traces: list[dict[str, str]] = []
         if latest_eval is not None:

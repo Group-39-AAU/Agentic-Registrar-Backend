@@ -232,6 +232,7 @@ async def submit_corrections(
     data: CorrectionUpdateRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
 ):
     """Student submits admission-number/name corrections in CHANGES_REQUESTED."""
     svc = ApplicationService(db)
@@ -240,6 +241,7 @@ async def submit_corrections(
             application_id=application_id,
             data=data,
             actor_id=current_user.id,
+            email_service=email_service,
         )
     except (
         EntityNotFoundError,

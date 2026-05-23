@@ -361,7 +361,6 @@ async def list_enrollments(
                 "university_id": item.university_id,
                 "program_id": item.program_id,
                 "department": item.department,
-                "section": item.section,
                 "enrollment_term": item.enrollment_term,
                 "created_at": item.created_at,
             }
