@@ -1,39 +1,43 @@
 """
-Ranking Test Seed Script — Standalone, Reproducible.
+Undergraduate Admission Seed Script — merged baseline + ranking test data.
 
-Creates diverse test data for end-to-end ranking agent verification.
-This script is idempotent: it checks for a sentinel email before seeding.
+Combines the former scripts/seed.py (programs, MoE samples, stream quotas,
+admission term, officer account) and scripts/seed_ranking_test.py (200 diverse
+test applicants at UAT_COMPLETED) into a single entry point. The two phases
+run sequentially and produce the same DB state and console output as running
+the two original scripts back-to-back.
 
-Run:
+Usage:
     cd /path/to/project
     source venv/bin/activate
-    python scripts/seed_ranking_test.py
+    python scripts/seed_undergraduate_admission.py
 
-Creates:
-    - 200 test students (users)
-    - 200 MoE student records with varied scores
-    - 200 undergraduate applications at UAT_COMPLETED status
-    - 200 completed UAT records with varied scores
-    - Status history entries for each application
+Seeds:
+    Phase 1 — Baseline
+        1. Academic Programs (15 programs — 9 Natural, 6 Social)
+        2. MoE Student Records (sample Grade 12 results for testing)
+        3. Stream Quotas (Natural: 2500, Social: 2500)
+        4. Undergraduate Admission Term (2026/27, open)
+        5. Default registrar officer account
 
-Mix:
-    - 20 hand-crafted students (12 self-sponsored, 8 government) — first
-      block, kept stable so existing test expectations still hold.
-    - 180 procedurally generated students with reproducible randomness
-      (random.Random(20260524)). Score bands (high/mid/low) and stream /
-      sponsorship splits are weighted so cutoffs and capacity limits
-      actually get exercised across multiple programs and streams.
+    Phase 2 — Ranking Test Data
+        - 200 test students (users), MoE records, applications at
+          UAT_COMPLETED, UAT records, status history entries.
+        - 20 hand-crafted students + 180 procedurally generated with
+          reproducible randomness (random.Random(20260524)).
 """
 
 import asyncio
-import uuid
 import random
+import uuid
+from datetime import date
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
+from app.core.security import hash_password
 from app.modules.auth.models import User
 from app.modules.moe.models import MoeStudentRecord
 from app.modules.programs.models import AcademicProgram
@@ -43,6 +47,7 @@ from app.modules.undergraduate.models import (
     UndergraduateAdmissionTerm,
     UndergraduateApplication,
 )
+from app.modules.undergraduate.ranking.models import StreamQuota
 from app.shared.enums import (
     ApplicationStatus,
     PaymentStatus,
@@ -53,11 +58,157 @@ from app.shared.enums import (
 
 DATABASE_URL = str(settings.DATABASE_URL)
 
-SENTINEL_EMAIL = "ranking_test_student_01@aau.edu.et"
 
 # ══════════════════════════════════════════════════════════════
-#  Test Students
+#  Phase 1 — Baseline data (formerly scripts/seed.py)
 # ══════════════════════════════════════════════════════════════
+
+PROGRAMS = [
+    # ── Natural Science ───────────────────────────────
+    {"code": "CS", "name": "Computer Science", "department": "Computer Science", "stream": StreamType.NATURAL, "cut_off_score": 550.0, "max_capacity": 120},
+    {"code": "SE", "name": "Software Engineering", "department": "Software Engineering", "stream": StreamType.NATURAL, "cut_off_score": 560.0, "max_capacity": 100},
+    {"code": "EE", "name": "Electrical Engineering", "department": "Electrical & Computer Engineering", "stream": StreamType.NATURAL, "cut_off_score": 540.0, "max_capacity": 80},
+    {"code": "ME", "name": "Mechanical Engineering", "department": "Mechanical Engineering", "stream": StreamType.NATURAL, "cut_off_score": 520.0, "max_capacity": 90},
+    # Course-management engineering programs (the 6 covered by course_course seed)
+    {"code": "ChE", "name": "Chemical Engineering", "department": "Chemical Engineering", "stream": StreamType.NATURAL, "cut_off_score": 510.0, "max_capacity": 70},
+    {"code": "CE", "name": "Civil Engineering", "department": "Civil Engineering", "stream": StreamType.NATURAL, "cut_off_score": 515.0, "max_capacity": 90},
+    {"code": "BME", "name": "Bio Medical Engineering", "department": "Bio Medical Engineering", "stream": StreamType.NATURAL, "cut_off_score": 540.0, "max_capacity": 60},
+    {"code": "MED", "name": "Medicine", "department": "Medical Sciences", "stream": StreamType.NATURAL, "cut_off_score": 600.0, "max_capacity": 60},
+    {"code": "BIO", "name": "Biology", "department": "Biological Sciences", "stream": StreamType.NATURAL, "cut_off_score": 480.0, "max_capacity": 100},
+    # ── Social Science ────────────────────────────────
+    {"code": "LAW", "name": "Law", "department": "Law", "stream": StreamType.SOCIAL, "cut_off_score": 530.0, "max_capacity": 80},
+    {"code": "ECON", "name": "Economics", "department": "Economics", "stream": StreamType.SOCIAL, "cut_off_score": 500.0, "max_capacity": 100},
+    {"code": "PSYCH", "name": "Psychology", "department": "Psychology", "stream": StreamType.SOCIAL, "cut_off_score": 470.0, "max_capacity": 80},
+    {"code": "ACCT", "name": "Accounting & Finance", "department": "Accounting & Finance", "stream": StreamType.SOCIAL, "cut_off_score": 510.0, "max_capacity": 90},
+    {"code": "MGMT", "name": "Management", "department": "Management", "stream": StreamType.SOCIAL, "cut_off_score": 490.0, "max_capacity": 100},
+    {"code": "POLS", "name": "Political Science", "department": "Political Science & International Relations", "stream": StreamType.SOCIAL, "cut_off_score": 480.0, "max_capacity": 70},
+]
+
+
+MOE_RECORDS = [
+    {
+        "admission_number": "2955397", "full_name": "Abebe Kebede", "exam_year": 2024, "stream": StreamType.NATURAL,
+        "subjects": {"Mathematics": 92, "Physics": 85, "Chemistry": 78, "Biology": 80, "English": 75, "Aptitude": 88},
+        "total_score": 498.0,
+    },
+    {
+        "admission_number": "3102845", "full_name": "Sara Tadesse", "exam_year": 2024, "stream": StreamType.NATURAL,
+        "subjects": {"Mathematics": 95, "Physics": 90, "Chemistry": 88, "Biology": 85, "English": 82, "Aptitude": 93},
+        "total_score": 533.0,
+    },
+    {
+        "admission_number": "2871034", "full_name": "Dawit Haile", "exam_year": 2024, "stream": StreamType.SOCIAL,
+        "subjects": {"History": 88, "Geography": 82, "Economics": 90, "Civics": 85, "English": 78, "Aptitude": 86},
+        "total_score": 509.0,
+    },
+    {
+        "admission_number": "3045612", "full_name": "Meron Alemu", "exam_year": 2024, "stream": StreamType.SOCIAL,
+        "subjects": {"History": 75, "Geography": 70, "Economics": 80, "Civics": 72, "English": 68, "Aptitude": 74},
+        "total_score": 439.0,
+    },
+    {
+        "admission_number": "3198203", "full_name": "Yonas Bekele", "exam_year": 2024, "stream": StreamType.NATURAL,
+        "subjects": {"Mathematics": 80, "Physics": 75, "Chemistry": 70, "Biology": 72, "English": 65, "Aptitude": 78},
+        "total_score": 440.0,
+    },
+]
+
+
+STREAM_QUOTAS = [
+    {"stream": StreamType.NATURAL, "max_capacity": 2500},
+    {"stream": StreamType.SOCIAL, "max_capacity": 2500},
+]
+
+
+async def seed():
+    engine = create_async_engine(DATABASE_URL, echo=False)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with async_session() as session:
+        # ── Seed Admission Terms ──
+        existing_terms = (await session.execute(select(UndergraduateAdmissionTerm))).scalars().all()
+        if existing_terms:
+            active_term = existing_terms[0]
+            print(f"⚠️  {len(existing_terms)} admission terms already exist — skipping term seeding.")
+        else:
+            active_term = UndergraduateAdmissionTerm(
+                id=uuid.uuid4(),
+                term_name="2026/27",
+                start_date=date(2026, 9, 1),
+                end_date=date(2027, 1, 31),
+                is_open=True,
+                description="Primary intake for 2026/27",
+            )
+            session.add(active_term)
+            await session.commit()
+            print("✅ Seeded undergraduate admission term: 2026/27.")
+
+        # ── Seed Programs ──
+        existing = (await session.execute(select(AcademicProgram))).scalars().all()
+        if existing:
+            print(f"⚠️  {len(existing)} programs already exist — skipping program seeding.")
+        else:
+            for p in PROGRAMS:
+                session.add(AcademicProgram(id=uuid.uuid4(), **p))
+            await session.commit()
+            print(f"✅ Seeded {len(PROGRAMS)} academic programs.")
+
+        # ── Seed MoE Records ──
+        existing_moe = (await session.execute(select(MoeStudentRecord))).scalars().all()
+        if existing_moe:
+            print(f"⚠️  {len(existing_moe)} MoE records already exist — skipping MoE seeding.")
+        else:
+            for r in MOE_RECORDS:
+                session.add(MoeStudentRecord(id=uuid.uuid4(), **r))
+            await session.commit()
+            print(f"✅ Seeded {len(MOE_RECORDS)} MoE student records.")
+
+        # ── Seed Stream Quotas ──
+        existing_quotas = (await session.execute(select(StreamQuota))).scalars().all()
+        if existing_quotas:
+            print(f"⚠️  {len(existing_quotas)} stream quotas already exist — skipping quota seeding.")
+        else:
+            for q in STREAM_QUOTAS:
+                session.add(
+                    StreamQuota(
+                        id=uuid.uuid4(),
+                        stream=q["stream"],
+                        max_capacity=q["max_capacity"],
+                        admission_term_id=active_term.id,
+                    )
+                )
+            await session.commit()
+            print(f"✅ Seeded {len(STREAM_QUOTAS)} stream quotas.")
+
+        # ── Seed Officer Account ──
+        officer = (await session.execute(
+            select(User).where(User.email == "officer@aau.edu.et")
+        )).scalar_one_or_none()
+
+        if officer:
+            print("⚠️  Officer account already exists.")
+        else:
+            session.add(User(
+                id=uuid.uuid4(),
+                email="officer@aau.edu.et",
+                first_name="Registrar",
+                last_name="Officer",
+                hashed_password=hash_password("password123"),
+                role=UserRole.REGISTRAR_OFFICER,
+                is_active=True,
+            ))
+            await session.commit()
+            print("✅ Seeded default officer account (officer@aau.edu.et).")
+
+    await engine.dispose()
+    print("\n🎉 Seeding complete!")
+
+
+# ══════════════════════════════════════════════════════════════
+#  Phase 2 — Ranking test data (formerly scripts/seed_ranking_test.py)
+# ══════════════════════════════════════════════════════════════
+
+SENTINEL_EMAIL = "ranking_test_student_01@aau.edu.et"
 
 # Each entry: (email, first_name, last_name, admission_number, stream,
 #              sponsorship, grade12_total (out of 600), uat_score (out of 100),
@@ -134,15 +285,12 @@ SELF_SPONSORED_PREFS = {
 }
 
 
-# ══════════════════════════════════════════════════════════════
-#  Procedural Roster Expansion
-# ══════════════════════════════════════════════════════════════
 # The 20 hand-crafted students above cover the canonical happy/edge
 # cases. The block below extends the roster to 200 with reproducible
 # variety so the ranking pipeline gets stressed across many programs,
 # streams, score bands, and capacities.
 
-# Program code pools — must match codes seeded by scripts/seed.py.
+# Program code pools — must match codes seeded by Phase 1.
 _NATURAL_PROGRAM_CODES = ["CS", "SE", "EE", "ME", "ChE", "CE", "BME", "MED", "BIO"]
 _SOCIAL_PROGRAM_CODES = ["LAW", "ECON", "PSYCH", "ACCT", "MGMT", "POLS"]
 
@@ -244,10 +392,6 @@ TEST_STUDENTS.extend(_EXTRA_STUDENTS)
 SELF_SPONSORED_PREFS.update(_EXTRA_PREFS)
 
 
-# ══════════════════════════════════════════════════════════════
-#  Runner
-# ══════════════════════════════════════════════════════════════
-
 async def seed_ranking_test():
     engine = create_async_engine(DATABASE_URL, echo=False)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -269,7 +413,7 @@ async def seed_ranking_test():
         print(f"📋 Found {len(programs)} programs: {list(programs.keys())}")
 
         if not programs:
-            print("❌ No programs found! Run `python scripts/seed.py` first.")
+            print("❌ No programs found! Run `python scripts/seed_undergraduate_admission.py` (Phase 1) first.")
             await engine.dispose()
             return
 
@@ -281,7 +425,7 @@ async def seed_ranking_test():
             ).order_by(UndergraduateAdmissionTerm.start_date.asc())
         )).scalars().first()
         if term is None:
-            print("❌ No open undergraduate admission term found! Run `python scripts/seed.py` first.")
+            print("❌ No open undergraduate admission term found! Run `python scripts/seed_undergraduate_admission.py` (Phase 1) first.")
             await engine.dispose()
             return
 
@@ -399,5 +543,14 @@ async def seed_ranking_test():
         print(f"   {first + ' ' + last:<28s} {cat + '/' + stream.value:<15s} {g12:>4d} {uat:>4d} {final:>6.2f}")
 
 
+# ══════════════════════════════════════════════════════════════
+#  Entry point
+# ══════════════════════════════════════════════════════════════
+
+async def main():
+    await seed()
+    await seed_ranking_test()
+
+
 if __name__ == "__main__":
-    asyncio.run(seed_ranking_test())
+    asyncio.run(main())
