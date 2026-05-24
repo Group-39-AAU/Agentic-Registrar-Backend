@@ -99,13 +99,17 @@ async def run_enrollment(
         raise HTTPException(400, "All admitted applications are already enrolled")
 
     # ── 3. Fetch ranking results for program assignment ──
+    # Each applicant has one RankingResult row per run; the latest run holds
+    # the authoritative locked assignment. Order desc and keep first per app.
     enroll_ids = [a.id for a in to_enroll]
     rr_result = await db.execute(
-        select(RankingResult).where(
-            RankingResult.application_id.in_(enroll_ids)
-        )
+        select(RankingResult)
+        .where(RankingResult.application_id.in_(enroll_ids))
+        .order_by(RankingResult.ranking_run_number.desc())
     )
-    rr_map = {r.application_id: r for r in rr_result.scalars().all()}
+    rr_map: dict[uuid.UUID, RankingResult] = {}
+    for r in rr_result.scalars().all():
+        rr_map.setdefault(r.application_id, r)
 
     # ── 4. Fetch program info ──
     prog_result = await db.execute(select(AcademicProgram))

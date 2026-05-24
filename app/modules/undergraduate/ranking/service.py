@@ -28,6 +28,7 @@ class RankingService:
         current_run_number: int,
         final_state: dict[str, Any],
         program_info: dict[str, dict[str, str]],
+        skip_application_ids: set[uuid.UUID] | None = None,
     ) -> None:
         """
         Re-assign rerun applicants by using cutoffs locked in by previous runs.
@@ -37,7 +38,11 @@ class RankingService:
         streams that have never received an assignment have no floor: any applicant
         who chose them is eligible, and their assignment in this run will establish
         the cutoff going forward.
+
+        `skip_application_ids` — applicants already locked from prior runs whose
+        assignments must not be touched (the router restores them verbatim).
         """
+        skip_application_ids = skip_application_ids or set()
         prior_rows = (await self._db.execute(
             select(RankingResult)
             .where(
@@ -74,6 +79,8 @@ class RankingService:
                         stream_cutoffs[stream_key] = row.final_score
 
         for applicant in final_state["self_sponsored"]:
+            if applicant.application_id in skip_application_ids:
+                continue
             applicant.is_assigned = False
             applicant.assigned_program_id = None
             applicant.assignment_detail = "Unassigned — below locked cutoffs"
@@ -104,6 +111,8 @@ class RankingService:
                     break
 
         for applicant in final_state["government"]:
+            if applicant.application_id in skip_application_ids:
+                continue
             applicant.is_assigned = False
             applicant.assigned_stream = None
             cutoff = stream_cutoffs.get(applicant.stream)
