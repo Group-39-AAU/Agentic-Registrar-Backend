@@ -276,20 +276,6 @@ COURSES = [
 ]
 
 
-# Six additional SE / semester-1 catalog rows (was: seed_extra_se_sem1_courses.py).
-# Codes use slots 05-10 so they never collide with the base seed
-# (SE101-SE104). All rows are department="Software Engineering",
-# semester=1; the "add course" flow uses these to widen its picker.
-EXTRA_SE_SEM1 = [
-    ("SE105", "Introduction to Computing",    3),
-    ("SE106", "Communicative English Skills", 3),
-    ("SE107", "Civics & Ethical Education",   2),
-    ("SE108", "Logic & Critical Thinking",    2),
-    ("SE109", "Inclusiveness",                1),
-    ("SE110", "General Psychology",           3),
-]
-
-
 # ══════════════════════════════════════════════════════════════
 #  Prerequisites (intra-department only)
 # ══════════════════════════════════════════════════════════════
@@ -650,37 +636,6 @@ async def _seed_courses(session: AsyncSession) -> dict[str, Course]:
     else:
         print(f"⚠️  All {len(by_code)} courses already present — skipping.")
     return by_code
-
-
-async def _seed_extra_se_sem1_courses(
-    session: AsyncSession,
-    courses_by_code: dict[str, Course],
-) -> None:
-    """
-    Add the six extra Software-Engineering / semester-1 catalog rows
-    (SE105-SE110). Idempotent: re-runs skip existing codes.
-    """
-    new_count = 0
-    for code, title, credits in EXTRA_SE_SEM1:
-        if code in courses_by_code:
-            continue
-        course = Course(
-            id=_uid("course", code),
-            code=code,
-            title=title,
-            credit_hours=credits,
-            semester=1,
-            department="Software Engineering",
-        )
-        session.add(course)
-        courses_by_code[code] = course
-        new_count += 1
-
-    await session.commit()
-    if new_count:
-        print(f"✅ Seeded {new_count} extra SE-sem-1 courses (SE105-SE110).")
-    else:
-        print("⚠️  Extra SE-sem-1 courses already present — skipping.")
 
 
 async def _seed_prerequisites(
@@ -2099,7 +2054,6 @@ async def seed() -> None:
     async with async_session() as session:
         terms = await _seed_terms(session)
         courses_by_code = await _seed_courses(session)
-        await _seed_extra_se_sem1_courses(session, courses_by_code)
         await _seed_prerequisites(session, courses_by_code)
         await _seed_classrooms(session)
         instructors = await _seed_instructors(session)
