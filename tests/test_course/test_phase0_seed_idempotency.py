@@ -1,5 +1,5 @@
 """
-Phase 0 — seed_course.py idempotency contract.
+Phase 0 — seed_course_management.py idempotency contract.
 
 The seed script has skip-if-exists guards on every block. Re-running
 it against a populated database must not create duplicates and must
@@ -23,14 +23,16 @@ from app.modules.course.models import (
 
 def _load_seed_module():
     """
-    Load scripts/seed_course.py as a module without running its
-    asyncio entry point.
+    Load scripts/seed_course_management.py as a module without running
+    its asyncio entry point.
     """
     repo_root = pathlib.Path(__file__).resolve().parents[2]
-    seed_path = repo_root / "scripts" / "seed_course.py"
-    spec = importlib.util.spec_from_file_location("seed_course", seed_path)
+    seed_path = repo_root / "scripts" / "seed_course_management.py"
+    spec = importlib.util.spec_from_file_location(
+        "seed_course_management", seed_path,
+    )
     module = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault("seed_course", module)
+    sys.modules.setdefault("seed_course_management", module)
     assert spec and spec.loader
     spec.loader.exec_module(module)
     return module

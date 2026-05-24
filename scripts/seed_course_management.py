@@ -1,33 +1,43 @@
 """
-Course Management — Phase 0 seed data.
+Course Management — consolidated seed script.
 
-Populates the deterministic sandbox that every track (A/B/C) reuses
-in its own tests so feature work in any one track can be demoed
-without dependencies on the others.
+Merges four previously separate scripts into one idempotent runner:
 
-Idempotent: running twice does not create duplicates.
+  1. seed_course.py
+       Phase 0 catalog (terms, courses, prerequisites, classrooms,
+       instructors + assignments, students, officers) plus Track A
+       sample registrations, the SE-sem1/upper-year bulk cohorts,
+       grade backfill, and the Track C standing demo cohort.
+
+  2. migrate_terms_to_ethiopian_phases.py
+       Idempotent backfill of the four Ethiopian-phase AcademicTerm
+       rows — folded into _seed_terms() since the seed already covers
+       the same set of terms. The final "term state" summary print
+       at the end of this script comes from here.
+
+  3. seed_extra_se_sem1_courses.py
+       Six extra Software-Engineering / semester-1 catalog rows
+       (SE105–SE110) used to give the "add course" flow more
+       options. Run after _seed_courses so the prerequisite seeder
+       sees them.
+
+  4. seed_track_b_roster.py
+       Self-contained Track B PR-1 demo scenario: a separate term
+       ("Track-B-Demo-2026"), one instructor teaching CS101 across
+       two sections, with the ADD/DROP/draft edge cases the roster
+       endpoints need to exercise.
+
+Idempotent end-to-end: running twice does not create duplicates.
 
 Usage:
-    cd /path/to/project
+    cd /path/to/Agentic-Registrar-Backend
     source venv/bin/activate
-    python scripts/seed_course.py
-
-Phase 0 seeds (this script):
-    1. Two AcademicTerms — Fall 2026 (open) and Spring 2027 (closed),
-       i.e. one full academic year of two semesters
-    2. 240 Courses across 6 engineering departments (4 per
-       (department, semester) cell, 5-year programs = 10 semesters)
-    3. ~28 intra-department prerequisite edges spanning 3+ depth levels
-    4. 12 Instructors (2 per department) + InstructorAssignments per term
-       (cohort Section rows are emitted by the scheduling agent at
-       allocation time, not at seed time)
-    5. 30 Students (5 per department) across semesters 1–8
-    6. Registrar Officer + Department Head (Software Engineering) accounts
+    python scripts/seed_course_management.py
 """
 
 import asyncio
 import uuid
-from datetime import date
+from datetime import date, time, datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -35,18 +45,16 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 from app.core.security import hash_password
-from datetime import datetime, timezone
-
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    AcademicTerm, AdvisoryRecommendation, Classroom, Course,
-    CoursePrerequisite, Grade, Instructor, InstructorAssignment, Registration,
-    RegistrationCourse, RegistrationStatusHistory, Section, Student,
-    CourseManagementOfficer,
+    AcademicTerm, AdvisoryRecommendation, ClassScheduleSlot, Classroom,
+    Course, CoursePrerequisite, CourseManagementOfficer, Grade, Instructor,
+    InstructorAssignment, Registration, RegistrationCourse,
+    RegistrationStatusHistory, Section, Student, StudentScheduleAddition,
 )
 from app.modules.course.grade_points import points_for
 from app.shared.enums import (
-    AcademicPhase, EnrollmentStatus, GradeLetter, GradeSubmissionStatus, 
+    AcademicPhase, EnrollmentStatus, GradeLetter, GradeSubmissionStatus,
     OfficerRole, RegistrationStatus, RiskStatus, SponsorshipType, UserRole,
 )
 
@@ -57,33 +65,34 @@ DATABASE_URL = str(settings.DATABASE_URL)
 # ══════════════════════════════════════════════════════════════
 #  Deterministic UUIDs
 # ══════════════════════════════════════════════════════════════
-# Using uuid5 with a fixed namespace so every run of the seed gets
-# the same IDs. This means tests can hard-code "Fall 2026" =
-# COURSE_NS:term:fall-2026 and look it up reliably.
+# Two stable namespaces — Phase 0 + Track A reuse one, Track B uses
+# its own so the demo scenario can't accidentally collide with the
+# bulk cohort ids.
 
-_NS = uuid.UUID("c0a3e000-0000-4000-8000-000000000000")  # "course phase 0"
+_NS = uuid.UUID("c0a3e000-0000-4000-8000-000000000000")     # phase 0
+_NS_TB = uuid.UUID("b0a3e000-0000-4000-8000-000000000001")  # track b pr 1
 
 
 def _uid(*parts: str) -> uuid.UUID:
-    """Stable UUID derived from the slash-joined parts."""
+    """Stable UUID in the Phase 0 namespace."""
     return uuid.uuid5(_NS, "/".join(parts))
 
 
-# ══════════════════════════════════════════════════════════════
-#  Academic Term
-# ══════════════════════════════════════════════════════════════
+def _uid_tb(*parts: str) -> uuid.UUID:
+    """Stable UUID in the Track B namespace."""
+    return uuid.uuid5(_NS_TB, "/".join(parts))
 
-# Ethiopian-context academic calendar — every academic year is split
-# into two phases:
-#
+
+# ══════════════════════════════════════════════════════════════
+#  Academic Terms (Ethiopian phases)
+# ══════════════════════════════════════════════════════════════
+# Every academic year is split into two phases:
 #   Phase One: September → end of January  (≈ Meskerem → Tir)
 #   Phase Two: February  → end of June     (≈ Yekatit  → Sene)
 #
-# We seed the previous and the upcoming academic year (4 terms total).
-# Whichever phase covers "today" is marked ``is_open=True`` so the
-# registration portal is testable out of the box without an officer
-# manually flipping a window. The other three stay closed; officers
-# can exercise the open/close endpoints freely.
+# Whichever phase covers "today" is seeded with ``is_open=True`` so the
+# registration portal is testable out of the box. The other three stay
+# closed and officers can flip the windows freely.
 TERMS = [
     {
         "id": _uid("term", "2025-2026-phase-1"),
@@ -128,12 +137,7 @@ TERMS = [
 #  Departments + curriculum
 # ══════════════════════════════════════════════════════════════
 # Six engineering departments, 5-year programs (10 semesters each),
-# 4 courses per (department, semester) cell. No cross-department
-# course sharing — each department has its own version of any
-# foundational subject (Calculus, Physics, etc.) so the curriculum
-# filter can be a strict ``course.department == student.department``.
-#
-# 6 × 10 × 4 = 240 courses total.
+# 4 courses per (department, semester) cell. 6 × 10 × 4 = 240 courses.
 
 DEPARTMENTS = [
     "Software Engineering",
@@ -154,10 +158,6 @@ DEPT_CODE = {
 }
 
 
-# Per-(department, semester) course list as (title, credit_hours).
-# 4 courses per cell, designed to look like a realistic AAIT
-# 5-year engineering curriculum (foundation → core → advanced →
-# capstone). Order within a semester is stable — slot 1, 2, 3, 4.
 CURRICULUM: dict[str, dict[int, list[tuple[str, int]]]] = {
     "Software Engineering": {
         1:  [("Calculus I", 4), ("Programming Fundamentals", 4), ("Engineering Drawing", 3), ("Engineering Mechanics", 3)],
@@ -239,9 +239,6 @@ def _course_code(department: str, semester: int, slot: int) -> str:
     return f"{DEPT_CODE[department]}{semester}{slot:02d}"
 
 
-# Generated catalog: (code, title, credit_hours, semester, department).
-# Order is dept-major, semester-minor, slot-tertiary so existing tests
-# that assume a deterministic insertion order still see consistent UUIDs.
 COURSES = [
     (
         _course_code(department, semester, slot),
@@ -256,62 +253,70 @@ COURSES = [
 ]
 
 
+# Six additional SE / semester-1 catalog rows (was: seed_extra_se_sem1_courses.py).
+# Codes use slots 05-10 so they never collide with the base seed
+# (SE101-SE104). All rows are department="Software Engineering",
+# semester=1; the "add course" flow uses these to widen its picker.
+EXTRA_SE_SEM1 = [
+    ("SE105", "Introduction to Computing",    3),
+    ("SE106", "Communicative English Skills", 3),
+    ("SE107", "Civics & Ethical Education",   2),
+    ("SE108", "Logic & Critical Thinking",    2),
+    ("SE109", "Inclusiveness",                1),
+    ("SE110", "General Psychology",           3),
+]
+
+
 # ══════════════════════════════════════════════════════════════
-#  Prerequisites (intra-department only — no cross-department FKs
-#  since each department has its own version of every foundational
-#  course like Calculus / Discrete Math / Engineering Mechanics).
+#  Prerequisites (intra-department only)
 # ══════════════════════════════════════════════════════════════
-# (course_code, prerequisite_course_code)
-# 4-6 chains per department, designed to span at least 3 depth
-# levels so the compliance agent has non-trivial cases.
 
 PREREQUISITES = [
     # ── Software Engineering ────────────────────────────────────
-    ("SE201", "SE101"),     # Calculus II  ← Calculus I
-    ("SE303", "SE102"),     # Data Structures ← Programming Fundamentals
-    ("SE402", "SE303"),     # Algorithms ← Data Structures
-    ("SE403", "SE303"),     # Database Systems ← Data Structures
-    ("SE601", "SE503"),     # Software Architecture ← SE Principles
+    ("SE201", "SE101"),
+    ("SE303", "SE102"),
+    ("SE402", "SE303"),
+    ("SE403", "SE303"),
+    ("SE601", "SE503"),
 
     # ── Electrical Engineering ──────────────────────────────────
-    ("EE201", "EE101"),     # Calculus II ← Calculus I
-    ("EE402", "EE303"),     # Circuit Theory II ← Circuit Theory I
-    ("EE403", "EE304"),     # Electronics II ← Electronics I
-    ("EE503", "EE404"),     # Microprocessors ← Digital Logic Design
-    ("EE602", "EE502"),     # Electromagnetics II ← Electromagnetics I
+    ("EE201", "EE101"),
+    ("EE402", "EE303"),
+    ("EE403", "EE304"),
+    ("EE503", "EE404"),
+    ("EE602", "EE502"),
 
     # ── Chemical Engineering ────────────────────────────────────
-    ("ChE201", "ChE101"),   # Calculus II ← Calculus I
-    ("ChE403", "ChE201"),   # Thermodynamics I ← Calculus II
-    ("ChE503", "ChE403"),   # Reaction Engineering I ← Thermodynamics I
-    ("ChE603", "ChE503"),   # Reaction Engineering II ← Reaction Engineering I
+    ("ChE201", "ChE101"),
+    ("ChE403", "ChE201"),
+    ("ChE503", "ChE403"),
+    ("ChE603", "ChE503"),
 
     # ── Civil Engineering ───────────────────────────────────────
-    ("CE201", "CE101"),     # Calculus II ← Calculus I
-    ("CE402", "CE303"),     # Surveying II ← Surveying I
-    ("CE501", "CE403"),     # Theory of Structures I ← Strength of Materials
-    ("CE601", "CE501"),     # Theory of Structures II ← Theory of Structures I
-    ("CE502", "CE304"),     # Soil Mechanics I ← Engineering Geology
+    ("CE201", "CE101"),
+    ("CE402", "CE303"),
+    ("CE501", "CE403"),
+    ("CE601", "CE501"),
+    ("CE502", "CE304"),
 
     # ── Mechanical Engineering ──────────────────────────────────
-    ("ME201", "ME101"),     # Calculus II ← Calculus I
-    ("ME402", "ME303"),     # Strength of Materials II ← Strength of Materials I
-    ("ME403", "ME201"),     # Thermodynamics I ← Calculus II
-    ("ME502", "ME403"),     # Thermodynamics II ← Thermodynamics I
-    ("ME601", "ME501"),     # Heat Transfer ← Fluid Mechanics
+    ("ME201", "ME101"),
+    ("ME402", "ME303"),
+    ("ME403", "ME201"),
+    ("ME502", "ME403"),
+    ("ME601", "ME501"),
 
     # ── Bio Medical Engineering ─────────────────────────────────
-    ("BME201", "BME101"),   # Calculus II ← Calculus I
-    ("BME402", "BME303"),   # Anatomy & Physiology II ← Anatomy & Physiology I
-    ("BME501", "BME402"),   # Medical Instrumentation I ← Anatomy & Physiology II
-    ("BME601", "BME501"),   # Medical Instrumentation II ← Medical Instrumentation I
+    ("BME201", "BME101"),
+    ("BME402", "BME303"),
+    ("BME501", "BME402"),
+    ("BME601", "BME501"),
 ]
 
 
 # ══════════════════════════════════════════════════════════════
 #  Instructors (12 across 6 departments — 2 per department)
 # ══════════════════════════════════════════════════════════════
-# (instructor_id, first_name, last_name, department)
 
 INSTRUCTORS = [
     ("STAFF/0001/10", "Alemayehu", "Bekele",   "Software Engineering"),
@@ -332,40 +337,28 @@ INSTRUCTORS = [
 # ══════════════════════════════════════════════════════════════
 #  Classrooms (per-department physical room inventory)
 # ══════════════════════════════════════════════════════════════
-# Three rooms per department: a big lecture hall, a mid-size room,
-# and a small lab. Software Engineering's biggest hall (SE-101) is
-# 80 seats so the bulk SE-sem-1 cohort (72 students) fits in one
-# room rather than splitting. Other departments don't have that
-# volume yet so 60-seat lectures suffice.
 
-# (name, capacity, department)
 CLASSROOMS = [
-    # ── Software Engineering ────────────────────────────
     ("SE-101",   80, "Software Engineering"),
     ("SE-201",   60, "Software Engineering"),
     ("SE-LAB-1", 30, "Software Engineering"),
 
-    # ── Electrical Engineering ──────────────────────────
     ("EE-101",   60, "Electrical Engineering"),
     ("EE-201",   50, "Electrical Engineering"),
     ("EE-LAB-1", 30, "Electrical Engineering"),
 
-    # ── Chemical Engineering ────────────────────────────
     ("ChE-101",   60, "Chemical Engineering"),
     ("ChE-201",   50, "Chemical Engineering"),
     ("ChE-LAB-1", 30, "Chemical Engineering"),
 
-    # ── Civil Engineering ───────────────────────────────
     ("CE-101",   60, "Civil Engineering"),
     ("CE-201",   50, "Civil Engineering"),
     ("CE-LAB-1", 30, "Civil Engineering"),
 
-    # ── Mechanical Engineering ──────────────────────────
     ("ME-101",   60, "Mechanical Engineering"),
     ("ME-201",   50, "Mechanical Engineering"),
     ("ME-LAB-1", 30, "Mechanical Engineering"),
 
-    # ── Bio Medical Engineering ─────────────────────────
     ("BME-101",   60, "Bio Medical Engineering"),
     ("BME-201",   50, "Bio Medical Engineering"),
     ("BME-LAB-1", 30, "Bio Medical Engineering"),
@@ -373,54 +366,43 @@ CLASSROOMS = [
 
 
 # ══════════════════════════════════════════════════════════════
-#  Students (30 across semesters 1–8, distributed across the 6 depts)
+#  Students (30 across semesters 1–8, distributed across 6 depts)
 # ══════════════════════════════════════════════════════════════
-# (student_id, first_name, last_name, current_semester, department, sponsorship)
-# 5 students per department × 6 departments = 30 students. Semesters
-# are spread 1-8 within each department so Track A has students at
-# multiple curriculum depths. Sponsorship is mixed (~70% government,
-# ~30% self-sponsored) to reflect the typical AAU intake mix.
 
 _GOV = SponsorshipType.GOVERNMENT
 _SELF = SponsorshipType.SELF_SPONSORED
 
 STUDENTS = [
-    # ── Software Engineering (5 students) ───────────────────────
     ("UGR/0001/14", "Abel",      "Tesfaye",     1, "Software Engineering",   _GOV),
     ("UGR/0002/14", "Beza",      "Worku",       2, "Software Engineering",   _SELF),
     ("UGR/0003/14", "Caleb",     "Mulugeta",    3, "Software Engineering",   _GOV),
     ("UGR/0004/14", "Dina",      "Hailemariam", 5, "Software Engineering",   _GOV),
     ("UGR/0005/14", "Ermias",    "Bekele",      7, "Software Engineering",   _SELF),
 
-    # ── Electrical Engineering (5 students) ─────────────────────
     ("UGR/0006/14", "Frehiwot",  "Asrat",       1, "Electrical Engineering", _GOV),
     ("UGR/0007/14", "Gemechu",   "Olana",       2, "Electrical Engineering", _GOV),
     ("UGR/0008/14", "Helen",     "Yohannes",    4, "Electrical Engineering", _SELF),
     ("UGR/0009/14", "Isaac",     "Demeke",      6, "Electrical Engineering", _GOV),
     ("UGR/0010/14", "Jerusalem", "Tilahun",     8, "Electrical Engineering", _GOV),
 
-    # ── Chemical Engineering (5 students) ───────────────────────
     ("UGR/0011/14", "Kalkidan",  "Sisay",       1, "Chemical Engineering",   _GOV),
     ("UGR/0012/14", "Lidya",     "Abebe",       3, "Chemical Engineering",   _SELF),
     ("UGR/0013/14", "Marcos",    "Negash",      4, "Chemical Engineering",   _GOV),
     ("UGR/0014/14", "Nardos",    "Birhanu",     5, "Chemical Engineering",   _GOV),
     ("UGR/0015/14", "Obse",      "Tariku",      7, "Chemical Engineering",   _GOV),
 
-    # ── Civil Engineering (5 students) ──────────────────────────
     ("UGR/0016/14", "Petros",    "Selam",       2, "Civil Engineering",      _GOV),
     ("UGR/0017/14", "Rahel",     "Yilma",       3, "Civil Engineering",      _SELF),
     ("UGR/0018/14", "Samuel",    "Habte",       5, "Civil Engineering",      _GOV),
     ("UGR/0019/14", "Tigist",    "Mekuria",     6, "Civil Engineering",      _GOV),
     ("UGR/0020/14", "Ujulu",     "Gobena",      8, "Civil Engineering",      _SELF),
 
-    # ── Mechanical Engineering (5 students) ─────────────────────
     ("UGR/0021/14", "Veronica",  "Eshete",      1, "Mechanical Engineering", _GOV),
     ("UGR/0022/14", "Wondwossen","Aklilu",      2, "Mechanical Engineering", _GOV),
     ("UGR/0023/14", "Xavier",    "Birru",       4, "Mechanical Engineering", _SELF),
     ("UGR/0024/14", "Yared",     "Lemessa",     6, "Mechanical Engineering", _GOV),
     ("UGR/0025/14", "Zewditu",   "Asfaw",       7, "Mechanical Engineering", _GOV),
 
-    # ── Bio Medical Engineering (5 students) ────────────────────
     ("UGR/0026/14", "Amanuel",   "Getaneh",     1, "Bio Medical Engineering", _GOV),
     ("UGR/0027/14", "Bisrat",    "Kebede",      3, "Bio Medical Engineering", _SELF),
     ("UGR/0028/14", "Christian", "Wolde",       5, "Bio Medical Engineering", _GOV),
@@ -432,9 +414,6 @@ STUDENTS = [
 # ══════════════════════════════════════════════════════════════
 #  Officers
 # ══════════════════════════════════════════════════════════════
-# (staff_id, first_name, last_name, role, authorization_level, email)
-# A registrar officer plus a department head — the latter is the
-# *only* role allowed to override prerequisite blocks per SRS §3.5.
 
 OFFICERS = [
     (
@@ -451,17 +430,105 @@ OFFICERS = [
 
 
 # ══════════════════════════════════════════════════════════════
-#  Runner
+#  Track A — sample registrations
+# ══════════════════════════════════════════════════════════════
+
+SAMPLE_REGISTRATIONS = [
+    {
+        "student_id": "UGR/0001/14",
+        "course_codes": ["SE101", "SE102"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.SELF_SPONSORED,
+        "payment_reference": "MOCK-PAID-FALL2026-UGR0001",
+        "advisory": None,
+    },
+    {
+        "student_id": "UGR/0007/14",
+        "course_codes": ["EE201"],
+        "status": RegistrationStatus.REGISTRATION_OPEN,
+        "sponsorship": SponsorshipType.GOVERNMENT,
+        "payment_reference": None,
+        "advisory": None,
+    },
+    {
+        "student_id": "UGR/0019/14",
+        "course_codes": ["CE601"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.SELF_SPONSORED,
+        "payment_reference": "MOCK-PAID-FALL2026-UGR0019",
+        "advisory": "LOW",
+    },
+    # First-semester cohort: every sem-1 student fully registered in
+    # their department's 4-course semester-1 curriculum so the
+    # AcademicSchedulingAgent has one (department, semester=1) cohort
+    # per department to allocate.
+    {
+        "student_id": "UGR/0006/14",
+        "course_codes": ["EE101", "EE102", "EE103", "EE104"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.GOVERNMENT,
+        "payment_reference": None,
+        "advisory": None,
+    },
+    {
+        "student_id": "UGR/0011/14",
+        "course_codes": ["ChE101", "ChE102", "ChE103", "ChE104"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.GOVERNMENT,
+        "payment_reference": None,
+        "advisory": None,
+    },
+    {
+        "student_id": "UGR/0021/14",
+        "course_codes": ["ME101", "ME102", "ME103", "ME104"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.GOVERNMENT,
+        "payment_reference": None,
+        "advisory": None,
+    },
+    {
+        "student_id": "UGR/0026/14",
+        "course_codes": ["BME101", "BME102", "BME103", "BME104"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.GOVERNMENT,
+        "payment_reference": None,
+        "advisory": None,
+    },
+]
 
 
 # ══════════════════════════════════════════════════════════════
-#  Runner
+#  Bulk SE-sem-1 cohort (70 fresh students, REGISTERED in open term)
 # ══════════════════════════════════════════════════════════════
+
+SE_SEM1_BULK_COUNT = 70
+SE_SEM1_BULK_START_SEQ = 100      # → UGR/0100/14 .. UGR/0169/14
+SE_SEM1_BULK_COURSES = ["SE101", "SE102", "SE103", "SE104"]
+
+
+# ══════════════════════════════════════════════════════════════
+#  Bulk SE upper-year cohorts (years 2–5, 60 students each)
+# ══════════════════════════════════════════════════════════════
+
+# (batch_year, target_semester, count)
+SE_BULK_UPPER_COHORTS: list[tuple[int, int, int]] = [
+    (13, 3, 60),   # Year 2
+    (12, 5, 60),   # Year 3
+    (11, 7, 60),   # Year 4
+    (10, 9, 60),   # Year 5
+]
+
+
+# ══════════════════════════════════════════════════════════════
+#  Phase 0 seed functions
+# ══════════════════════════════════════════════════════════════
+
 
 async def _seed_terms(session: AsyncSession) -> list[AcademicTerm]:
     """
-    Seed both terms of the academic year. Idempotent per term: an
-    existing row (matched by term_name) is reused unchanged.
+    Seed both phases of each academic year. Idempotent per term: an
+    existing row (matched by ``(term_name, phase)``) is reused
+    unchanged.
     """
     seeded: list[AcademicTerm] = []
     for spec in TERMS:
@@ -518,6 +585,37 @@ async def _seed_courses(session: AsyncSession) -> dict[str, Course]:
     return by_code
 
 
+async def _seed_extra_se_sem1_courses(
+    session: AsyncSession,
+    courses_by_code: dict[str, Course],
+) -> None:
+    """
+    Add the six extra Software-Engineering / semester-1 catalog rows
+    (SE105-SE110). Idempotent: re-runs skip existing codes.
+    """
+    new_count = 0
+    for code, title, credits in EXTRA_SE_SEM1:
+        if code in courses_by_code:
+            continue
+        course = Course(
+            id=_uid("course", code),
+            code=code,
+            title=title,
+            credit_hours=credits,
+            semester=1,
+            department="Software Engineering",
+        )
+        session.add(course)
+        courses_by_code[code] = course
+        new_count += 1
+
+    await session.commit()
+    if new_count:
+        print(f"✅ Seeded {new_count} extra SE-sem-1 courses (SE105-SE110).")
+    else:
+        print("⚠️  Extra SE-sem-1 courses already present — skipping.")
+
+
 async def _seed_prerequisites(
     session: AsyncSession,
     courses_by_code: dict[str, Course],
@@ -545,9 +643,15 @@ async def _seed_prerequisites(
 
     await session.commit()
     if new_count:
-        print(f"✅ Seeded {new_count} prerequisite edges (catalog total: {len(existing) + new_count}).")
+        print(
+            f"✅ Seeded {new_count} prerequisite edges "
+            f"(catalog total: {len(existing) + new_count})."
+        )
     else:
-        print(f"⚠️  All {len(existing)} prerequisite edges already present — skipping.")
+        print(
+            f"⚠️  All {len(existing)} prerequisite edges already present "
+            "— skipping."
+        )
 
 
 async def _ensure_user(
@@ -581,10 +685,8 @@ async def _ensure_user(
 
 async def _seed_classrooms(session: AsyncSession) -> dict[str, Classroom]:
     """
-    Seed the per-department classroom inventory. Idempotent:
-    re-running reuses any classroom whose ``name`` already exists,
-    even if its capacity or owning department drifts (those are
-    operational decisions the registrar makes by hand).
+    Seed the per-department classroom inventory. Idempotent: any
+    classroom whose ``name`` already exists is reused unchanged.
     """
     rows = (await session.execute(select(Classroom))).scalars().all()
     by_name: dict[str, Classroom] = {c.name: c for c in rows}
@@ -625,8 +727,6 @@ async def _seed_instructors(
     for staff_id, first_name, last_name, department in INSTRUCTORS:
         if staff_id in by_staff_id:
             continue
-        # The staff_id contains '/' which is not legal in an email
-        # local-part, so derive a slug for the email instead.
         slug = staff_id.lower().replace("/", "-")
         user = await _ensure_user(
             session,
@@ -648,9 +748,15 @@ async def _seed_instructors(
 
     await session.commit()
     if new_count:
-        print(f"✅ Seeded {new_count} instructors (catalog total: {len(by_staff_id)}).")
+        print(
+            f"✅ Seeded {new_count} instructors "
+            f"(catalog total: {len(by_staff_id)})."
+        )
     else:
-        print(f"⚠️  All {len(by_staff_id)} instructors already present — skipping.")
+        print(
+            f"⚠️  All {len(by_staff_id)} instructors already present "
+            "— skipping."
+        )
     return by_staff_id
 
 
@@ -661,24 +767,10 @@ async def _seed_instructor_assignments(
     instructors_by_staff_id: dict[str, Instructor],
 ) -> None:
     """
-    Seed per-term InstructorAssignments only.
-
-    The cohort scheduling agent reads InstructorAssignment to pin a
-    teacher onto every ClassScheduleSlot it emits. Course→instructor
-    is **round-robin within each department**, so every instructor in
-    a dept actually teaches something instead of the first instructor
-    grabbing all 40 courses.
-
-    Cohort Section rows are NOT seeded — they are created on demand by
-    the AcademicSchedulingAgent when an officer hits
-    ``POST /courses/officer/schedule/generate`` (the agent reads the
-    term's REGISTERED students, groups by (department, semester), and
-    spins up sections sized to the room inventory). Likewise the
-    per-class ClassScheduleSlot rows are emitted at that time.
+    Round-robin assign instructors to courses within each department.
+    Cohort Section rows are emitted on demand by
+    AcademicSchedulingAgent — not seeded here.
     """
-    # Reseeding redistributes via round-robin even on an existing DB.
-    # We wipe the term's assignments first so the round-robin pattern
-    # actually replaces the old "first instructor wins" allocation.
     existing_for_term = (
         await session.execute(
             select(InstructorAssignment).where(
@@ -694,13 +786,9 @@ async def _seed_instructor_assignments(
     instructors_by_dept: dict[str, list[Instructor]] = {}
     for ins in instructors_by_staff_id.values():
         instructors_by_dept.setdefault(ins.department, []).append(ins)
-    # Sort per-dept instructor lists by staff_id so the round-robin
-    # is deterministic across reseed runs.
     for ins_list in instructors_by_dept.values():
         ins_list.sort(key=lambda i: i.instructor_id)
 
-    # Group courses by department, sorted by code so the assignment
-    # order is stable across reseed runs.
     courses_by_dept: dict[str, list[Course]] = {}
     for code, course in courses_by_code.items():
         courses_by_dept.setdefault(course.department, []).append(course)
@@ -713,10 +801,6 @@ async def _seed_instructor_assignments(
         if not dept_instructors:
             continue
         for idx, course in enumerate(dept_courses):
-            # Round-robin: course #0 → instructor #0, course #1 →
-            # instructor #1, course #2 → instructor #0, etc. With 2
-            # instructors per department and 40 courses, each
-            # instructor ends up teaching 20.
             instructor = dept_instructors[idx % len(dept_instructors)]
             existing_assn = (
                 await session.execute(
@@ -762,10 +846,6 @@ async def _seed_students(session: AsyncSession) -> None:
     reconciled = 0
     for student_id, first_name, last_name, semester, department, sponsorship in STUDENTS:
         if student_id in by_student_id:
-            # Idempotent reconcile: any denormalised admission attribute
-            # that drifts from the seed spec gets fixed on a re-run.
-            # Without this, rows seeded before a column existed stay
-            # NULL forever and fail the curriculum / sponsorship paths.
             student = by_student_id[student_id]
             changed = False
             if student.department != department:
@@ -802,9 +882,15 @@ async def _seed_students(session: AsyncSession) -> None:
 
     await session.commit()
     if new_count:
-        print(f"✅ Seeded {new_count} students (catalog total: {len(existing) + new_count}).")
+        print(
+            f"✅ Seeded {new_count} students "
+            f"(catalog total: {len(existing) + new_count})."
+        )
     elif reconciled:
-        print(f"↻  Reconciled department/sponsorship on {reconciled} existing students.")
+        print(
+            f"↻  Reconciled department/sponsorship on {reconciled} "
+            "existing students."
+        )
     else:
         print(f"⚠️  All {len(existing)} students already present — skipping.")
 
@@ -845,97 +931,6 @@ async def _seed_officers(session: AsyncSession) -> None:
         print(f"⚠️  All {len(existing)} officers already present — skipping.")
 
 
-# ══════════════════════════════════════════════════════════════
-#  Track A — sample registrations & advisory verdicts
-# ══════════════════════════════════════════════════════════════
-# Demo data so the registration / scheduling / advisory journeys
-# can be poked at via Swagger without the engineer first having to
-# walk through draft → submit → pay → register manually.
-#
-# Three sample registrations, all under "Fall 2026":
-#   - UGR/0001/14 (semester 1) REGISTERED with two CS courses
-#       (sponsorship: SELF_SPONSORED, payment_reference seeded)
-#   - UGR/0005/14 (semester 2) draft REGISTRATION_OPEN with one CS
-#       course (no payment yet — useful for testing the
-#       PAYMENT_HOLD branch via the API)
-#   - UGR/0017/14 (semester 5) REGISTERED with one CS course;
-#       carries one LOW-risk AdvisoryRecommendation so the officer
-#       queue tests have a non-HIGH baseline to filter against.
-
-# (student_id, courses, status, sponsorship, payment_reference, advisory)
-# All sample students are referenced by UGR id; the courses must
-# belong to that student's department + current semester.
-#
-#   UGR/0001/14 → SE,    sem 1 → SE101, SE102 (REGISTERED)
-#   UGR/0007/14 → EE,    sem 2 → EE201      (RegistrationOpen draft)
-#   UGR/0019/14 → CE,    sem 6 → CE601      (REGISTERED, LOW-risk advisory)
-SAMPLE_REGISTRATIONS = [
-    {
-        "student_id": "UGR/0001/14",
-        "course_codes": ["SE101", "SE102"],
-        "status": RegistrationStatus.REGISTERED,
-        "sponsorship": SponsorshipType.SELF_SPONSORED,
-        "payment_reference": "MOCK-PAID-FALL2026-UGR0001",
-        "advisory": None,
-    },
-    {
-        "student_id": "UGR/0007/14",
-        "course_codes": ["EE201"],
-        "status": RegistrationStatus.REGISTRATION_OPEN,
-        "sponsorship": SponsorshipType.GOVERNMENT,
-        "payment_reference": None,
-        "advisory": None,
-    },
-    {
-        "student_id": "UGR/0019/14",
-        "course_codes": ["CE601"],
-        "status": RegistrationStatus.REGISTERED,
-        "sponsorship": SponsorshipType.SELF_SPONSORED,
-        "payment_reference": "MOCK-PAID-FALL2026-UGR0019",
-        "advisory": "LOW",
-    },
-    # ── First-semester cohort: every sem-1 student fully registered
-    #    in their department's 4-course semester-1 curriculum so the
-    #    AcademicSchedulingAgent has one (department, semester=1)
-    #    cohort per department to allocate. All four are government-
-    #    sponsored (matches Student.sponsorship_type), so they don't
-    #    need a payment_reference — the cost-sharing form is the
-    #    payment surrogate for these students.
-    {
-        "student_id": "UGR/0006/14",          # Electrical Engineering
-        "course_codes": ["EE101", "EE102", "EE103", "EE104"],
-        "status": RegistrationStatus.REGISTERED,
-        "sponsorship": SponsorshipType.GOVERNMENT,
-        "payment_reference": None,
-        "advisory": None,
-    },
-    {
-        "student_id": "UGR/0011/14",          # Chemical Engineering
-        "course_codes": ["ChE101", "ChE102", "ChE103", "ChE104"],
-        "status": RegistrationStatus.REGISTERED,
-        "sponsorship": SponsorshipType.GOVERNMENT,
-        "payment_reference": None,
-        "advisory": None,
-    },
-    {
-        "student_id": "UGR/0021/14",          # Mechanical Engineering
-        "course_codes": ["ME101", "ME102", "ME103", "ME104"],
-        "status": RegistrationStatus.REGISTERED,
-        "sponsorship": SponsorshipType.GOVERNMENT,
-        "payment_reference": None,
-        "advisory": None,
-    },
-    {
-        "student_id": "UGR/0026/14",          # Bio Medical Engineering
-        "course_codes": ["BME101", "BME102", "BME103", "BME104"],
-        "status": RegistrationStatus.REGISTERED,
-        "sponsorship": SponsorshipType.GOVERNMENT,
-        "payment_reference": None,
-        "advisory": None,
-    },
-]
-
-
 async def _seed_registrations(
     session: AsyncSession,
     term: AcademicTerm,
@@ -964,7 +959,10 @@ async def _seed_registrations(
             continue
 
         reg = Registration(
-            id=_uid("registration", term.term_name, term.phase.value, sample["student_id"]),
+            id=_uid(
+                "registration", term.term_name, term.phase.value,
+                sample["student_id"],
+            ),
             student_id=student.id,
             term_id=term.id,
             status=sample["status"],
@@ -975,7 +973,6 @@ async def _seed_registrations(
         await session.flush()
         new_regs += 1
 
-        # Initial-state history row, mirroring what the service does.
         session.add(
             RegistrationStatusHistory(
                 id=_uid("reghist", "init", sample["student_id"]),
@@ -1024,7 +1021,8 @@ async def _seed_registrations(
                         "single-course load."
                     ),
                     proposed_courses=[
-                        str(courses_by_code[c].id) for c in sample["course_codes"]
+                        str(courses_by_code[c].id)
+                        for c in sample["course_codes"]
                     ],
                     recommended_courses=[],
                     gap_analysis={
@@ -1041,34 +1039,11 @@ async def _seed_registrations(
     await session.commit()
     if new_regs:
         print(
-            f"✅ Seeded {new_regs} registrations, {new_links} registration "
-            f"courses, {new_history} status-history rows."
+            f"✅ Seeded {new_regs} registrations, {new_links} "
+            f"registration courses, {new_history} status-history rows."
         )
     else:
         print("⚠️  Sample registrations already present — skipping.")
-
-
-# ── Bulk SE-semester-1 cohort ──────────────────────────────────
-#
-# 70 fresh students all enrolled in Software Engineering / semester 1
-# / REGISTERED in the open term, each carrying the full 4-course
-# SE-sem1 curriculum (SE101–SE104). The Software Engineering /
-# semester-1 cohort then has enough volume that the
-# AcademicSchedulingAgent's room-capacity split actually does work —
-# the largest seeded room is FBE-12/14 at 80 seats, so all 70 fit
-# in one cohort A. Drop the largest-room capacity in the agent's
-# inventory below 70 to exercise the spill-into-cohort-B branch.
-#
-# IDs run UGR/0100/14 .. UGR/0169/14 so they don't collide with the
-# named demo students (UGR/0001..0030/14) or Yohannes (UGR/9999/14).
-# Names are programmatic ("Cohort101 SeSem1Student") because the
-# point of this block is volume, not realism — the named students
-# remain the source of truth for any test that asserts on a
-# specific person.
-
-SE_SEM1_BULK_COUNT = 70
-SE_SEM1_BULK_START_SEQ = 100      # → UGR/0100/14 .. UGR/0169/14
-SE_SEM1_BULK_COURSES = ["SE101", "SE102", "SE103", "SE104"]
 
 
 async def _seed_bulk_se_sem1_cohort(
@@ -1078,9 +1053,7 @@ async def _seed_bulk_se_sem1_cohort(
 ) -> None:
     """
     Seed ``SE_SEM1_BULK_COUNT`` Software-Engineering, semester-1,
-    REGISTERED students for ``term``. Idempotent per-student: a
-    student row whose student_id already exists is skipped, and a
-    registration that already exists for (student, term) is reused.
+    REGISTERED students for ``term``. Idempotent per-student.
     """
     se_sem1_courses = [courses_by_code[c] for c in SE_SEM1_BULK_COURSES]
 
@@ -1093,9 +1066,6 @@ async def _seed_bulk_se_sem1_cohort(
         slug = student_id_str.lower().replace("/", "-")
         email = f"{slug}@aau.edu.et"
 
-        # Mix sponsorship — every third student is self-sponsored so
-        # both payment paths (cost-sharing form vs. payment-callback)
-        # have non-trivial coverage.
         sponsorship = _SELF if i % 3 == 0 else _GOV
 
         student = (
@@ -1126,8 +1096,6 @@ async def _seed_bulk_se_sem1_cohort(
             await session.flush()
             new_users += 1
 
-        # Idempotent: skip if a registration already exists for this
-        # (student, term) pair.
         existing_reg = (
             await session.execute(
                 select(Registration).where(
@@ -1140,7 +1108,10 @@ async def _seed_bulk_se_sem1_cohort(
             continue
 
         reg = Registration(
-            id=_uid("registration", term.term_name, term.phase.value, student_id_str),
+            id=_uid(
+                "registration", term.term_name, term.phase.value,
+                student_id_str,
+            ),
             student_id=student.id,
             term_id=term.id,
             status=RegistrationStatus.REGISTERED,
@@ -1163,8 +1134,6 @@ async def _seed_bulk_se_sem1_cohort(
             ))
             new_links += 1
 
-        # Initial-state history row (None → REGISTERED) so the audit
-        # trail is consistent with what the service would produce.
         session.add(RegistrationStatusHistory(
             id=_uid("reghist", "init", student_id_str),
             registration_id=reg.id,
@@ -1185,61 +1154,21 @@ async def _seed_bulk_se_sem1_cohort(
         print("⚠️  Bulk SE-sem1 cohort already present — skipping.")
 
 
-# ── Bulk SE upper-year cohorts (years 2–5) ─────────────────────
-#
-# Fills out the SE pyramid: 60 students per year level beyond first
-# year, each fully registered for that year's Fall-semester
-# curriculum in the open term. Realistic batch years are used so
-# UGR ids encode "when did you start" — a year-2 student is in
-# batch 13 (started one year before the current intake), a year-5
-# in batch 10. Each batch year owns its own sequence 0001-0060.
-#
-#   Year 2 → Fall = semester 3 → batch 13 → UGR/0001/13 .. UGR/0060/13
-#   Year 3 → Fall = semester 5 → batch 12 → UGR/0001/12 .. UGR/0060/12
-#   Year 4 → Fall = semester 7 → batch 11 → UGR/0001/11 .. UGR/0060/11
-#   Year 5 → Fall = semester 9 → batch 10 → UGR/0001/10 .. UGR/0060/10
-#
-# Total new students: 4 × 60 = 240. Combined with the 72 SE-sem1
-# students already seeded, the Software Engineering pyramid then
-# holds 312 registered students across 5 year levels.
-
-# (batch_year, target_semester, count)
-SE_BULK_UPPER_COHORTS: list[tuple[int, int, int]] = [
-    (13, 3, 60),   # Year 2
-    (12, 5, 60),   # Year 3
-    (11, 7, 60),   # Year 4
-    (10, 9, 60),   # Year 5
-]
-
-
 async def _seed_bulk_se_upper_year_cohorts(
     session: AsyncSession,
     term: AcademicTerm,
     courses_by_code: dict[str, Course],
 ) -> None:
-    """
-    Seed 60 fully-registered SE students at each of semesters 3, 5,
-    7, and 9 (years 2–5). Idempotent per-student: a student whose
-    student_id already exists is skipped, and a registration that
-    already exists for (student, term) is reused.
-
-    Sponsorship is mixed (~33% self-sponsored, ~67% government)
-    matching the SE-sem1 bulk seed so the cost-sharing and bursar
-    paths have non-trivial coverage at every year level.
-    """
+    """Seed 60 fully-registered SE students per upper-year cohort (3,5,7,9)."""
     new_users = 0
     new_regs = 0
     new_links = 0
 
     for batch_year, semester, count in SE_BULK_UPPER_COHORTS:
-        # Build the per-(SE, semester) curriculum: SE<sem><01-04>.
         course_codes = [
             f"SE{semester}01", f"SE{semester}02",
             f"SE{semester}03", f"SE{semester}04",
         ]
-        # If any expected course is missing the seed is in an
-        # inconsistent state — fail loudly rather than silently
-        # producing empty registrations.
         try:
             target_courses = [courses_by_code[c] for c in course_codes]
         except KeyError as missing:
@@ -1288,8 +1217,6 @@ async def _seed_bulk_se_upper_year_cohorts(
                 await session.flush()
                 new_users += 1
 
-            # Idempotent: skip if a registration already exists for
-            # this (student, term).
             existing_reg = (
                 await session.execute(
                     select(Registration).where(
@@ -1302,7 +1229,10 @@ async def _seed_bulk_se_upper_year_cohorts(
                 continue
 
             reg = Registration(
-                id=_uid("registration", term.term_name, term.phase.value, student_id_str),
+                id=_uid(
+                    "registration", term.term_name, term.phase.value,
+                    student_id_str,
+                ),
                 student_id=student.id,
                 term_id=term.id,
                 status=RegistrationStatus.REGISTERED,
@@ -1342,8 +1272,7 @@ async def _seed_bulk_se_upper_year_cohorts(
     if new_regs or new_users:
         print(
             f"✅ Seeded bulk SE upper-year cohorts: {new_users} new "
-            f"students, {new_regs} registrations, {new_links} course "
-            "links."
+            f"students, {new_regs} registrations, {new_links} course links."
         )
     else:
         print("⚠️  Bulk SE upper-year cohorts already present — skipping.")
@@ -1352,24 +1281,7 @@ async def _seed_bulk_se_upper_year_cohorts(
 # ══════════════════════════════════════════════════════════════
 #  Grades — academic history backing the advisory consult flow
 # ══════════════════════════════════════════════════════════════
-# The Academic Advisory Agent's demand-driven consult endpoints
-# resolve a student's CGPA + completed-course set from the Grade
-# ledger. To make the consult flow demoable end-to-end we backfill
-# AUTHORISED grades for every prior semester of every seeded student
-# whose ``current_semester`` is greater than 1.
-#
-# The grade for a given (student, course) is deterministic from the
-# student id + course code so re-running the seed produces the same
-# CGPA every time. The distribution is biased mildly toward B's so
-# the average student lands around CGPA 3.0 — comfortably above the
-# Warning floor (2.0) but not so high that everyone looks like a
-# Distinction candidate.
 
-# Cycle of letter grades used by the deterministic per-student
-# distribution. Skipping I, NG, W, DO, P because they are
-# administrative marks that don't count toward CGPA (Senate Art
-# 90.7.4 / 90.7.6) — irrelevant for the advisory baseline. A+ is
-# included so Track C standing tests can hit the "top of scale" path.
 _SEED_GRADE_CYCLE = (
     GradeLetter.A_PLUS,
     GradeLetter.A,
@@ -1402,10 +1314,6 @@ async def _seed_grades(
     Seed AUTHORISED grades for every seeded student's completed
     semesters. Each row is keyed by ``_uid("grade", student_id,
     course_code)`` so the seed is idempotent.
-
-    Track-B-aligned shape: status=AUTHORISED, instructor entered,
-    officer authorised, grade_points cached. Track B's grade-entry
-    pipeline will use the same fields when it ships.
     """
     students = (await session.execute(select(Student))).scalars().all()
     instructors = (await session.execute(select(Instructor))).scalars().all()
@@ -1418,8 +1326,6 @@ async def _seed_grades(
 
     instructor_user_id = instructors[0].user_id
     officer_user_id = officers[0].user_id
-    # Anchor every seeded grade to the earliest term so completed
-    # semesters predate the currently-open registration term.
     history_term = min(terms, key=lambda t: t.start_date)
 
     existing = (await session.execute(select(Grade))).scalars().all()
@@ -1428,14 +1334,10 @@ async def _seed_grades(
     new_count = 0
     for student in students:
         if student.current_semester <= 1:
-            continue   # nothing to backfill — they have no prior terms
+            continue
         if not student.department:
-            continue   # legacy row without denormalised department
+            continue
         for sem in range(1, student.current_semester):
-            # Use SLOT 1 only — backfilling all 4 slots × every prior
-            # semester explodes the row count and a single course per
-            # semester is enough to give the agent a CGPA + a few
-            # completed courses to reason against.
             for slot in range(1, 5):
                 code = _course_code(student.department, sem, slot)
                 course = courses_by_code.get(code)
@@ -1450,22 +1352,18 @@ async def _seed_grades(
                 grade_points = (
                     pts * course.credit_hours if pts is not None else None
                 )
-                # Roughly map letters to underlying scores per AAU
-                # Senate Art 90.1 cutoffs so Track B's anomaly
-                # detector has plausible numeric_score data and the
-                # numeric → letter round-trip is consistent.
                 numeric = {
-                    GradeLetter.A_PLUS:   95.0,   # [90, 100]
-                    GradeLetter.A:        86.0,   # [83, 90)
-                    GradeLetter.A_MINUS:  81.0,   # [80, 83)
-                    GradeLetter.B_PLUS:   77.0,   # [75, 80)
-                    GradeLetter.B:        71.0,   # [68, 75)
-                    GradeLetter.B_MINUS:  66.0,   # [65, 68)
-                    GradeLetter.C_PLUS:   62.0,   # [60, 65)
-                    GradeLetter.C:        55.0,   # [50, 60)
-                    GradeLetter.C_MINUS:  47.0,   # [45, 50)
-                    GradeLetter.D:        42.0,   # [40, 45)
-                    GradeLetter.F:        30.0,   # < 40
+                    GradeLetter.A_PLUS:   95.0,
+                    GradeLetter.A:        86.0,
+                    GradeLetter.A_MINUS:  81.0,
+                    GradeLetter.B_PLUS:   77.0,
+                    GradeLetter.B:        71.0,
+                    GradeLetter.B_MINUS:  66.0,
+                    GradeLetter.C_PLUS:   62.0,
+                    GradeLetter.C:        55.0,
+                    GradeLetter.C_MINUS:  47.0,
+                    GradeLetter.D:        42.0,
+                    GradeLetter.F:        30.0,
                 }.get(letter)
 
                 session.add(Grade(
@@ -1499,27 +1397,6 @@ async def _seed_grades(
 # ══════════════════════════════════════════════════════════════
 #  Track C — Standing demo cohort
 # ══════════════════════════════════════════════════════════════
-# PR C1's three-dropdown DH browse flow needs at least one
-# (term, department, section) tuple where:
-#
-#   * the term is closed AND has authorised grades, and
-#   * students are registered into a Section of that term
-#
-# The existing seed creates Sections only for the open term and
-# Authorised grades only for the earliest (closed) term — so out
-# of the box, every closed term shows zero sections in the standing
-# browse. This function bridges that gap by:
-#
-#   1. Picking the earliest seeded term (``history_term``) as the
-#      "completed past semester" the standing flow demos against.
-#   2. Creating one Section per (department, semester=1) cohort in
-#      that term — enough to demo the three-dropdown flow across
-#      multiple departments.
-#   3. Registering the first 5 students per department (who already
-#      have AUTHORISED grades anchored to ``history_term`` from
-#      ``_seed_grades``) into that section, in REGISTERED state.
-#
-# Idempotent: re-runs do not duplicate Sections or Registrations.
 
 
 async def _seed_standing_demo_cohort(
@@ -1542,7 +1419,6 @@ async def _seed_standing_demo_cohort(
         print("⚠️  Skipping standing demo cohort — no eligible students.")
         return
 
-    # Bucket students by department, take the first 5 of each.
     by_dept: dict[str, list[Student]] = {}
     for stu in students:
         by_dept.setdefault(stu.department, []).append(stu)
@@ -1585,7 +1461,6 @@ async def _seed_standing_demo_cohort(
                 )
             )).scalar_one_or_none()
             if existing is not None:
-                # If a stale Registration exists without a section, pin it.
                 if existing.section_id is None:
                     existing.section_id = section.id
                     existing.status = RegistrationStatus.REGISTERED
@@ -1606,7 +1481,6 @@ async def _seed_standing_demo_cohort(
             session.add(reg)
             new_regs += 1
 
-        # Keep enrolled_count consistent with materialised registrations.
         section.enrolled_count = min(section.capacity, len(cohort))
 
     await session.commit()
@@ -1622,45 +1496,618 @@ async def _seed_standing_demo_cohort(
         )
 
 
+# ══════════════════════════════════════════════════════════════
+#  Track B PR 1 — roster demo (self-contained scenario)
+# ══════════════════════════════════════════════════════════════
+# A separate term ("Track-B-Demo-2026"), one instructor (Dr. Lemma)
+# teaching CS101 in two sections A and B. Three add/drop edge cases
+# the roster derivation must handle:
+#
+#   * 4 originals in A taking CS101
+#   * 4 originals in B taking CS101
+#   * 1 student from B who ADDED CS101 from A
+#   * 1 student from A who DROPPED CS101 entirely
+#   * 1 student in A whose registration is still REGISTRATION_OPEN
+#
+# Login credentials seeded for manual testing:
+#   instructor    staff-9991-15@aau.edu.et   password123
+#   dept head     reg-9999-15@aau.edu.et     password123
+
+TB_TERM_NAME = "Track-B-Demo-2026"
+TB_DEPARTMENT = "Software Engineering"
+TB_SEMESTER = 1
+
+TB_COURSE_CODE = "CS101"
+TB_COURSE_TITLE = "Introduction to Programming"
+TB_COURSE_CREDITS = 3
+
+TB_SECONDARY_COURSE_CODE = "MATH101"
+TB_SECONDARY_COURSE_TITLE = "Calculus I"
+TB_SECONDARY_COURSE_CREDITS = 3
+
+TB_INSTRUCTOR_STAFF_ID = "STAFF/9991/15"
+TB_INSTRUCTOR_FIRST = "Lemma"
+TB_INSTRUCTOR_LAST = "Bekele"
+
+TB_DH_STAFF_ID = "REG/9999/15"
+TB_DH_FIRST = "Almaz"
+TB_DH_LAST = "Tilahun"
+
+TB_SECTION_A_STUDENTS = [
+    ("UGR/9001/15", "Abel Tesfaye"),
+    ("UGR/9002/15", "Bethel Demissie"),
+    ("UGR/9003/15", "Chala Worku"),
+    ("UGR/9004/15", "Dawit Asefa"),
+    ("UGR/9005/15", "Eyerusalem Hailu"),   # will DROP CS101
+    ("UGR/9006/15", "Feven Mulu"),         # REGISTRATION_OPEN draft
+]
+_TB_DROPPER_INDEX = 4
+_TB_DRAFT_INDEX = 5
+
+TB_SECTION_B_STUDENTS = [
+    ("UGR/9011/15", "Genet Aklilu"),
+    ("UGR/9012/15", "Hana Yonas"),
+    ("UGR/9013/15", "Ibrahim Mohammed"),
+    ("UGR/9014/15", "Jemberu Kassa"),
+    ("UGR/9015/15", "Kalkidan Tadesse"),   # will ADD CS101 from A
+]
+_TB_MOVER_INDEX = 4
+
+
+async def _tb_ensure_term(session: AsyncSession) -> AcademicTerm:
+    existing = (
+        await session.execute(
+            select(AcademicTerm).where(
+                AcademicTerm.term_name == TB_TERM_NAME,
+                AcademicTerm.phase == AcademicPhase.ONE,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    term = AcademicTerm(
+        id=_uid_tb("term", TB_TERM_NAME),
+        term_name=TB_TERM_NAME,
+        phase=AcademicPhase.ONE,
+        start_date=date(2026, 9, 1),
+        end_date=date(2027, 1, 31),
+        is_open=True,
+        description="Track B PR 1 manual-test demo term.",
+    )
+    session.add(term)
+    await session.flush()
+    return term
+
+
+async def _tb_ensure_course(
+    session: AsyncSession, *, code: str, title: str, credits: int,
+) -> Course:
+    existing = (
+        await session.execute(select(Course).where(Course.code == code))
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    course = Course(
+        id=_uid_tb("course", code),
+        code=code,
+        title=title,
+        credit_hours=credits,
+        semester=TB_SEMESTER,
+        department=TB_DEPARTMENT,
+        description=f"{title} — Track B demo course.",
+    )
+    session.add(course)
+    await session.flush()
+    return course
+
+
+async def _tb_ensure_instructor(session: AsyncSession) -> Instructor:
+    existing = (
+        await session.execute(
+            select(Instructor).where(
+                Instructor.instructor_id == TB_INSTRUCTOR_STAFF_ID
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    slug = TB_INSTRUCTOR_STAFF_ID.lower().replace("/", "-")
+    user = await _ensure_user(
+        session,
+        email=f"{slug}@aau.edu.et",
+        first_name=TB_INSTRUCTOR_FIRST,
+        last_name=TB_INSTRUCTOR_LAST,
+        role=UserRole.INSTRUCTOR,
+        user_uid=_uid_tb("user", "instructor", TB_INSTRUCTOR_STAFF_ID),
+    )
+    instructor = Instructor(
+        id=_uid_tb("instructor", TB_INSTRUCTOR_STAFF_ID),
+        user_id=user.id,
+        instructor_id=TB_INSTRUCTOR_STAFF_ID,
+        department=TB_DEPARTMENT,
+    )
+    session.add(instructor)
+    await session.flush()
+    return instructor
+
+
+async def _tb_ensure_department_head(
+    session: AsyncSession,
+) -> CourseManagementOfficer:
+    existing = (
+        await session.execute(
+            select(CourseManagementOfficer).where(
+                CourseManagementOfficer.staff_id == TB_DH_STAFF_ID,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    slug = TB_DH_STAFF_ID.lower().replace("/", "-")
+    user = await _ensure_user(
+        session,
+        email=f"{slug}@aau.edu.et",
+        first_name=TB_DH_FIRST,
+        last_name=TB_DH_LAST,
+        role=UserRole.REGISTRAR_OFFICER,
+        user_uid=_uid_tb("user", "officer", TB_DH_STAFF_ID),
+    )
+    officer = CourseManagementOfficer(
+        id=_uid_tb("officer", TB_DH_STAFF_ID),
+        user_id=user.id,
+        staff_id=TB_DH_STAFF_ID,
+        role=OfficerRole.DEPARTMENT_HEAD,
+        authorization_level=5,
+    )
+    session.add(officer)
+    await session.flush()
+    return officer
+
+
+async def _tb_ensure_instructor_assignment(
+    session: AsyncSession,
+    *,
+    instructor: Instructor,
+    course: Course,
+    term: AcademicTerm,
+) -> InstructorAssignment:
+    existing = (
+        await session.execute(
+            select(InstructorAssignment).where(
+                InstructorAssignment.instructor_id == instructor.id,
+                InstructorAssignment.course_id == course.id,
+                InstructorAssignment.term_id == term.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    assignment = InstructorAssignment(
+        id=_uid_tb(
+            "assignment", str(instructor.id), str(course.id), str(term.id),
+        ),
+        instructor_id=instructor.id,
+        course_id=course.id,
+        term_id=term.id,
+    )
+    session.add(assignment)
+    await session.flush()
+    return assignment
+
+
+async def _tb_ensure_section(
+    session: AsyncSession,
+    *,
+    term: AcademicTerm,
+    section_code: str,
+    capacity: int = 30,
+) -> Section:
+    existing = (
+        await session.execute(
+            select(Section).where(
+                Section.term_id == term.id,
+                Section.department == TB_DEPARTMENT,
+                Section.semester == TB_SEMESTER,
+                Section.section_code == section_code,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    section = Section(
+        id=_uid_tb(
+            "section", str(term.id), TB_DEPARTMENT,
+            str(TB_SEMESTER), section_code,
+        ),
+        term_id=term.id,
+        department=TB_DEPARTMENT,
+        semester=TB_SEMESTER,
+        section_code=section_code,
+        capacity=capacity,
+        enrolled_count=0,
+    )
+    session.add(section)
+    await session.flush()
+    return section
+
+
+async def _tb_ensure_slot(
+    session: AsyncSession,
+    *,
+    section: Section,
+    course: Course,
+    instructor: Instructor,
+    day_of_week: str,
+    start_hour: int,
+    end_hour: int,
+    room: str,
+) -> ClassScheduleSlot:
+    existing = (
+        await session.execute(
+            select(ClassScheduleSlot).where(
+                ClassScheduleSlot.section_id == section.id,
+                ClassScheduleSlot.day_of_week == day_of_week,
+                ClassScheduleSlot.start_time == time(start_hour, 0),
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    slot = ClassScheduleSlot(
+        id=_uid_tb(
+            "slot",
+            str(section.id), str(course.id),
+            day_of_week, str(start_hour),
+        ),
+        section_id=section.id,
+        course_id=course.id,
+        instructor_id=instructor.id,
+        day_of_week=day_of_week,
+        start_time=time(start_hour, 0),
+        end_time=time(end_hour, 0),
+        room=room,
+    )
+    session.add(slot)
+    await session.flush()
+    return slot
+
+
+async def _tb_ensure_student(
+    session: AsyncSession,
+    *,
+    student_id: str,
+    full_name: str,
+) -> Student:
+    existing = (
+        await session.execute(
+            select(Student).where(Student.student_id == student_id)
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    slug = student_id.lower().replace("/", "-")
+    first, *rest = full_name.split(" ", 1)
+    last = rest[0] if rest else "."
+    user = await _ensure_user(
+        session,
+        email=f"{slug}@aau.edu.et",
+        first_name=first,
+        last_name=last,
+        role=UserRole.STUDENT,
+        user_uid=_uid_tb("user", "student", student_id),
+    )
+    student = Student(
+        id=_uid_tb("student", student_id),
+        user_id=user.id,
+        student_id=student_id,
+        full_name=full_name,
+        current_semester=TB_SEMESTER,
+        department=TB_DEPARTMENT,
+        sponsorship_type=SponsorshipType.GOVERNMENT,
+        enrollment_status=EnrollmentStatus.ACTIVE,
+    )
+    session.add(student)
+    await session.flush()
+    return student
+
+
+async def _tb_ensure_registration(
+    session: AsyncSession,
+    *,
+    student: Student,
+    term: AcademicTerm,
+    section: Section,
+    status_: RegistrationStatus,
+) -> Registration:
+    existing = (
+        await session.execute(
+            select(Registration).where(
+                Registration.student_id == student.id,
+                Registration.term_id == term.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        if existing.section_id != section.id:
+            existing.section_id = section.id
+        if existing.status != status_:
+            existing.status = status_
+        await session.flush()
+        return existing
+    registration = Registration(
+        id=_uid_tb("registration", str(student.id), str(term.id)),
+        student_id=student.id,
+        term_id=term.id,
+        section_id=section.id,
+        status=status_,
+        sponsorship_type=SponsorshipType.GOVERNMENT,
+        finalised_at=datetime.now(timezone.utc)
+        if status_ == RegistrationStatus.REGISTERED
+        else None,
+    )
+    session.add(registration)
+    await session.flush()
+    return registration
+
+
+async def _tb_ensure_registration_course(
+    session: AsyncSession,
+    *,
+    registration: Registration,
+    course: Course,
+    is_dropped: bool,
+) -> RegistrationCourse:
+    existing = (
+        await session.execute(
+            select(RegistrationCourse).where(
+                RegistrationCourse.registration_id == registration.id,
+                RegistrationCourse.course_id == course.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        if existing.is_dropped != is_dropped:
+            existing.is_dropped = is_dropped
+            await session.flush()
+        return existing
+    rc = RegistrationCourse(
+        id=_uid_tb(
+            "registration-course",
+            str(registration.id), str(course.id),
+        ),
+        registration_id=registration.id,
+        course_id=course.id,
+        is_dropped=is_dropped,
+    )
+    session.add(rc)
+    await session.flush()
+    return rc
+
+
+async def _tb_ensure_schedule_addition(
+    session: AsyncSession,
+    *,
+    registration: Registration,
+    slot: ClassScheduleSlot,
+    course: Course,
+    source_section: Section,
+) -> StudentScheduleAddition:
+    existing = (
+        await session.execute(
+            select(StudentScheduleAddition).where(
+                StudentScheduleAddition.registration_id == registration.id,
+                StudentScheduleAddition.schedule_slot_id == slot.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    addition = StudentScheduleAddition(
+        id=_uid_tb(
+            "schedule-addition",
+            str(registration.id), str(slot.id),
+        ),
+        registration_id=registration.id,
+        schedule_slot_id=slot.id,
+        course_id=course.id,
+        source_section_id=source_section.id,
+    )
+    session.add(addition)
+    await session.flush()
+    return addition
+
+
+async def _seed_track_b_roster(session: AsyncSession) -> None:
+    """Build the Track B PR 1 demo scenario end-to-end. Idempotent."""
+    print(">> Track B PR 1 — roster seed")
+
+    term = await _tb_ensure_term(session)
+    print(f"   term:          {term.term_name} ({term.id})")
+
+    course = await _tb_ensure_course(
+        session, code=TB_COURSE_CODE,
+        title=TB_COURSE_TITLE, credits=TB_COURSE_CREDITS,
+    )
+    secondary_course = await _tb_ensure_course(
+        session, code=TB_SECONDARY_COURSE_CODE,
+        title=TB_SECONDARY_COURSE_TITLE, credits=TB_SECONDARY_COURSE_CREDITS,
+    )
+
+    instructor = await _tb_ensure_instructor(session)
+    print(f"   instructor:    {TB_INSTRUCTOR_FIRST} {TB_INSTRUCTOR_LAST}")
+    print(f"                  login: staff-9991-15@aau.edu.et / password123")
+
+    dh = await _tb_ensure_department_head(session)
+    print(f"   dept head:     {TB_DH_FIRST} {TB_DH_LAST}")
+    print(f"                  login: reg-9999-15@aau.edu.et / password123")
+
+    await _tb_ensure_instructor_assignment(
+        session, instructor=instructor, course=course, term=term,
+    )
+
+    section_a = await _tb_ensure_section(
+        session, term=term, section_code="A", capacity=30,
+    )
+    section_b = await _tb_ensure_section(
+        session, term=term, section_code="B", capacity=30,
+    )
+
+    # CS101 slots: instructor teaches in both A and B.
+    slot_a_cs101 = await _tb_ensure_slot(
+        session,
+        section=section_a, course=course, instructor=instructor,
+        day_of_week="MON", start_hour=9, end_hour=10, room="LAB-1",
+    )
+    await _tb_ensure_slot(
+        session,
+        section=section_a, course=course, instructor=instructor,
+        day_of_week="WED", start_hour=9, end_hour=10, room="LAB-1",
+    )
+    await _tb_ensure_slot(
+        session,
+        section=section_a, course=course, instructor=instructor,
+        day_of_week="FRI", start_hour=9, end_hour=10, room="LAB-1",
+    )
+    await _tb_ensure_slot(
+        session,
+        section=section_b, course=course, instructor=instructor,
+        day_of_week="TUE", start_hour=11, end_hour=12, room="LAB-2",
+    )
+    await _tb_ensure_slot(
+        session,
+        section=section_b, course=course, instructor=instructor,
+        day_of_week="THU", start_hour=11, end_hour=12, room="LAB-2",
+    )
+    # MATH101 slot in Section A — verifies GET /me/sections returns
+    # two (section, course) pairs for Section A rather than collapsing.
+    await _tb_ensure_slot(
+        session,
+        section=section_a, course=secondary_course, instructor=instructor,
+        day_of_week="TUE", start_hour=14, end_hour=15, room="LAB-1",
+    )
+
+    # Section A students — one drops, one is draft, rest are originals.
+    for i, (student_id, full_name) in enumerate(TB_SECTION_A_STUDENTS):
+        student = await _tb_ensure_student(
+            session, student_id=student_id, full_name=full_name,
+        )
+        if i == _TB_DRAFT_INDEX:
+            reg = await _tb_ensure_registration(
+                session, student=student, term=term, section=section_a,
+                status_=RegistrationStatus.REGISTRATION_OPEN,
+            )
+            await _tb_ensure_registration_course(
+                session, registration=reg, course=course, is_dropped=False,
+            )
+        else:
+            reg = await _tb_ensure_registration(
+                session, student=student, term=term, section=section_a,
+                status_=RegistrationStatus.REGISTERED,
+            )
+            dropped = (i == _TB_DROPPER_INDEX)
+            await _tb_ensure_registration_course(
+                session, registration=reg, course=course, is_dropped=dropped,
+            )
+
+    # Section B students — one moves CS101 to Section A.
+    for i, (student_id, full_name) in enumerate(TB_SECTION_B_STUDENTS):
+        student = await _tb_ensure_student(
+            session, student_id=student_id, full_name=full_name,
+        )
+        reg = await _tb_ensure_registration(
+            session, student=student, term=term, section=section_b,
+            status_=RegistrationStatus.REGISTERED,
+        )
+        if i == _TB_MOVER_INDEX:
+            await _tb_ensure_registration_course(
+                session, registration=reg, course=course, is_dropped=True,
+            )
+            await _tb_ensure_schedule_addition(
+                session,
+                registration=reg, slot=slot_a_cs101,
+                course=course, source_section=section_a,
+            )
+        else:
+            await _tb_ensure_registration_course(
+                session, registration=reg, course=course, is_dropped=False,
+            )
+
+    await session.commit()
+    print("✅ Track B PR 1 roster seeded (Section A: 4 originals + 1 added; "
+          "Section B: 4 originals).")
+
+
+# ══════════════════════════════════════════════════════════════
+#  Final state summary (was: migrate_terms_to_ethiopian_phases.py)
+# ══════════════════════════════════════════════════════════════
+
+
+async def _print_term_state(session: AsyncSession) -> None:
+    """Print the current set of AcademicTerm rows, ordered by start date."""
+    print()
+    print("─" * 58)
+    print("Final academic-term state:")
+    rows = (
+        await session.execute(
+            select(AcademicTerm)
+            .where(AcademicTerm.is_deleted == False)  # noqa: E712
+            .order_by(AcademicTerm.start_date.asc())
+        )
+    ).scalars().all()
+    for r in rows:
+        flag = "OPEN " if r.is_open else "     "
+        print(
+            f"  [{flag}] {r.term_name}  phase={r.phase.value:<3}  "
+            f"{r.start_date.isoformat()} → {r.end_date.isoformat()}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+#  Runner
+# ══════════════════════════════════════════════════════════════
+
+
 async def seed() -> None:
     engine = create_async_engine(DATABASE_URL, echo=False)
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async_session = sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False,
+    )
 
     async with async_session() as session:
         terms = await _seed_terms(session)
         courses_by_code = await _seed_courses(session)
+        await _seed_extra_se_sem1_courses(session, courses_by_code)
         await _seed_prerequisites(session, courses_by_code)
         await _seed_classrooms(session)
         instructors = await _seed_instructors(session)
-        # Each term gets its own offerings + sections — a student
-        # registered in Fall 2026 cannot accidentally sit in a Spring
-        # 2027 section.
         for term in terms:
             await _seed_instructor_assignments(
                 session, term, courses_by_code, instructors,
             )
         await _seed_students(session)
         await _seed_officers(session)
-        # Sample registrations live under the currently-open term so
-        # the demo data is reachable from /courses/me/* without an
-        # officer first opening a window.
+
         open_term = next((t for t in terms if t.is_open), terms[0])
         await _seed_registrations(session, open_term, courses_by_code)
         await _seed_bulk_se_sem1_cohort(session, open_term, courses_by_code)
         await _seed_bulk_se_upper_year_cohorts(
             session, open_term, courses_by_code,
         )
-        # Backfill prior-semester grades so the advisory consult
-        # endpoints have CGPA + completed-course history to reason
-        # over without the caller providing anything.
+
         await _seed_grades(session, terms, courses_by_code)
-        # Track C — make the earliest term browsable in the standing
-        # flow by giving it a cohort Section + Registrations for the
-        # students whose grades already live in that term.
         await _seed_standing_demo_cohort(session, terms)
 
+        # Track B PR 1 demo — fully self-contained scenario in its own term.
+        await _seed_track_b_roster(session)
+
+        # Final summary so it's obvious which terms ended up in the DB.
+        await _print_term_state(session)
+
     await engine.dispose()
-    print("\n🎉 Course Management seed complete (Phase 0 + Track A samples).")
+    print(
+        "\n🎉 Course Management seed complete "
+        "(Phase 0 + Track A samples + Track B roster + extras)."
+    )
 
 
 if __name__ == "__main__":
