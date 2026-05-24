@@ -24,6 +24,8 @@ def run_credential_lookup(
     admission_number: str,
     student_name: str,
     moe_full_name: Optional[str],
+    applicant_stream: Optional[str] = None,
+    moe_stream: Optional[str] = None,
 ) -> CredentialLookupResult:
     """Cross-check applicant identity against MoE data using admission number."""
     issues: list[str] = []
@@ -75,6 +77,45 @@ def run_credential_lookup(
                     "step_name": "name_cross_check",
                     "reasoning_log": (
                         f"FAIL: '{student_name}' does not match '{moe_full_name}'"
+                    ),
+                }
+            )
+
+        # ── Stream cross-check ──
+        # Mirrors the name check: if the applicant declared a different
+        # stream than their MoE record, flag so an officer can ask for a
+        # correction (student then updates via the CHANGES_REQUESTED flow).
+        if applicant_stream and moe_stream:
+            if applicant_stream.upper() == moe_stream.upper():
+                traces.append(
+                    {
+                        "step_name": "stream_cross_check",
+                        "reasoning_log": (
+                            f"OK: Stream '{applicant_stream}' matches MoE stream '{moe_stream}'"
+                        ),
+                    }
+                )
+            else:
+                issues.append(
+                    f"Stream mismatch: application has '{applicant_stream}' "
+                    f"but MoE has '{moe_stream}'"
+                )
+                traces.append(
+                    {
+                        "step_name": "stream_cross_check",
+                        "reasoning_log": (
+                            f"FAIL: applicant stream '{applicant_stream}' does not "
+                            f"match MoE stream '{moe_stream}'"
+                        ),
+                    }
+                )
+        elif applicant_stream and not moe_stream:
+            traces.append(
+                {
+                    "step_name": "stream_cross_check",
+                    "reasoning_log": (
+                        f"SKIP: applicant stream '{applicant_stream}' present but "
+                        "MoE record has no stream value"
                     ),
                 }
             )

@@ -337,6 +337,9 @@ class ApplicationService:
         if data.last_name and data.last_name != applicant.last_name:
             applicant.last_name = data.last_name
             updated_fields.append("last_name")
+        if data.stream and data.stream != application.stream:
+            application.stream = data.stream
+            updated_fields.append("stream")
 
         if not updated_fields:
             raise MissingPrerequisiteError("No effective changes detected to update")
@@ -969,11 +972,15 @@ class ApplicationService:
 
         student_name = f"{applicant.first_name} {applicant.last_name}".strip().upper()
         moe_full_name = moe_record.full_name.strip().upper() if moe_record else None
+        moe_stream = moe_record.stream.value if moe_record else None
+        applicant_stream = application.stream.value if application.stream else None
 
         result = run_credential_lookup(
             admission_number=application.admission_number,
             student_name=student_name,
             moe_full_name=moe_full_name,
+            applicant_stream=applicant_stream,
+            moe_stream=moe_stream,
         )
 
         evaluation = AIEvaluation(
