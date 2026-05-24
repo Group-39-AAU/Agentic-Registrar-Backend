@@ -301,13 +301,25 @@ async def register_me(
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
     except ComplianceCheckFailedError as exc:
-        # ComplianceCheckFailedError carries .payload (the structured
-        # agent verdict), not .detail. Surface the payload so the
-        # student can see *why* their courses were rejected.
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=exc.payload,
-        )
+        # Stitch the agent's per-check reasons into one human-readable
+        # string. The exception carries the full structured payload on
+        # ``exc.payload`` (prereq_results / load_result / payment_result),
+        # each with a ``reasons`` list of plain-language strings.
+        reasons: list[str] = []
+        payload = exc.payload or {}
+        for prereq in payload.get("prereq_results", []) or []:
+            if not prereq.get("passed", True):
+                reasons.extend(prereq.get("reasons", []) or [])
+        for key in ("load_result", "payment_result"):
+            result = payload.get(key) or {}
+            if not result.get("passed", True):
+                reasons.extend(result.get("reasons", []) or [])
+        # Use "\n" as the separator — individual reason strings can
+        # contain semicolons (e.g. "Payment outstanding for 10 course(s);
+        # registration cannot be finalised until settled."), so the
+        # frontend needs an unambiguous splitter to render bullets.
+        detail = "\n".join(r for r in reasons if r) or str(exc)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail)
     return RegistrationSubmitResponse(
         registration=registration, compliance=compliance,
     )
