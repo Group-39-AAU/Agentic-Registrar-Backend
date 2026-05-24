@@ -573,23 +573,34 @@ class LLMClient:
             ) from exc
 
         raw_text = _extract_text(response)
+        finish_reason = _extract_finish_reason(response)
         if not raw_text:
             raise LLMUnavailableError(
-                "Gemini returned an empty response body."
+                f"Gemini returned an empty response body "
+                f"(finish_reason={finish_reason or 'unknown'})."
             )
+        cleaned = _strip_json_fences(raw_text)
         try:
-            return json.loads(raw_text)
+            return json.loads(cleaned)
         except json.JSONDecodeError as exc:
             logger.warning(
                 "advisory_consult_llm_invalid_json",
                 extra={
                     "agent_layer": "advisory_consult",
+                    "finish_reason": finish_reason,
                     "raw_excerpt": raw_text[:500],
                 },
             )
+            if finish_reason == "MAX_TOKENS":
+                raise LLMUnavailableError(
+                    "Gemini truncated the response at the token cap "
+                    f"({self._max_tokens}). Increase "
+                    "ADVISORY_LLM_MAX_TOKENS and retry."
+                ) from exc
             raise LLMUnavailableError(
                 "Gemini response was not valid JSON despite "
-                "structured-output mode."
+                f"structured-output mode (finish_reason="
+                f"{finish_reason or 'unknown'})."
             ) from exc
 
 
@@ -673,24 +684,35 @@ class LLMClient:
             ) from exc
 
         raw_text = _extract_text(response)
+        finish_reason = _extract_finish_reason(response)
         print(f"LLM Response:\n{raw_text}")
         if not raw_text:
             raise LLMUnavailableError(
-                "Gemini returned an empty response body."
+                f"Gemini returned an empty response body "
+                f"(finish_reason={finish_reason or 'unknown'})."
             )
+        cleaned = _strip_json_fences(raw_text)
         try:
-            return json.loads(raw_text)
+            return json.loads(cleaned)
         except json.JSONDecodeError as exc:
             logger.warning(
                 "grading_review_llm_invalid_json",
                 extra={
                     "agent_layer": "grading_review",
+                    "finish_reason": finish_reason,
                     "raw_excerpt": raw_text[:500],
                 },
             )
+            if finish_reason == "MAX_TOKENS":
+                raise LLMUnavailableError(
+                    "Gemini truncated the response at the token cap "
+                    f"({self._max_tokens}). Increase "
+                    "ADVISORY_LLM_MAX_TOKENS and retry."
+                ) from exc
             raise LLMUnavailableError(
                 "Gemini response was not valid JSON despite "
-                "structured-output mode."
+                f"structured-output mode (finish_reason="
+                f"{finish_reason or 'unknown'})."
             ) from exc
 
 
@@ -714,6 +736,43 @@ def _extract_text(response: Any) -> Optional[str]:
                 parts.append(t)
     joined = "".join(parts).strip()
     return joined or None
+
+
+def _extract_finish_reason(response: Any) -> Optional[str]:
+    """
+    Return the first candidate's ``finish_reason`` as a string (or
+    ``None`` if absent). Used to distinguish a truncated MAX_TOKENS
+    response from genuinely malformed model output.
+    """
+    candidates = getattr(response, "candidates", None) or []
+    for cand in candidates:
+        reason = getattr(cand, "finish_reason", None)
+        if reason is None:
+            continue
+        # google-genai exposes finish_reason as an Enum; .name is the
+        # canonical string (e.g. "STOP", "MAX_TOKENS", "SAFETY").
+        name = getattr(reason, "name", None)
+        return name if name else str(reason)
+    return None
+
+
+def _strip_json_fences(text: str) -> str:
+    """
+    Strip a leading/trailing ```json ... ``` markdown fence if the
+    model emitted one despite ``response_mime_type="application/json"``.
+    Idempotent on already-clean payloads.
+    """
+    s = text.strip()
+    if s.startswith("```"):
+        # Drop the opening fence (``` or ```json) up to the next newline.
+        newline_idx = s.find("\n")
+        if newline_idx != -1:
+            s = s[newline_idx + 1 :]
+        else:
+            s = s.lstrip("`").lstrip("json").lstrip()
+    if s.endswith("```"):
+        s = s[: -len("```")].rstrip()
+    return s
 
 
 def build_default_llm_client() -> Optional[LLMClient]:

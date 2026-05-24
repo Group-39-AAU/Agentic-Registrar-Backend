@@ -46,8 +46,21 @@ class Settings(BaseSettings):
     # which comfortably covers final-year project demos.
     GEMINI_API_KEY: str = ""
     ADVISORY_LLM_MODEL: str = "gemini-2.5-flash-lite"
-    ADVISORY_LLM_TIMEOUT_SECONDS: float = 5.0
-    ADVISORY_LLM_MAX_TOKENS: int = 600
+    # Covers both the (fast) advisory narration call and the (slower)
+    # JSON-mode consult call. JSON-schema-constrained Gemini calls
+    # routinely take 15–25 s on cold paths, so 10 s used to surface as
+    # "Advisory LLM call timed out after 10.0s" during /consult flows.
+    # Override per-environment via the ADVISORY_LLM_TIMEOUT_SECONDS env
+    # var if your network/model latency demands more.
+    ADVISORY_LLM_TIMEOUT_SECONDS: float = 45.0
+    # 600 was too tight for the consult schema — verdict + risk_status +
+    # an array of recommended_courses + warnings + graduation_impact +
+    # a 3–6 sentence narrative routinely runs 700–1100 tokens. When the
+    # cap was hit the response truncated mid-string and ``json.loads``
+    # raised ``Gemini response was not valid JSON``. 2048 covers verbose
+    # consult outputs with room to spare; override via env var if you
+    # want to clamp costs.
+    ADVISORY_LLM_MAX_TOKENS: int = 2048
 
     # ── Tuition / cost-sharing pricing ───────────────────
     # Self-sponsored students pay this many birr per credit hour
