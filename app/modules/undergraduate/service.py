@@ -69,7 +69,11 @@ from app.modules.undergraduate.schemas import (
     ProgramChoiceSummary,
 )
 from app.modules.testing_center.models import UATRecord
-from app.shared.email import EmailService, build_uat_acceptance_email
+from app.shared.email import (
+    EmailService,
+    build_changes_requested_email,
+    build_uat_acceptance_email,
+)
 from app.shared.audit.models import SystemAuditLog
 from app.shared.enums import (
     ApplicationStatus,
@@ -664,6 +668,7 @@ class ApplicationService:
         data: FlagResolutionRequest,
         actor_id: uuid.UUID,
         actor_role: UserRole,
+        email_service: Optional[EmailService] = None,
     ) -> UndergraduateApplication:
         application = await self._app_repo.get_by_id(application_id)
         if application is None:
@@ -694,6 +699,11 @@ class ApplicationService:
                 actor_id=actor_id,
                 actor_role=actor_role,
                 trigger_reason=trigger,
+            )
+            await self._notify_student_changes_requested(
+                application=application,
+                officer_note=data.resolution_note,
+                email_service=email_service,
             )
         elif data.action == "ESCALATE_TO_PENDING_REVIEW":
             await self._transition_status(
@@ -1044,6 +1054,43 @@ class ApplicationService:
                 actor_id=application.applicant_id,
                 actor_role=UserRole.AGENT,
                 trigger_reason=f"Credential Verification: FLAGGED - {result.summary}",
+            )
+
+    async def _notify_student_changes_requested(
+        self,
+        *,
+        application: UndergraduateApplication,
+        officer_note: str,
+        email_service: Optional[EmailService],
+    ) -> None:
+        """Best-effort: email the applicant the officer's correction request."""
+        if email_service is None:
+            return
+
+        user_result = await self._db.execute(
+            select(UserModel).where(UserModel.id == application.applicant_id)
+        )
+        applicant = user_result.scalar_one_or_none()
+        if applicant is None or not applicant.email:
+            logger.warning(
+                "Skip changes-requested email: applicant or email missing application_id=%s",
+                application.id,
+            )
+            return
+
+        try:
+            await email_service.send(
+                build_changes_requested_email(
+                    to_email=applicant.email,
+                    first_name=applicant.first_name,
+                    application_id=str(application.id),
+                    officer_note=officer_note,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Changes-requested email failed application_id=%s",
+                application.id,
             )
 
     # ── Trilogy of Persistence (private) ──────────────────────

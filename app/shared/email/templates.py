@@ -103,6 +103,96 @@ def build_portal_credentials_email(
     )
 
 
+def build_changes_requested_email(
+    to_email: EmailStr,
+    first_name: str,
+    application_id: str,
+    officer_note: str,
+    *,
+    correction_url: str | None = None,
+) -> EmailMessage:
+    """
+    Sent when a registrar officer resolves a flagged application with
+    REQUEST_STUDENT_CORRECTION. Carries the officer's note verbatim plus a
+    link the student can follow to log in and update their application.
+    """
+    app_name = settings.APP_NAME
+    base = settings.PUBLIC_APP_BASE_URL.rstrip("/")
+    correction_url = correction_url or f"{base}/admissions/my-admissions/{application_id}"
+
+    # Light HTML-escape on the officer note so quotes/<>& don't break the layout.
+    safe_note = (
+        officer_note.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br>")
+    )
+
+    html_body = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background-color:#f4f6f8;font-family:Georgia,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f4f6f8;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(15,23,42,0.08);">
+        <tr><td style="background:linear-gradient(135deg,#7c2d12 0%,#b45309 100%);padding:28px 32px;text-align:center;">
+          <p style="margin:0;color:#fde68a;font-size:13px;letter-spacing:0.12em;text-transform:uppercase;">{app_name}</p>
+          <h1 style="margin:12px 0 0;color:#ffffff;font-size:22px;font-weight:600;">Action required on your application</h1>
+        </td></tr>
+        <tr><td style="padding:28px 32px 8px;color:#1e293b;font-size:16px;line-height:1.6;">
+          <p style="margin:0 0 16px;">Hi {first_name},</p>
+          <p style="margin:0 0 16px;">A registrar officer has reviewed your undergraduate application and needs you to provide additional information or corrections before it can move forward.</p>
+          <p style="margin:0 0 12px;font-weight:600;color:#0f172a;">Message from the registrar's office</p>
+          <p style="margin:0 0 20px;padding:14px 16px;background:#fef3c7;border-left:4px solid #b45309;border-radius:0 8px 8px 0;color:#78350f;font-size:15px;">{safe_note}</p>
+          <p style="margin:0 0 12px;font-weight:600;color:#0f172a;">What to do next</p>
+          <ol style="margin:0 0 20px 20px;padding:0;color:#475569;font-size:15px;">
+            <li style="margin:0 0 6px;">Sign in to the admissions portal using the account you applied with.</li>
+            <li style="margin:0 0 6px;">Open the application referenced below and review the officer's message.</li>
+            <li style="margin:0 0 6px;">Update the requested fields and resubmit. Your application will be re-verified automatically.</li>
+          </ol>
+          <p style="margin:0 0 12px;font-weight:600;color:#0f172a;">Application reference</p>
+          <p style="margin:0 0 20px;padding:12px 16px;background:#f1f5f9;border-radius:8px;font-family:ui-monospace,monospace;font-size:14px;color:#1d4ed8;">{application_id}</p>
+        </td></tr>
+        <tr><td style="padding:0 32px 32px;text-align:center;">
+          <a href="{correction_url}" style="display:inline-block;padding:14px 32px;background:#b45309;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;border-radius:999px;">Update my application</a>
+          <p style="margin:16px 0 0;font-size:12px;color:#94a3b8;">If the button does not work, copy this link into your browser:<br><span style="word-break:break-all;color:#64748b;">{correction_url}</span></p>
+        </td></tr>
+        <tr><td style="padding:16px 32px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;line-height:1.5;text-align:center;">
+          Your application will remain paused until you submit the requested changes. If you have questions, contact the admissions office.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    text_body = (
+        f"Hi {first_name},\n\n"
+        "A registrar officer has reviewed your undergraduate application and "
+        "needs you to provide additional information or corrections before it "
+        "can move forward.\n\n"
+        "Message from the registrar's office:\n"
+        f"{officer_note}\n\n"
+        "What to do next:\n"
+        "  1. Sign in to the admissions portal using the account you applied with.\n"
+        "  2. Open the application referenced below and review the officer's message.\n"
+        "  3. Update the requested fields and resubmit. Your application will be "
+        "re-verified automatically.\n\n"
+        f"Application reference: {application_id}\n\n"
+        f"Update your application: {correction_url}\n\n"
+        "Your application will remain paused until you submit the requested changes.\n\n"
+        f"— {app_name}"
+    )
+
+    return EmailMessage(
+        to_email=to_email,
+        subject="Action required: more information needed for your application",
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+
 def build_uat_acceptance_email(
     to_email: EmailStr,
     first_name: str,

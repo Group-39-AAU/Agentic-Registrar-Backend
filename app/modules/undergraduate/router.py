@@ -449,6 +449,7 @@ async def resolve_flag(
     data: FlagResolutionRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    email_service: EmailService = Depends(get_email_service),
 ):
     """Resolve a flagged case and route it back into the pipeline."""
     _officer_admin_only(current_user)
@@ -459,6 +460,7 @@ async def resolve_flag(
             data=data,
             actor_id=current_user.id,
             actor_role=current_user.role,
+            email_service=email_service,
         )
     except (EntityNotFoundError, InvalidStateTransitionError, MissingPrerequisiteError) as e:
         _handle_domain_error(e)
