@@ -25,12 +25,22 @@ class EnrollmentResponse(BaseModel):
     created_at: datetime
 
 
+class OnboardingOutcome(BaseModel):
+    """Per-student onboarding result captured during /enrollment/run."""
+    application_id: uuid.UUID
+    university_id: str
+    onboarded: bool
+    detail: Optional[str] = None
+
+
 class EnrollmentRunResponse(BaseModel):
     """Response after running enrollment batch."""
     enrolled_count: int
     skipped_count: int
+    onboarded_count: int = 0
     message: str
     enrollments: list[EnrollmentResponse]
+    onboarding_outcomes: list[OnboardingOutcome] = []
 
 
 class EnrollmentListResponse(BaseModel):
