@@ -7,6 +7,19 @@ from pydantic import EmailStr
 from app.core.config import settings
 from app.shared.email.schemas import EmailMessage
 
+# Public-facing university brand used in outbound applicant-facing email.
+# Kept separate from settings.APP_NAME (which is the internal system name)
+# so applicants see the institution, not the software product.
+_UNIVERSITY_NAME = "Addis Ababa University"
+_UNIVERSITY_TAGLINE = "Office of the Registrar"
+
+
+def _university_logo_url() -> str:
+    """Public URL for the AAU emblem, served by the backend static mount."""
+    base = settings.PUBLIC_APP_BASE_URL.rstrip("/")
+    return f"{base}/static/email/aau-logo.png"
+
+
 # Placeholder copy for in-person UAT until scheduling is integrated.
 _UAT_VENUE_PLACEHOLDER = (
     "Main Campus — Admissions Building, Room 101<br>"
@@ -20,17 +33,66 @@ _UAT_TIME_PLACEHOLDER = (
 
 def build_welcome_email(to_email: EmailStr, first_name: str) -> EmailMessage:
     """Build the default welcome email for newly registered users."""
+    logo_url = _university_logo_url()
+    portal_url = settings.PUBLIC_APP_BASE_URL.rstrip("/")
+
+    html_body = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome to {_UNIVERSITY_NAME}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f4f6f8;font-family:Georgia,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f4f6f8;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(15,23,42,0.08);">
+        <tr><td style="background:linear-gradient(135deg,#0f3d7a 0%,#1d4ed8 100%);padding:32px 32px 28px;text-align:center;">
+          <img src="{logo_url}" alt="{_UNIVERSITY_NAME}" width="84" height="84" style="display:block;margin:0 auto 14px;border:0;outline:none;text-decoration:none;background:#ffffff;border-radius:50%;padding:6px;">
+          <p style="margin:0;color:#dbeafe;font-size:12px;letter-spacing:0.18em;text-transform:uppercase;">{_UNIVERSITY_TAGLINE}</p>
+          <h1 style="margin:10px 0 0;color:#ffffff;font-size:24px;font-weight:600;line-height:1.3;">Welcome to {_UNIVERSITY_NAME}</h1>
+        </td></tr>
+        <tr><td style="padding:28px 32px 8px;color:#1e293b;font-size:16px;line-height:1.6;">
+          <p style="margin:0 0 16px;">Dear {first_name},</p>
+          <p style="margin:0 0 16px;">Your account with the <strong>{_UNIVERSITY_NAME}</strong> Registrar has been created successfully. You can now access the applicant portal to start or continue your admission journey.</p>
+          <p style="margin:0 0 16px;color:#475569;">From the portal you can:</p>
+          <ul style="margin:0 0 20px 20px;padding:0;color:#475569;font-size:15px;">
+            <li style="margin:0 0 6px;">Submit your undergraduate or graduate application.</li>
+            <li style="margin:0 0 6px;">Upload supporting academic documents.</li>
+            <li style="margin:0 0 6px;">Track the status of your application in real time.</li>
+            <li style="margin:0 0 6px;">Receive official notifications from the Registrar's office.</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:0 32px 32px;text-align:center;">
+          <a href="{portal_url}" style="display:inline-block;padding:14px 32px;background:#1d4ed8;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;border-radius:999px;">Open the applicant portal</a>
+        </td></tr>
+        <tr><td style="padding:16px 32px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;line-height:1.5;text-align:center;">
+          You are receiving this message because an account was created with this email address at {_UNIVERSITY_NAME}.<br>
+          If this wasn't you, please contact the Registrar's office.
+        </td></tr>
+      </table>
+      <p style="margin:16px 0 0;color:#94a3b8;font-size:11px;letter-spacing:0.05em;">&copy; {_UNIVERSITY_NAME} &middot; {_UNIVERSITY_TAGLINE}</p>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    text_body = (
+        f"Dear {first_name},\n\n"
+        f"Welcome to {_UNIVERSITY_NAME}.\n\n"
+        "Your account with the Registrar has been created successfully. "
+        "You can now log in to the applicant portal to submit your application, "
+        "upload supporting documents, and track your admission status.\n\n"
+        f"Portal: {portal_url}\n\n"
+        f"— {_UNIVERSITY_NAME}, {_UNIVERSITY_TAGLINE}"
+    )
+
     return EmailMessage(
         to_email=to_email,
-        subject="Welcome to Agentic Registrar",
-        html_body=(
-            f"<p>Hi {first_name},</p>"
-            "<p>Your account was created successfully.</p>"
-        ),
-        text_body=(
-            f"Hi {first_name},\n\n"
-            "Your account was created successfully."
-        ),
+        subject=f"Welcome to {_UNIVERSITY_NAME}",
+        html_body=html_body,
+        text_body=text_body,
     )
 
 
