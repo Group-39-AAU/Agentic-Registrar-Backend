@@ -101,25 +101,29 @@ class ApplicationRepository:
         limit: int = 50,
         offset: int = 0,
         admission_term_id: uuid.UUID,
+        current_status: ApplicationStatus | None = None,
     ) -> tuple[Sequence[UndergraduateApplication], int]:
         """Returns (items, total_count) for paginated listing for a term."""
+
+        base_filters = [
+            UndergraduateApplication.is_deleted == False,  # noqa: E712
+            UndergraduateApplication.admission_term_id == admission_term_id,
+        ]
+        if current_status is not None:
+            base_filters.append(
+                UndergraduateApplication.current_status == current_status,
+            )
 
         count_stmt = (
             select(func.count())
             .select_from(UndergraduateApplication)
-            .where(
-                UndergraduateApplication.is_deleted == False,  # noqa: E712
-                UndergraduateApplication.admission_term_id == admission_term_id,
-            )
+            .where(*base_filters)
         )
         total = (await self._db.execute(count_stmt)).scalar_one()
 
         items_stmt = (
             select(UndergraduateApplication)
-            .where(
-                UndergraduateApplication.is_deleted == False,  # noqa: E712
-                UndergraduateApplication.admission_term_id == admission_term_id,
-            )
+            .where(*base_filters)
             .order_by(UndergraduateApplication.created_at.desc())
             .limit(limit)
             .offset(offset)

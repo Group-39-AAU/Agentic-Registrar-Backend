@@ -163,24 +163,15 @@ async def list_students_for_review(
         None,
         description="Filter by latest AI recommended decision: RECOMMEND_ADMIT, RECOMMEND_REJECT, or RECOMMEND_WAITLIST",
     ),
-    status: Optional[ApplicationStatus] = Query(
-        None,
-        description=(
-            "Filter by application lifecycle status (e.g. PAYMENT_VERIFIED, "
-            "UAT_COMPLETED, FLAGGED_FOR_REVIEW, PENDING_REVIEW). Defaults to "
-            "PENDING_REVIEW when omitted."
-        ),
-    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Paginated list of students for officer review.
+    Paginated list of students awaiting officer review.
     Filtered by sponsorship type (self-sponsored or government).
-    Optionally filtered by the latest AI recommended decision and/or
-    by application lifecycle status.
+    Optionally filtered by the latest AI recommended decision.
     """
     _role_gate(current_user)
 
@@ -194,10 +185,8 @@ async def list_students_for_review(
             "ai_recommended_decision must be RECOMMEND_ADMIT, RECOMMEND_REJECT, or RECOMMEND_WAITLIST",
         )
 
-    effective_status = status if status is not None else ApplicationStatus.PENDING_REVIEW
-
     base_filter = [
-        UndergraduateApplication.current_status == effective_status,
+        UndergraduateApplication.current_status == ApplicationStatus.PENDING_REVIEW,
         UndergraduateApplication.is_deleted == False,  # noqa: E712
         UndergraduateApplication.sponsorship_type == sponsorship_type,
     ]

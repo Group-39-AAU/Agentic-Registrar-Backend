@@ -45,7 +45,7 @@ from app.modules.undergraduate.schemas import (
 )
 from app.modules.undergraduate.service import ApplicationService, DecisionService
 from app.shared.email import EmailService
-from app.shared.enums import UserRole
+from app.shared.enums import ApplicationStatus, UserRole
 
 router = APIRouter(prefix="/undergraduate", tags=["Undergraduate Admission"])
 
@@ -176,13 +176,23 @@ async def list_applications(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     term_id: uuid.UUID = Query(..., description="Admission term ID to filter by"),
+    status: ApplicationStatus | None = Query(
+        None,
+        description=(
+            "Optional application lifecycle status filter (e.g. PAYMENT_VERIFIED, "
+            "UAT_COMPLETED, FLAGGED_FOR_REVIEW, PENDING_REVIEW). When omitted, "
+            "applications in every status are returned."
+        ),
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List all applications (registrar/admin view)."""
     _officer_admin_only(current_user)
     svc = ApplicationService(db)
-    items, total = await svc.list_applications(limit=limit, offset=offset, term_id=term_id)
+    items, total = await svc.list_applications(
+        limit=limit, offset=offset, term_id=term_id, status=status,
+    )
     return ApplicationListResponse(items=items, total=total)
 
 
