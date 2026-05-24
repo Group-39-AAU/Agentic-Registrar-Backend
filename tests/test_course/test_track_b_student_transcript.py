@@ -312,7 +312,7 @@ async def test_transcript_carries_breakdown_for_track_b_batches(
     assert cs101.has_breakdown is True
     names = {c.name for c in cs101.components}
     assert names == {"Mid", "Final"}
-    # Mid: 45/50 × 40 = 36; Final: 90/100 × 60 = 54; total 90 → A-.
+    # Mid: 45/50 × 40 = 36; Final: 90/100 × 60 = 54; total 90 → A+.
     mid = next(c for c in cs101.components if c.name == "Mid")
     final = next(c for c in cs101.components if c.name == "Final")
     assert mid.score == 45
@@ -320,8 +320,8 @@ async def test_transcript_carries_breakdown_for_track_b_batches(
     assert final.score == 90
     assert final.weighted_contribution == 54.0
     assert cs101.numeric_score == 90.0
-    # 90.0 is the lower boundary for A in the AAU scale (≥90 → A).
-    assert cs101.letter_grade is GradeLetter.A
+    # 90.0 is the lower boundary for A+ under Senate Art 90.1 ([90,100] → A+).
+    assert cs101.letter_grade is GradeLetter.A_PLUS
 
 
 async def test_transcript_legacy_grade_without_batch(
@@ -364,22 +364,23 @@ async def test_transcript_term_and_cgpa(
     """Two authorised courses in one term + one in another → CGPA composite."""
     w = transcript_scenario
 
-    # Fall: CS101 (3 cr) — Mid 45/50×40=36 + Final 90/100×60=54 → 90 → A
+    # Senate Art 90.1 cutoffs apply.
+    # Fall: CS101 (3 cr) — Mid 45/50×40=36 + Final 90/100×60=54 → 90 → A+
     #   grade_points = 3 × 4.00 = 12.0
     await _submit_and_authorise(
         async_session, w,
         term=w["fall_2026"], section=w["section_fall"], course=w["cs101"],
         score_grid=(45, 90),
     )
-    # Fall: MATH101 (3 cr) — Mid 30/50×40=24 + Final 60/100×60=36 → 60 → C
-    #   grade_points = 3 × 2.00 = 6.0
+    # Fall: MATH101 (3 cr) — Mid 30/50×40=24 + Final 60/100×60=36 → 60 → C+
+    #   grade_points = 3 × 2.50 = 7.5
     await _submit_and_authorise(
         async_session, w,
         term=w["fall_2026"], section=w["section_fall"], course=w["math101"],
         score_grid=(30, 60),
     )
-    # Spring: CS201 (4 cr) — Mid 30/50×40=24 + Final 85/100×60=51 → 75 → B
-    #   grade_points = 4 × 3.00 = 12.0
+    # Spring: CS201 (4 cr) — Mid 30/50×40=24 + Final 85/100×60=51 → 75 → B+
+    #   grade_points = 4 × 3.50 = 14.0
     await _submit_and_authorise(
         async_session, w,
         term=w["spring_2027"], section=w["section_spring"], course=w["cs201"],
@@ -397,13 +398,13 @@ async def test_transcript_term_and_cgpa(
     # Per-term GPAs.
     spring_gpa = transcript.terms[0].term_gpa
     fall_gpa = transcript.terms[1].term_gpa
-    # Spring: 12.0 / 4 = 3.00
-    assert spring_gpa == 3.00
-    # Fall: (12.0 + 6.0) / 6 = 3.00
-    assert fall_gpa == 3.00
+    # Spring: 14.0 / 4 = 3.50
+    assert spring_gpa == 3.50
+    # Fall: (12.0 + 7.5) / 6 = 3.25
+    assert fall_gpa == 3.25
 
-    # CGPA: (12.0 + 6.0 + 12.0) / (3+3+4) = 30.0/10 = 3.00
-    assert transcript.cgpa == 3.00
+    # CGPA: (12.0 + 7.5 + 14.0) / (3+3+4) = 33.5/10 = 3.35
+    assert transcript.cgpa == 3.35
     assert transcript.total_credit_hours_completed == 10
 
 

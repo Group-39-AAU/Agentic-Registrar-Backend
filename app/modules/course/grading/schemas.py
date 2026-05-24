@@ -37,7 +37,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.shared.enums import GradeLetter, GradeSubmissionStatus
+from app.shared.enums import AcademicStatusType, GradeLetter, GradeSubmissionStatus
 
 
 # ══════════════════════════════════════════════════════════════
@@ -479,7 +479,16 @@ class TranscriptCourseEntry(BaseModel):
 
 
 class TranscriptTermEntry(BaseModel):
-    """All AUTHORISED grades for one term, plus the per-term GPA."""
+    """
+    All AUTHORISED grades for one term, plus the per-term GPA.
+
+    Track C (academic standing) bolt-on: when the Department Head has
+    authorised an :class:`AcademicStanding` row for this (student,
+    term), the term entry surfaces the official status the student
+    received. Both fields are ``None`` for terms whose standing
+    hasn't been computed/authorised yet — additive, so legacy
+    callers ignoring the new fields keep working.
+    """
     term_id: uuid.UUID
     term_name: str
     term_phase: str
@@ -488,6 +497,9 @@ class TranscriptTermEntry(BaseModel):
     courses: list[TranscriptCourseEntry]
     term_gpa: Optional[float]   # weighted average of grade_points / credit_hours
     total_credit_hours: int
+    # Track C extension (PR C3) — None until the DH authorises.
+    academic_status: Optional[AcademicStatusType] = None
+    academic_status_authorised_at: Optional[datetime] = None
 
 
 class TranscriptResponse(BaseModel):

@@ -41,7 +41,7 @@ from app.modules.auth.models import User
 from app.modules.course.models import (
     AcademicTerm, AdvisoryRecommendation, Classroom, Course,
     CoursePrerequisite, Grade, Instructor, InstructorAssignment, Registration,
-    RegistrationCourse, RegistrationStatusHistory, Student,
+    RegistrationCourse, RegistrationStatusHistory, Section, Student,
     CourseManagementOfficer,
 )
 from app.modules.course.grade_points import points_for
@@ -1366,10 +1366,12 @@ async def _seed_bulk_se_upper_year_cohorts(
 # Distinction candidate.
 
 # Cycle of letter grades used by the deterministic per-student
-# distribution. Skipping I and NG because they are edge-case marks
-# that route through AcademicStandingAgent.handleEdgeCase rather
-# than counting toward CGPA — irrelevant for the advisory baseline.
+# distribution. Skipping I, NG, W, DO, P because they are
+# administrative marks that don't count toward CGPA (Senate Art
+# 90.7.4 / 90.7.6) — irrelevant for the advisory baseline. A+ is
+# included so Track C standing tests can hit the "top of scale" path.
 _SEED_GRADE_CYCLE = (
+    GradeLetter.A_PLUS,
     GradeLetter.A,
     GradeLetter.B_PLUS,
     GradeLetter.B,
@@ -1448,19 +1450,22 @@ async def _seed_grades(
                 grade_points = (
                     pts * course.credit_hours if pts is not None else None
                 )
-                # Roughly map letters to underlying scores so Track B's
-                # anomaly detector has plausible numeric_score data.
+                # Roughly map letters to underlying scores per AAU
+                # Senate Art 90.1 cutoffs so Track B's anomaly
+                # detector has plausible numeric_score data and the
+                # numeric → letter round-trip is consistent.
                 numeric = {
-                    GradeLetter.A:        92.0,
-                    GradeLetter.A_MINUS:  87.0,
-                    GradeLetter.B_PLUS:   83.0,
-                    GradeLetter.B:        78.0,
-                    GradeLetter.B_MINUS:  73.0,
-                    GradeLetter.C_PLUS:   68.0,
-                    GradeLetter.C:        63.0,
-                    GradeLetter.C_MINUS:  58.0,
-                    GradeLetter.D:        53.0,
-                    GradeLetter.F:        40.0,
+                    GradeLetter.A_PLUS:   95.0,   # [90, 100]
+                    GradeLetter.A:        86.0,   # [83, 90)
+                    GradeLetter.A_MINUS:  81.0,   # [80, 83)
+                    GradeLetter.B_PLUS:   77.0,   # [75, 80)
+                    GradeLetter.B:        71.0,   # [68, 75)
+                    GradeLetter.B_MINUS:  66.0,   # [65, 68)
+                    GradeLetter.C_PLUS:   62.0,   # [60, 65)
+                    GradeLetter.C:        55.0,   # [50, 60)
+                    GradeLetter.C_MINUS:  47.0,   # [45, 50)
+                    GradeLetter.D:        42.0,   # [40, 45)
+                    GradeLetter.F:        30.0,   # < 40
                 }.get(letter)
 
                 session.add(Grade(
@@ -1489,6 +1494,132 @@ async def _seed_grades(
         )
     else:
         print("⚠️  All backfill grades already present — skipping.")
+
+
+# ══════════════════════════════════════════════════════════════
+#  Track C — Standing demo cohort
+# ══════════════════════════════════════════════════════════════
+# PR C1's three-dropdown DH browse flow needs at least one
+# (term, department, section) tuple where:
+#
+#   * the term is closed AND has authorised grades, and
+#   * students are registered into a Section of that term
+#
+# The existing seed creates Sections only for the open term and
+# Authorised grades only for the earliest (closed) term — so out
+# of the box, every closed term shows zero sections in the standing
+# browse. This function bridges that gap by:
+#
+#   1. Picking the earliest seeded term (``history_term``) as the
+#      "completed past semester" the standing flow demos against.
+#   2. Creating one Section per (department, semester=1) cohort in
+#      that term — enough to demo the three-dropdown flow across
+#      multiple departments.
+#   3. Registering the first 5 students per department (who already
+#      have AUTHORISED grades anchored to ``history_term`` from
+#      ``_seed_grades``) into that section, in REGISTERED state.
+#
+# Idempotent: re-runs do not duplicate Sections or Registrations.
+
+
+async def _seed_standing_demo_cohort(
+    session: AsyncSession,
+    terms: list[AcademicTerm],
+) -> None:
+    """Make ``history_term`` browsable in the Track C standing flow."""
+    history_term = min(terms, key=lambda t: t.start_date)
+
+    students = (
+        await session.execute(
+            select(Student).where(
+                Student.is_deleted == False,  # noqa: E712
+                Student.department.is_not(None),
+                Student.current_semester > 1,
+            )
+        )
+    ).scalars().all()
+    if not students:
+        print("⚠️  Skipping standing demo cohort — no eligible students.")
+        return
+
+    # Bucket students by department, take the first 5 of each.
+    by_dept: dict[str, list[Student]] = {}
+    for stu in students:
+        by_dept.setdefault(stu.department, []).append(stu)
+    for dept_list in by_dept.values():
+        dept_list.sort(key=lambda s: s.student_id)
+
+    new_sections = 0
+    new_regs = 0
+    for dept, dept_students in by_dept.items():
+        cohort = dept_students[:5]
+        if not cohort:
+            continue
+
+        section_id = _uid(
+            "standing-demo-section", str(history_term.id), dept,
+        )
+        section = (await session.execute(
+            select(Section).where(Section.id == section_id)
+        )).scalar_one_or_none()
+
+        if section is None:
+            section = Section(
+                id=section_id,
+                term_id=history_term.id,
+                department=dept,
+                semester=1,
+                section_code="A",
+                capacity=max(30, len(cohort)),
+                enrolled_count=0,
+            )
+            session.add(section)
+            await session.flush()
+            new_sections += 1
+
+        for stu in cohort:
+            existing = (await session.execute(
+                select(Registration).where(
+                    Registration.student_id == stu.id,
+                    Registration.term_id == history_term.id,
+                )
+            )).scalar_one_or_none()
+            if existing is not None:
+                # If a stale Registration exists without a section, pin it.
+                if existing.section_id is None:
+                    existing.section_id = section.id
+                    existing.status = RegistrationStatus.REGISTERED
+                continue
+            reg = Registration(
+                id=_uid(
+                    "standing-demo-reg", str(stu.id), str(history_term.id),
+                ),
+                student_id=stu.id,
+                term_id=history_term.id,
+                status=RegistrationStatus.REGISTERED,
+                sponsorship_type=(
+                    stu.sponsorship_type or SponsorshipType.GOVERNMENT
+                ),
+                section_id=section.id,
+                finalised_at=datetime.now(timezone.utc),
+            )
+            session.add(reg)
+            new_regs += 1
+
+        # Keep enrolled_count consistent with materialised registrations.
+        section.enrolled_count = min(section.capacity, len(cohort))
+
+    await session.commit()
+    if new_sections or new_regs:
+        print(
+            f"✅ Seeded standing demo cohort: {new_sections} sections, "
+            f"{new_regs} registrations into '{history_term.term_name}'."
+        )
+    else:
+        print(
+            f"⚠️  Standing demo cohort already present in "
+            f"'{history_term.term_name}' — skipping."
+        )
 
 
 async def seed() -> None:
@@ -1523,6 +1654,10 @@ async def seed() -> None:
         # endpoints have CGPA + completed-course history to reason
         # over without the caller providing anything.
         await _seed_grades(session, terms, courses_by_code)
+        # Track C — make the earliest term browsable in the standing
+        # flow by giving it a cohort Section + Registrations for the
+        # students whose grades already live in that term.
+        await _seed_standing_demo_cohort(session, terms)
 
     await engine.dispose()
     print("\n🎉 Course Management seed complete (Phase 0 + Track A samples).")

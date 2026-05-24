@@ -53,6 +53,9 @@ from app.modules.course.grading.models import (                         # noqa: 
     AssessmentBreakdown, AssessmentComponent, GradeAgentReview,
     GradeAuthorisationDecision, GradeBatch, StudentComponentScore,
 )
+from app.modules.course.standing.models import (                        # noqa: F401
+    AcademicStanding, AcademicStandingHistory,
+)
 
 from app.database.base import Base
 
