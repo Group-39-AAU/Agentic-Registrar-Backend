@@ -271,6 +271,9 @@ class AcademicSchedulingAgent(CourseBaseAgent):
             await session.flush()
 
         # ── Pull REGISTERED students in this department ───────────
+        # Stable order (created_at, id) makes re-runs deterministic:
+        # the same student always falls in the same balanced slot
+        # across rebuilds, so officers see consistent section letters.
         rows = (
             await session.execute(
                 select(Registration, Student).join(
@@ -280,6 +283,9 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                     Registration.status == RegistrationStatus.REGISTERED,
                     Registration.is_deleted == False,  # noqa: E712
                     Student.department == department,
+                ).order_by(
+                    Registration.created_at.asc(),
+                    Registration.id.asc(),
                 )
             )
         ).all()
@@ -291,19 +297,33 @@ class AcademicSchedulingAgent(CourseBaseAgent):
             students_by_sem[stu.current_semester].append((reg, stu))
 
         # ── Build fresh sections, codes restart at A per semester ──
-        # Allocation deliberately does not pin a room. Cohort capacity
-        # is the department's largest room (we don't yet know which
-        # one the cohort will use); :meth:`generate_schedule` picks
-        # the actual room when laying down weekly slots.
+        # Allocation deliberately does not pin a room. Each section's
+        # ``capacity`` is set to the department's largest room (the
+        # absolute upper bound an officer can grow the cohort to);
+        # :meth:`generate_schedule` picks the actual room per slot.
+        #
+        # Balanced split: instead of greedily filling section A to
+        # ``max_room_capacity`` and trickling the remainder into B,
+        # we minimise the max-section size by spreading evenly. For
+        # ``n`` students and ``k = ceil(n / max_room_capacity)``
+        # sections, ``n mod k`` sections get ``floor(n/k) + 1``
+        # students and the rest get ``floor(n/k)``.
         max_room_capacity = rooms[0][1]
 
         for sem in sorted(students_by_sem.keys()):
-            unplaced = students_by_sem[sem]
+            cohort = students_by_sem[sem]
+            n = len(cohort)
+            if n == 0:
+                continue
+
+            num_sections = -(-n // max_room_capacity)  # ceil(n / cap)
+            base_size, extras = divmod(n, num_sections)
+
             used_codes: set[str] = set()
-
-            while unplaced:
-                cohort_size = min(len(unplaced), max_room_capacity)
-
+            cursor = 0
+            for i in range(num_sections):
+                # First ``extras`` sections absorb the +1; rest get base.
+                this_size = base_size + (1 if i < extras else 0)
                 section_code = _next_section_code(used_codes)
                 used_codes.add(section_code)
 
@@ -323,10 +343,10 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                     "department": department,
                     "semester": sem,
                     "capacity": max_room_capacity,
+                    "balanced_size": this_size,
                 })
 
-                for _ in range(cohort_size):
-                    reg, stu = unplaced.pop(0)
+                for reg, stu in cohort[cursor:cursor + this_size]:
                     reg.section_id = section.id
                     section.enrolled_count += 1
                     result.students_placed.append({
@@ -334,6 +354,7 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                         "section_id": str(section.id),
                         "section_code": section.section_code,
                     })
+                cursor += this_size
 
         await session.flush()
         return result
