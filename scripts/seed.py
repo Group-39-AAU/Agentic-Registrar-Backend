@@ -119,7 +119,7 @@ async def seed():
         else:
             active_term = UndergraduateAdmissionTerm(
                 id=uuid.uuid4(),
-                term_name="Fall 2026",
+                term_name="2026/27",
                 start_date=date(2026, 9, 1),
                 end_date=date(2027, 1, 31),
                 is_open=True,
@@ -127,7 +127,7 @@ async def seed():
             )
             session.add(active_term)
             await session.commit()
-            print("✅ Seeded undergraduate admission term: Fall 2026.")
+            print("✅ Seeded undergraduate admission term: 2026/27.")
 
         # ── Seed Programs ──
         existing = (await session.execute(select(AcademicProgram))).scalars().all()

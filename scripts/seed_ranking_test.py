@@ -10,16 +10,19 @@ Run:
     python scripts/seed_ranking_test.py
 
 Creates:
-    - 20 test students (users)
-    - 20 MoE student records with varied scores
-    - 20 undergraduate applications at UAT_COMPLETED status
-    - 20 completed UAT records with varied scores
+    - 200 test students (users)
+    - 200 MoE student records with varied scores
+    - 200 undergraduate applications at UAT_COMPLETED status
+    - 200 completed UAT records with varied scores
     - Status history entries for each application
 
 Mix:
-    - 12 self-sponsored  (6 Natural, 6 Social) with program preferences
-    - 8  government       (4 Natural, 4 Social)
-    - Scores range from low to high to test cutoffs and capacity limits
+    - 20 hand-crafted students (12 self-sponsored, 8 government) — first
+      block, kept stable so existing test expectations still hold.
+    - 180 procedurally generated students with reproducible randomness
+      (random.Random(20260524)). Score bands (high/mid/low) and stream /
+      sponsorship splits are weighted so cutoffs and capacity limits
+      actually get exercised across multiple programs and streams.
 """
 
 import asyncio
@@ -129,6 +132,116 @@ SELF_SPONSORED_PREFS = {
     "9000011": ("PSYCH", "POLS", "MGMT"),  # Low — Psychology
     "9000012": ("POLS", "MGMT", "PSYCH"),  # Lowest — Political Science
 }
+
+
+# ══════════════════════════════════════════════════════════════
+#  Procedural Roster Expansion
+# ══════════════════════════════════════════════════════════════
+# The 20 hand-crafted students above cover the canonical happy/edge
+# cases. The block below extends the roster to 200 with reproducible
+# variety so the ranking pipeline gets stressed across many programs,
+# streams, score bands, and capacities.
+
+# Program code pools — must match codes seeded by scripts/seed.py.
+_NATURAL_PROGRAM_CODES = ["CS", "SE", "EE", "ME", "ChE", "CE", "BME", "MED", "BIO"]
+_SOCIAL_PROGRAM_CODES = ["LAW", "ECON", "PSYCH", "ACCT", "MGMT", "POLS"]
+
+_FIRST_NAMES = [
+    "Abel", "Abenezer", "Abeba", "Addis", "Adugna", "Aklilu", "Alemayehu",
+    "Almaz", "Amare", "Amha", "Aregawi", "Aron", "Aster", "Ayele", "Bekele",
+    "Belaynesh", "Bemnet", "Berhanu", "Beza", "Birhane", "Birtukan", "Bisrat",
+    "Dagim", "Daniel", "Dawit", "Desta", "Eden", "Eskedar", "Eyob", "Fasika",
+    "Filagot", "Frehiwot", "Fitsum", "Genet", "Getachew", "Gizachew", "Helen",
+    "Helina", "Henok", "Hewan", "Hilina", "Hiwot", "Israel", "Iyasu", "Kalkidan",
+    "Kaleb", "Lemlem", "Lidya", "Mahder", "Mahlet", "Mathias", "Mebrat", "Mehari",
+    "Mekdes", "Melat", "Melaku", "Mengistu", "Meron", "Meskerem", "Mikiyas",
+    "Mulu", "Muluken", "Nardos", "Natnael", "Nebiat", "Nuhamin", "Rahel",
+    "Robel", "Robera", "Roman", "Samrawit", "Selam", "Selamawit", "Semira",
+    "Sintayehu", "Sirak", "Solomon", "Solyana", "Surafel", "Tarekegn",
+    "Tewodros", "Tinsae", "Tomas", "Tsadkan", "Yeshi", "Yidnekachew", "Yohannes",
+    "Yonas", "Yordanos", "Yosef", "Zara", "Zewdie", "Zinash",
+]
+
+_LAST_NAMES = [
+    "Abebe", "Abera", "Abraham", "Abrha", "Aklilu", "Alemayehu", "Alemu",
+    "Amare", "Asfaw", "Assefa", "Ayele", "Bekele", "Belay", "Berhane", "Berhe",
+    "Birhanu", "Bogale", "Demissie", "Desta", "Eshetu", "Fekadu", "Gebre",
+    "Gebremariam", "Gebrehiwot", "Genene", "Getachew", "Girma", "Habte",
+    "Hailu", "Haftom", "Kassa", "Kebede", "Lemma", "Mamo", "Mekonnen",
+    "Mengistu", "Molla", "Mulugeta", "Nigatu", "Reda", "Shiferaw", "Solomon",
+    "Tadesse", "Taye", "Tekle", "Teklemariam", "Teshome", "Tilahun", "Tola",
+    "Tsegaye", "Wolde", "Woldemariam", "Workneh", "Worku", "Yohannes",
+    "Zelalem", "Zewde", "Zewdu",
+]
+
+
+def _generate_extra_students(count: int, start_index: int) -> tuple[list, dict]:
+    """
+    Build `count` extra (student, preferences) entries with reproducible
+    randomness. Returns (students_list, prefs_dict) ready to be appended to
+    TEST_STUDENTS / SELF_SPONSORED_PREFS.
+
+    The fixed seed (20260524) ensures the roster is identical across runs,
+    so test expectations remain stable.
+    """
+    rng = random.Random(20260524)
+    extras: list = []
+    prefs_map: dict = {}
+
+    for offset in range(count):
+        idx = start_index + offset                       # 21, 22, …
+        adm = f"9{idx:06d}"                              # 9000021, 9000022, …
+        email = f"ranking_test_student_{idx:03d}@aau.edu.et"
+        first_name = rng.choice(_FIRST_NAMES)
+        last_name = rng.choice(_LAST_NAMES)
+
+        stream = rng.choices(
+            [StreamType.NATURAL, StreamType.SOCIAL],
+            weights=[60, 40],
+        )[0]
+        sponsorship = rng.choices(
+            [SponsorshipType.SELF_SPONSORED, SponsorshipType.GOVERNMENT],
+            weights=[55, 45],
+        )[0]
+
+        band = rng.choices(["high", "mid", "low"], weights=[25, 50, 25])[0]
+        if band == "high":
+            g12 = rng.randint(540, 600)
+            uat = rng.randint(85, 100)
+        elif band == "mid":
+            g12 = rng.randint(420, 540)
+            uat = rng.randint(65, 88)
+        else:
+            g12 = rng.randint(330, 430)
+            uat = rng.randint(45, 70)
+
+        # Derive subject scores around the per-subject average with jitter,
+        # clamped to [40, 100].
+        per_subject = g12 / 6
+        subject_names = (
+            ("Mathematics", "Physics", "Chemistry", "Biology", "English", "Aptitude")
+            if stream == StreamType.NATURAL
+            else ("History", "Geography", "Economics", "Civics", "English", "Aptitude")
+        )
+        subjects = {
+            name: max(40, min(100, int(per_subject + rng.randint(-6, 6))))
+            for name in subject_names
+        }
+
+        extras.append(
+            (email, first_name, last_name, adm, stream, sponsorship, g12, uat, subjects)
+        )
+
+        if sponsorship == SponsorshipType.SELF_SPONSORED:
+            pool = _NATURAL_PROGRAM_CODES if stream == StreamType.NATURAL else _SOCIAL_PROGRAM_CODES
+            prefs_map[adm] = tuple(rng.sample(pool, 3))
+
+    return extras, prefs_map
+
+
+_EXTRA_STUDENTS, _EXTRA_PREFS = _generate_extra_students(count=180, start_index=21)
+TEST_STUDENTS.extend(_EXTRA_STUDENTS)
+SELF_SPONSORED_PREFS.update(_EXTRA_PREFS)
 
 
 # ══════════════════════════════════════════════════════════════
