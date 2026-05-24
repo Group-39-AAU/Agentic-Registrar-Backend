@@ -239,22 +239,26 @@ async def list_my_available_courses(
            * No Registration → 200 with ``is_registered=false`` and
              ``courses`` = curriculum picker (department + per-term
              semester filter).
-      2. Term is CLOSED and has already started → 200 with the
-         student's active (non-dropped) registered courses, plus
-         ``registration_id`` + ``registration_status``. **404** if
-         the student has no Registration for that term.
-      3. Term is CLOSED and has not started yet → **409** "this term
-         is not open yet".
+      2. Term is CLOSED and has already started.
+           * Has a Registration → 200 with the student's active
+             (non-dropped) registered courses, plus ``registration_id``
+             + ``registration_status``.
+           * No Registration → 200 with ``is_registered=false`` and
+             ``courses=[]``. Not an error — the frontend renders the
+             "you weren't registered for this term" empty state.
+      3. Term is CLOSED and has not started yet → 200 with
+         ``is_registered=false`` and ``courses=[]``. Same shape as the
+         past-term no-registration case; the frontend renders a "this
+         term hasn't opened yet" empty-state card.
 
-    Returns 404 also when ``term_id`` does not match any existing
-    (non-deleted) AcademicTerm.
+    Returns 404 when ``term_id`` does not match any existing
+    (non-deleted) AcademicTerm, or when the calling student row is
+    missing.
     """
     student = await _resolve_student(db, current_user)
     svc = RegistrationService(db)
     try:
         return await svc.list_available_courses(student.id, payload.term_id)
-    except TermNotYetOpenError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
 

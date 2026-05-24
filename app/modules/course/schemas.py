@@ -67,19 +67,29 @@ class AvailableCoursesRequest(BaseModel):
 
 class AvailableCoursesResponse(BaseModel):
     """
-    200-only payload from ``POST /me/available-courses``. Two shapes,
-    keyed off whether a Registration exists for the (student, term)
-    pair (errors are surfaced as 404 / 409 instead of returned here):
+    200-only payload from ``POST /me/available-courses``. Four shapes,
+    keyed off whether a Registration exists and the term's open/start
+    status (the only error path is 404 if the term or student row is
+    missing):
 
-      * Has a Registration → ``is_registered=True``,
-        ``registration_id`` + ``registration_status`` populated, and
-        ``courses`` is the active (non-dropped) registered selection.
-        Frontends drive the action button off ``registration_status``:
-        ``REGISTRATION_OPEN`` → still in draft, ``PAYMENT_HOLD`` →
-        prompt to pay, ``REGISTERED`` → show "Registered ✓", etc.
-      * No Registration (only reachable when the term is OPEN) →
-        ``is_registered=False`` and ``courses`` is the curriculum
-        picker the student will submit from.
+      * Has a Registration (term may be open or closed) →
+        ``is_registered=True``, ``registration_id`` +
+        ``registration_status`` populated, ``courses`` is the active
+        (non-dropped) registered selection. Frontends drive the
+        action button off ``registration_status``: ``REGISTRATION_OPEN``
+        → still in draft, ``PAYMENT_HOLD`` → prompt to pay,
+        ``REGISTERED`` → show "Registered ✓", etc.
+      * No Registration, term OPEN → ``is_registered=False`` and
+        ``courses`` is the curriculum picker the student will submit
+        from.
+      * No Registration, term CLOSED (already started) →
+        ``is_registered=False`` with an empty ``courses`` list. The
+        frontend renders a calm "you weren't registered for this
+        term" empty state.
+      * No Registration, term CLOSED (not yet started) →
+        ``is_registered=False`` with an empty ``courses`` list, same
+        shape as above. The frontend compares ``term.start_date`` to
+        today and renders a "this term hasn't opened yet" empty state.
     """
     term: AcademicTermResponse
     is_registered: bool

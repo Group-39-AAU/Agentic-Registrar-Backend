@@ -305,15 +305,19 @@ class RegistrationService:
                  student will submit from.
 
           2. Term is CLOSED and has already started (``today >=
-             start_date``) → must have a Registration.
-               * Found → return the registered courses.
-               * Not found → raise ``EntityNotFoundError`` so the
-                 router surfaces "you didn't register for this term"
-                 as a 404.
+             start_date``).
+               * Has a Registration → return the registered courses.
+               * No Registration → return ``is_registered=False`` with
+                 an empty ``courses`` list. The frontend renders a
+                 calm "you weren't registered for this term" empty
+                 state. This is not an error — a past term you didn't
+                 register for is a valid state to ask about.
 
           3. Term is CLOSED and has not started yet (``today <
-             start_date``) → raise :class:`TermNotYetOpenError` so
-             the router can surface a 409 "this term is not open yet".
+             start_date``) → return ``is_registered=False`` with an
+             empty ``courses`` list, same shape as Rule 2's no-reg
+             branch. The frontend compares ``term.start_date`` to
+             today and renders a "this term hasn't opened yet" card.
 
         Also raises ``EntityNotFoundError`` if either the Student or
         the AcademicTerm itself is missing.
@@ -339,10 +343,19 @@ class RegistrationService:
 
         today = date.today()
 
-        # Rule 3 — closed and not yet started: surface "not open yet"
-        # before we touch registrations.
+        # Rule 3 — closed and not yet started: return an empty state
+        # payload with ``is_registered=False``. The frontend distinguishes
+        # "past term you didn't register for" vs "future term that hasn't
+        # opened yet" by comparing ``term.start_date`` to today, and
+        # renders the appropriate empty-state card.
         if not term.is_open and today < term.start_date:
-            raise TermNotYetOpenError(term.term_name)
+            return {
+                "term": term,
+                "is_registered": False,
+                "registration_id": None,
+                "registration_status": None,
+                "courses": [],
+            }
 
         registration = (
             await self.db.execute(
@@ -381,14 +394,19 @@ class RegistrationService:
                 "courses": list(rows),
             }
 
-        # No registration. If the window is closed (Rule 2 with no
-        # registration), 404. If it's still open (Rule 1, never
-        # submitted yet), return the curriculum picker.
+        # No registration for this term. Two flavors:
+        #   * Term is CLOSED → return a state payload (is_registered=False,
+        #     no courses). The frontend renders "you weren't registered
+        #     for this term" — not an error, just a state.
+        #   * Term is OPEN  → fall through to the curriculum picker below.
         if not term.is_open:
-            raise EntityNotFoundError(
-                "Registration",
-                f"student={student.student_id}, term='{term.term_name}'",
-            )
+            return {
+                "term": term,
+                "is_registered": False,
+                "registration_id": None,
+                "registration_status": None,
+                "courses": [],
+            }
 
         target_semester = await self._semester_for_term(student, term)
         if target_semester is None or not (1 <= target_semester <= 10):
