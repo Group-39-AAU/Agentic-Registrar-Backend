@@ -1,33 +1,52 @@
 """
 Course Management — consolidated seed script.
 
-Merges four previously separate scripts into one idempotent runner:
+Provides a coherent demo dataset spanning every workflow surface:
 
-  1. seed_course.py
-       Phase 0 catalog (terms, courses, prerequisites, classrooms,
-       instructors + assignments, students, officers) plus Track A
-       sample registrations, the SE-sem1/upper-year bulk cohorts,
-       grade backfill, and the Track C standing demo cohort.
+  * Track A  — course registration, section allocation, scheduling
+  * Track B  — instructor grading
+  * Track C  — status determination
 
-  2. migrate_terms_to_ethiopian_phases.py
-       Idempotent backfill of the four Ethiopian-phase AcademicTerm
-       rows — folded into _seed_terms() since the seed already covers
-       the same set of terms. The final "term state" summary print
-       at the end of this script comes from here.
+All three tracks share the same open AcademicTerm (2026/2027 phase ONE),
+the same catalog of courses/instructors/sections, and the same students
+— there are no parallel demo universes.
 
-  3. seed_extra_se_sem1_courses.py
-       Six extra Software-Engineering / semester-1 catalog rows
-       (SE105–SE110) used to give the "add course" flow more
-       options. Run after _seed_courses so the prerequisite seeder
-       sees them.
+Top-level structure:
 
-  4. seed_track_b_roster.py
-       Self-contained Track B PR-1 demo scenario: a separate term
-       ("Track-B-Demo-2026"), one instructor teaching CS101 across
-       two sections, with the ADD/DROP/draft edge cases the roster
-       endpoints need to exercise.
+  Phase 0 catalog
+    Terms (4 — 2025/26 ph 1 closed, 2025/26 ph 2 closed,
+                2026/27 ph 1 OPEN, 2026/27 ph 2 closed),
+    Courses (240 — 6 depts × 10 sems × 4 courses, plus 6 extra SE-sem-1
+    catalog rows SE105–SE110), prerequisites, classrooms, 12 instructors
+    with round-robin course assignments per term, 30 hand-crafted students
+    across odd semesters (1/3/5/7/9) and 6 departments (5 per dept), and 2
+    officers. The registration-flow demo subject is *not* seeded — they
+    are created live by running the admission → ranking → enrollment flow,
+    which assigns a fresh UGR/XXXX/19 ID derived from the open admission
+    term name.
 
-Idempotent end-to-end: running twice does not create duplicates.
+  Track A — sample registrations
+    Hand-crafted registrations covering REGISTERED / REGISTRATION_OPEN
+    / LOW-risk advisory cases. Bulk SE-sem-1 cohort (70 students at
+    /0100–/0169 /19) plus four upper-year SE cohorts (/0500–/0559 in
+    /18, /17, /16, /15 for sems 3/5/7/9) — all REGISTERED in the open
+    term to populate the cohort scheduler.
+
+  Track C — grade backfill + standing demo cohort
+    Prior-semester AUTHORISED grades for every hand-crafted student
+    with current_semester > 1, anchored to the earliest seeded term
+    (2025/26 phase 1) as a single "history" container so the standing
+    flow has something to browse.
+
+  Track B — instructor-grading roster
+    Reuses the open 2026/2027 phase-1 term, real catalog SE101/SE102
+    courses, the existing SE instructor (STAFF/0001/10 Alemayehu
+    Bekele) and the existing SE department head (REG/9002/10
+    Selamawit Mengistu). 11 first-year SE students (UGR/9001/19 –
+    UGR/9015/19) split across Sections A/B with the ADD/DROP/draft
+    edge cases the roster derivation must handle.
+
+Idempotent end-to-end: re-running the script does not create duplicates.
 
 Usage:
     cd /path/to/Agentic-Registrar-Backend
@@ -109,7 +128,7 @@ TERMS = [
         "phase": AcademicPhase.TWO,
         "start_date": date(2026, 2, 1),
         "end_date": date(2026, 6, 30),
-        "is_open": True,
+        "is_open": False,
         "description": "Phase Two of the 2025/2026 academic year (Feb–Jun).",
     },
     {
@@ -118,8 +137,12 @@ TERMS = [
         "phase": AcademicPhase.ONE,
         "start_date": date(2026, 9, 1),
         "end_date": date(2027, 1, 31),
-        "is_open": False,
-        "description": "Phase One of the 2026/2027 academic year (Sep–Jan).",
+        "is_open": True,
+        "description": (
+            "Phase One of the 2026/2027 academic year (Sep–Jan). Aligned "
+            "with the open undergraduate admission term — admitted applicants "
+            "register here for their first-semester courses."
+        ),
     },
     {
         "id": _uid("term", "2026-2027-phase-2"),
@@ -366,49 +389,71 @@ CLASSROOMS = [
 
 
 # ══════════════════════════════════════════════════════════════
-#  Students (30 across semesters 1–8, distributed across 6 depts)
+#  Students (30 across odd semesters 1/3/5/7/9, 5 per department)
 # ══════════════════════════════════════════════════════════════
+# Open term is 2026/2027 phase ONE (odd semesters). Each student's
+# batch year matches their cohort entry year:
+#     sem 1 → /19   (started Sep 2026)
+#     sem 3 → /18   (started Sep 2025)
+#     sem 5 → /17   (started Sep 2024)
+#     sem 7 → /16   (started Sep 2023)
+#     sem 9 → /15   (started Sep 2022)
 
 _GOV = SponsorshipType.GOVERNMENT
 _SELF = SponsorshipType.SELF_SPONSORED
 
 STUDENTS = [
-    ("UGR/0001/14", "Abel",      "Tesfaye",     1, "Software Engineering",   _GOV),
-    ("UGR/0002/14", "Beza",      "Worku",       2, "Software Engineering",   _SELF),
-    ("UGR/0003/14", "Caleb",     "Mulugeta",    3, "Software Engineering",   _GOV),
-    ("UGR/0004/14", "Dina",      "Hailemariam", 5, "Software Engineering",   _GOV),
-    ("UGR/0005/14", "Ermias",    "Bekele",      7, "Software Engineering",   _SELF),
+    # ── Software Engineering ─────────────────────────────────────
+    ("UGR/0001/19", "Abel",      "Tesfaye",     1, "Software Engineering",   _GOV),
+    ("UGR/0002/18", "Beza",      "Worku",       3, "Software Engineering",   _SELF),
+    ("UGR/0003/17", "Caleb",     "Mulugeta",    5, "Software Engineering",   _GOV),
+    ("UGR/0004/16", "Dina",      "Hailemariam", 7, "Software Engineering",   _GOV),
+    ("UGR/0005/15", "Ermias",    "Bekele",      9, "Software Engineering",   _SELF),
 
-    ("UGR/0006/14", "Frehiwot",  "Asrat",       1, "Electrical Engineering", _GOV),
-    ("UGR/0007/14", "Gemechu",   "Olana",       2, "Electrical Engineering", _GOV),
-    ("UGR/0008/14", "Helen",     "Yohannes",    4, "Electrical Engineering", _SELF),
-    ("UGR/0009/14", "Isaac",     "Demeke",      6, "Electrical Engineering", _GOV),
-    ("UGR/0010/14", "Jerusalem", "Tilahun",     8, "Electrical Engineering", _GOV),
+    # ── Electrical Engineering ───────────────────────────────────
+    ("UGR/0006/19", "Frehiwot",  "Asrat",       1, "Electrical Engineering", _GOV),
+    ("UGR/0007/18", "Gemechu",   "Olana",       3, "Electrical Engineering", _GOV),
+    ("UGR/0008/17", "Helen",     "Yohannes",    5, "Electrical Engineering", _SELF),
+    ("UGR/0009/16", "Isaac",     "Demeke",      7, "Electrical Engineering", _GOV),
+    ("UGR/0010/15", "Jerusalem", "Tilahun",     9, "Electrical Engineering", _GOV),
 
-    ("UGR/0011/14", "Kalkidan",  "Sisay",       1, "Chemical Engineering",   _GOV),
-    ("UGR/0012/14", "Lidya",     "Abebe",       3, "Chemical Engineering",   _SELF),
-    ("UGR/0013/14", "Marcos",    "Negash",      4, "Chemical Engineering",   _GOV),
-    ("UGR/0014/14", "Nardos",    "Birhanu",     5, "Chemical Engineering",   _GOV),
-    ("UGR/0015/14", "Obse",      "Tariku",      7, "Chemical Engineering",   _GOV),
+    # ── Chemical Engineering ─────────────────────────────────────
+    ("UGR/0011/19", "Kalkidan",  "Sisay",       1, "Chemical Engineering",   _GOV),
+    ("UGR/0012/18", "Lidya",     "Abebe",       3, "Chemical Engineering",   _SELF),
+    ("UGR/0013/17", "Marcos",    "Negash",      5, "Chemical Engineering",   _GOV),
+    ("UGR/0014/16", "Nardos",    "Birhanu",     7, "Chemical Engineering",   _GOV),
+    ("UGR/0015/15", "Obse",      "Tariku",      9, "Chemical Engineering",   _GOV),
 
-    ("UGR/0016/14", "Petros",    "Selam",       2, "Civil Engineering",      _GOV),
-    ("UGR/0017/14", "Rahel",     "Yilma",       3, "Civil Engineering",      _SELF),
-    ("UGR/0018/14", "Samuel",    "Habte",       5, "Civil Engineering",      _GOV),
-    ("UGR/0019/14", "Tigist",    "Mekuria",     6, "Civil Engineering",      _GOV),
-    ("UGR/0020/14", "Ujulu",     "Gobena",      8, "Civil Engineering",      _SELF),
+    # ── Civil Engineering ────────────────────────────────────────
+    ("UGR/0016/19", "Petros",    "Selam",       1, "Civil Engineering",      _GOV),
+    ("UGR/0017/18", "Rahel",     "Yilma",       3, "Civil Engineering",      _SELF),
+    ("UGR/0018/17", "Samuel",    "Habte",       5, "Civil Engineering",      _GOV),
+    ("UGR/0019/16", "Tigist",    "Mekuria",     7, "Civil Engineering",      _GOV),
+    ("UGR/0020/15", "Ujulu",     "Gobena",      9, "Civil Engineering",      _SELF),
 
-    ("UGR/0021/14", "Veronica",  "Eshete",      1, "Mechanical Engineering", _GOV),
-    ("UGR/0022/14", "Wondwossen","Aklilu",      2, "Mechanical Engineering", _GOV),
-    ("UGR/0023/14", "Xavier",    "Birru",       4, "Mechanical Engineering", _SELF),
-    ("UGR/0024/14", "Yared",     "Lemessa",     6, "Mechanical Engineering", _GOV),
-    ("UGR/0025/14", "Zewditu",   "Asfaw",       7, "Mechanical Engineering", _GOV),
+    # ── Mechanical Engineering ───────────────────────────────────
+    ("UGR/0021/19", "Veronica",  "Eshete",      1, "Mechanical Engineering", _GOV),
+    ("UGR/0022/18", "Wondwossen","Aklilu",      3, "Mechanical Engineering", _GOV),
+    ("UGR/0023/17", "Xavier",    "Birru",       5, "Mechanical Engineering", _SELF),
+    ("UGR/0024/16", "Yared",     "Lemessa",     7, "Mechanical Engineering", _GOV),
+    ("UGR/0025/15", "Zewditu",   "Asfaw",       9, "Mechanical Engineering", _GOV),
 
-    ("UGR/0026/14", "Amanuel",   "Getaneh",     1, "Bio Medical Engineering", _GOV),
-    ("UGR/0027/14", "Bisrat",    "Kebede",      3, "Bio Medical Engineering", _SELF),
-    ("UGR/0028/14", "Christian", "Wolde",       5, "Bio Medical Engineering", _GOV),
-    ("UGR/0029/14", "Daniel",    "Tamirat",     6, "Bio Medical Engineering", _GOV),
-    ("UGR/0030/14", "Eleni",     "Berhanu",     8, "Bio Medical Engineering", _GOV),
+    # ── Bio Medical Engineering ──────────────────────────────────
+    ("UGR/0026/19", "Amanuel",   "Getaneh",     1, "Bio Medical Engineering", _GOV),
+    ("UGR/0027/18", "Bisrat",    "Kebede",      3, "Bio Medical Engineering", _SELF),
+    ("UGR/0028/17", "Christian", "Wolde",       5, "Bio Medical Engineering", _GOV),
+    ("UGR/0029/16", "Daniel",    "Tamirat",     7, "Bio Medical Engineering", _GOV),
+    ("UGR/0030/15", "Eleni",     "Berhanu",     9, "Bio Medical Engineering", _GOV),
 ]
+
+
+# NOTE: there is no seed roster of "unregistered first-year SE students"
+# for the registration-flow demo. The demo subject is created live by
+# running the undergraduate admission flow end-to-end, which assigns a
+# fresh university ID (e.g. UGR/6400/19) on enrollment. The seeded
+# students below are all pre-registered so the section-allocation,
+# scheduling, grading, and status-determination demos have a populated
+# cohort to operate on.
 
 
 # ══════════════════════════════════════════════════════════════
@@ -434,36 +479,43 @@ OFFICERS = [
 # ══════════════════════════════════════════════════════════════
 
 SAMPLE_REGISTRATIONS = [
+    # Hand-crafted SE first-year — fully registered for SE sem-1 courses.
+    # This is the "happy path" demo: an admitted/enrolled applicant who
+    # has already completed registration. Use one of the DEMO_FIRST_YEAR
+    # students for the live registration flow demo.
     {
-        "student_id": "UGR/0001/14",
-        "course_codes": ["SE101", "SE102"],
+        "student_id": "UGR/0001/19",
+        "course_codes": ["SE101", "SE102", "SE103", "SE104"],
         "status": RegistrationStatus.REGISTERED,
-        "sponsorship": SponsorshipType.SELF_SPONSORED,
-        "payment_reference": "MOCK-PAID-FALL2026-UGR0001",
+        "sponsorship": SponsorshipType.GOVERNMENT,
+        "payment_reference": None,
         "advisory": None,
     },
+    # Hand-crafted sem-3 EE student in REGISTRATION_OPEN — mid-flow draft.
     {
-        "student_id": "UGR/0007/14",
-        "course_codes": ["EE201"],
+        "student_id": "UGR/0007/18",
+        "course_codes": ["EE301", "EE302"],
         "status": RegistrationStatus.REGISTRATION_OPEN,
         "sponsorship": SponsorshipType.GOVERNMENT,
         "payment_reference": None,
         "advisory": None,
     },
+    # Hand-crafted sem-7 CE student fully registered, with a LOW-risk
+    # advisory recommendation so the advisory consult flow has data.
     {
-        "student_id": "UGR/0019/14",
-        "course_codes": ["CE601"],
+        "student_id": "UGR/0019/16",
+        "course_codes": ["CE701", "CE702"],
         "status": RegistrationStatus.REGISTERED,
         "sponsorship": SponsorshipType.SELF_SPONSORED,
         "payment_reference": "MOCK-PAID-FALL2026-UGR0019",
         "advisory": "LOW",
     },
-    # First-semester cohort: every sem-1 student fully registered in
-    # their department's 4-course semester-1 curriculum so the
-    # AcademicSchedulingAgent has one (department, semester=1) cohort
-    # per department to allocate.
+    # First-semester cohort: every sem-1 student in each non-SE department
+    # fully registered for the 4-course semester-1 curriculum so the
+    # AcademicSchedulingAgent has one (department, semester=1) cohort per
+    # department to allocate. SE sem-1 is covered by the bulk cohort.
     {
-        "student_id": "UGR/0006/14",
+        "student_id": "UGR/0006/19",
         "course_codes": ["EE101", "EE102", "EE103", "EE104"],
         "status": RegistrationStatus.REGISTERED,
         "sponsorship": SponsorshipType.GOVERNMENT,
@@ -471,7 +523,7 @@ SAMPLE_REGISTRATIONS = [
         "advisory": None,
     },
     {
-        "student_id": "UGR/0011/14",
+        "student_id": "UGR/0011/19",
         "course_codes": ["ChE101", "ChE102", "ChE103", "ChE104"],
         "status": RegistrationStatus.REGISTERED,
         "sponsorship": SponsorshipType.GOVERNMENT,
@@ -479,7 +531,15 @@ SAMPLE_REGISTRATIONS = [
         "advisory": None,
     },
     {
-        "student_id": "UGR/0021/14",
+        "student_id": "UGR/0016/19",
+        "course_codes": ["CE101", "CE102", "CE103", "CE104"],
+        "status": RegistrationStatus.REGISTERED,
+        "sponsorship": SponsorshipType.GOVERNMENT,
+        "payment_reference": None,
+        "advisory": None,
+    },
+    {
+        "student_id": "UGR/0021/19",
         "course_codes": ["ME101", "ME102", "ME103", "ME104"],
         "status": RegistrationStatus.REGISTERED,
         "sponsorship": SponsorshipType.GOVERNMENT,
@@ -487,7 +547,7 @@ SAMPLE_REGISTRATIONS = [
         "advisory": None,
     },
     {
-        "student_id": "UGR/0026/14",
+        "student_id": "UGR/0026/19",
         "course_codes": ["BME101", "BME102", "BME103", "BME104"],
         "status": RegistrationStatus.REGISTERED,
         "sponsorship": SponsorshipType.GOVERNMENT,
@@ -502,20 +562,27 @@ SAMPLE_REGISTRATIONS = [
 # ══════════════════════════════════════════════════════════════
 
 SE_SEM1_BULK_COUNT = 70
-SE_SEM1_BULK_START_SEQ = 100      # → UGR/0100/14 .. UGR/0169/14
+SE_SEM1_BULK_START_SEQ = 100      # → UGR/0100/19 .. UGR/0169/19
+SE_SEM1_BATCH_YEAR = 19           # 2026/27 phase 1 first-year cohort
 SE_SEM1_BULK_COURSES = ["SE101", "SE102", "SE103", "SE104"]
 
 
 # ══════════════════════════════════════════════════════════════
 #  Bulk SE upper-year cohorts (years 2–5, 60 students each)
 # ══════════════════════════════════════════════════════════════
+# Seq starts at 500 so these don't collide with the hand-crafted
+# /0001–/0030 students that share the same batch suffixes.
 
-# (batch_year, target_semester, count)
+SE_UPPER_BULK_START_SEQ = 500
+
+# (batch_year, target_semester, count) — batch year matches the
+# calendar year each cohort started, so a sem-3 student in the open
+# 2026/27 phase-1 term began Sep 2025 (Ethiopian batch /18).
 SE_BULK_UPPER_COHORTS: list[tuple[int, int, int]] = [
-    (13, 3, 60),   # Year 2
-    (12, 5, 60),   # Year 3
-    (11, 7, 60),   # Year 4
-    (10, 9, 60),   # Year 5
+    (18, 3, 60),   # Year 2
+    (17, 5, 60),   # Year 3
+    (16, 7, 60),   # Year 4
+    (15, 9, 60),   # Year 5
 ]
 
 
@@ -1062,7 +1129,7 @@ async def _seed_bulk_se_sem1_cohort(
     new_links = 0
     for i in range(SE_SEM1_BULK_COUNT):
         seq = SE_SEM1_BULK_START_SEQ + i
-        student_id_str = f"UGR/{seq:04d}/14"
+        student_id_str = f"UGR/{seq:04d}/{SE_SEM1_BATCH_YEAR:02d}"
         slug = student_id_str.lower().replace("/", "-")
         email = f"{slug}@aau.edu.et"
 
@@ -1179,7 +1246,7 @@ async def _seed_bulk_se_upper_year_cohorts(
             ) from None
 
         for i in range(count):
-            seq = i + 1
+            seq = SE_UPPER_BULK_START_SEQ + i
             student_id_str = f"UGR/{seq:04d}/{batch_year:02d}"
             slug = student_id_str.lower().replace("/", "-")
             email = f"{slug}@aau.edu.et"
@@ -1497,170 +1564,123 @@ async def _seed_standing_demo_cohort(
 
 
 # ══════════════════════════════════════════════════════════════
-#  Track B PR 1 — roster demo (self-contained scenario)
+#  Track B PR 1 — roster demo integrated into the real catalog
 # ══════════════════════════════════════════════════════════════
-# A separate term ("Track-B-Demo-2026"), one instructor (Dr. Lemma)
-# teaching CS101 in two sections A and B. Three add/drop edge cases
-# the roster derivation must handle:
+# Uses the open 2026/2027 phase-1 AcademicTerm, the catalog SE101 /
+# SE102 courses, and the existing SE instructor & department head —
+# no parallel "Track-B-Demo-2026" universe. The Track-B demo students
+# are first-year SE students in batch /19, so they appear naturally in
+# the same cohort as the bulk SE-sem-1 / demo first-year rosters.
 #
-#   * 4 originals in A taking CS101
-#   * 4 originals in B taking CS101
-#   * 1 student from B who ADDED CS101 from A
-#   * 1 student from A who DROPPED CS101 entirely
+# Demo scenario covered (unchanged):
+#   * 4 originals in Section A taking SE101
+#   * 4 originals in Section B taking SE101
+#   * 1 student from B who ADDED SE101 from A
+#   * 1 student from A who DROPPED SE101 entirely
 #   * 1 student in A whose registration is still REGISTRATION_OPEN
 #
-# Login credentials seeded for manual testing:
-#   instructor    staff-9991-15@aau.edu.et   password123
-#   dept head     reg-9999-15@aau.edu.et     password123
+# Login credentials for manual testing:
+#   instructor    staff-0001-10@aau.edu.et   password123   (Alemayehu Bekele, SE)
+#   dept head     se.dept.head@aau.edu.et    password123   (Selamawit Mengistu, SE)
 
-TB_TERM_NAME = "Track-B-Demo-2026"
+TB_TERM_NAME = "2026/2027"
+TB_TERM_PHASE = AcademicPhase.ONE
 TB_DEPARTMENT = "Software Engineering"
 TB_SEMESTER = 1
 
-TB_COURSE_CODE = "CS101"
-TB_COURSE_TITLE = "Introduction to Programming"
-TB_COURSE_CREDITS = 3
+TB_COURSE_CODE = "SE101"
+TB_SECONDARY_COURSE_CODE = "SE102"
 
-TB_SECONDARY_COURSE_CODE = "MATH101"
-TB_SECONDARY_COURSE_TITLE = "Calculus I"
-TB_SECONDARY_COURSE_CREDITS = 3
-
-TB_INSTRUCTOR_STAFF_ID = "STAFF/9991/15"
-TB_INSTRUCTOR_FIRST = "Lemma"
-TB_INSTRUCTOR_LAST = "Bekele"
-
-TB_DH_STAFF_ID = "REG/9999/15"
-TB_DH_FIRST = "Almaz"
-TB_DH_LAST = "Tilahun"
+TB_INSTRUCTOR_STAFF_ID = "STAFF/0001/10"
+TB_DH_STAFF_ID = "REG/9002/10"
 
 TB_SECTION_A_STUDENTS = [
-    ("UGR/9001/15", "Abel Tesfaye"),
-    ("UGR/9002/15", "Bethel Demissie"),
-    ("UGR/9003/15", "Chala Worku"),
-    ("UGR/9004/15", "Dawit Asefa"),
-    ("UGR/9005/15", "Eyerusalem Hailu"),   # will DROP CS101
-    ("UGR/9006/15", "Feven Mulu"),         # REGISTRATION_OPEN draft
+    ("UGR/9001/19", "Robel Tesfaye"),
+    ("UGR/9002/19", "Bethel Demissie"),
+    ("UGR/9003/19", "Chala Worku"),
+    ("UGR/9004/19", "Dawit Asefa"),
+    ("UGR/9005/19", "Eyerusalem Hailu"),   # will DROP SE101
+    ("UGR/9006/19", "Feven Mulu"),         # REGISTRATION_OPEN draft
 ]
 _TB_DROPPER_INDEX = 4
 _TB_DRAFT_INDEX = 5
 
 TB_SECTION_B_STUDENTS = [
-    ("UGR/9011/15", "Genet Aklilu"),
-    ("UGR/9012/15", "Hana Yonas"),
-    ("UGR/9013/15", "Ibrahim Mohammed"),
-    ("UGR/9014/15", "Jemberu Kassa"),
-    ("UGR/9015/15", "Kalkidan Tadesse"),   # will ADD CS101 from A
+    ("UGR/9011/19", "Genet Aklilu"),
+    ("UGR/9012/19", "Hana Yonas"),
+    ("UGR/9013/19", "Ibrahim Mohammed"),
+    ("UGR/9014/19", "Jemberu Kassa"),
+    ("UGR/9015/19", "Kalkidan Tadesse"),   # will ADD SE101 from A
 ]
 _TB_MOVER_INDEX = 4
 
 
-async def _tb_ensure_term(session: AsyncSession) -> AcademicTerm:
-    existing = (
+async def _tb_get_open_term(session: AsyncSession) -> AcademicTerm:
+    """
+    Fetch the open 2026/2027 phase-1 AcademicTerm. Raises if missing —
+    Track B must run *after* _seed_terms in the same script run.
+    """
+    term = (
         await session.execute(
             select(AcademicTerm).where(
                 AcademicTerm.term_name == TB_TERM_NAME,
-                AcademicTerm.phase == AcademicPhase.ONE,
+                AcademicTerm.phase == TB_TERM_PHASE,
             )
         )
     ).scalar_one_or_none()
-    if existing:
-        return existing
-    term = AcademicTerm(
-        id=_uid_tb("term", TB_TERM_NAME),
-        term_name=TB_TERM_NAME,
-        phase=AcademicPhase.ONE,
-        start_date=date(2026, 9, 1),
-        end_date=date(2027, 1, 31),
-        is_open=True,
-        description="Track B PR 1 manual-test demo term.",
-    )
-    session.add(term)
-    await session.flush()
+    if term is None:
+        raise RuntimeError(
+            f"Track B requires the catalog term '{TB_TERM_NAME}' "
+            f"(phase {TB_TERM_PHASE.value}) — did _seed_terms run?"
+        )
     return term
 
 
-async def _tb_ensure_course(
-    session: AsyncSession, *, code: str, title: str, credits: int,
-) -> Course:
-    existing = (
+async def _tb_get_course(session: AsyncSession, code: str) -> Course:
+    """Fetch a catalog Course by code; raise if it isn't seeded."""
+    course = (
         await session.execute(select(Course).where(Course.code == code))
     ).scalar_one_or_none()
-    if existing:
-        return existing
-    course = Course(
-        id=_uid_tb("course", code),
-        code=code,
-        title=title,
-        credit_hours=credits,
-        semester=TB_SEMESTER,
-        department=TB_DEPARTMENT,
-        description=f"{title} — Track B demo course.",
-    )
-    session.add(course)
-    await session.flush()
+    if course is None:
+        raise RuntimeError(
+            f"Track B requires catalog course '{code}' — did _seed_courses run?"
+        )
     return course
 
 
-async def _tb_ensure_instructor(session: AsyncSession) -> Instructor:
-    existing = (
+async def _tb_get_instructor(session: AsyncSession) -> Instructor:
+    """Fetch the SE instructor used for the Track B demo."""
+    instructor = (
         await session.execute(
             select(Instructor).where(
                 Instructor.instructor_id == TB_INSTRUCTOR_STAFF_ID
             )
         )
     ).scalar_one_or_none()
-    if existing:
-        return existing
-    slug = TB_INSTRUCTOR_STAFF_ID.lower().replace("/", "-")
-    user = await _ensure_user(
-        session,
-        email=f"{slug}@aau.edu.et",
-        first_name=TB_INSTRUCTOR_FIRST,
-        last_name=TB_INSTRUCTOR_LAST,
-        role=UserRole.INSTRUCTOR,
-        user_uid=_uid_tb("user", "instructor", TB_INSTRUCTOR_STAFF_ID),
-    )
-    instructor = Instructor(
-        id=_uid_tb("instructor", TB_INSTRUCTOR_STAFF_ID),
-        user_id=user.id,
-        instructor_id=TB_INSTRUCTOR_STAFF_ID,
-        department=TB_DEPARTMENT,
-    )
-    session.add(instructor)
-    await session.flush()
+    if instructor is None:
+        raise RuntimeError(
+            f"Track B requires instructor '{TB_INSTRUCTOR_STAFF_ID}' — "
+            "did _seed_instructors run?"
+        )
     return instructor
 
 
-async def _tb_ensure_department_head(
+async def _tb_get_department_head(
     session: AsyncSession,
 ) -> CourseManagementOfficer:
-    existing = (
+    """Fetch the SE department head used for the Track B demo."""
+    officer = (
         await session.execute(
             select(CourseManagementOfficer).where(
                 CourseManagementOfficer.staff_id == TB_DH_STAFF_ID,
             )
         )
     ).scalar_one_or_none()
-    if existing:
-        return existing
-    slug = TB_DH_STAFF_ID.lower().replace("/", "-")
-    user = await _ensure_user(
-        session,
-        email=f"{slug}@aau.edu.et",
-        first_name=TB_DH_FIRST,
-        last_name=TB_DH_LAST,
-        role=UserRole.REGISTRAR_OFFICER,
-        user_uid=_uid_tb("user", "officer", TB_DH_STAFF_ID),
-    )
-    officer = CourseManagementOfficer(
-        id=_uid_tb("officer", TB_DH_STAFF_ID),
-        user_id=user.id,
-        staff_id=TB_DH_STAFF_ID,
-        role=OfficerRole.DEPARTMENT_HEAD,
-        authorization_level=5,
-    )
-    session.add(officer)
-    await session.flush()
+    if officer is None:
+        raise RuntimeError(
+            f"Track B requires department head '{TB_DH_STAFF_ID}' — "
+            "did _seed_officers run?"
+        )
     return officer
 
 
@@ -1919,27 +1939,28 @@ async def _tb_ensure_schedule_addition(
 
 async def _seed_track_b_roster(session: AsyncSession) -> None:
     """Build the Track B PR 1 demo scenario end-to-end. Idempotent."""
-    print(">> Track B PR 1 — roster seed")
+    print(">> Track B PR 1 — roster seed (catalog-integrated)")
 
-    term = await _tb_ensure_term(session)
-    print(f"   term:          {term.term_name} ({term.id})")
-
-    course = await _tb_ensure_course(
-        session, code=TB_COURSE_CODE,
-        title=TB_COURSE_TITLE, credits=TB_COURSE_CREDITS,
-    )
-    secondary_course = await _tb_ensure_course(
-        session, code=TB_SECONDARY_COURSE_CODE,
-        title=TB_SECONDARY_COURSE_TITLE, credits=TB_SECONDARY_COURSE_CREDITS,
+    term = await _tb_get_open_term(session)
+    print(
+        f"   term:          {term.term_name} (phase {term.phase.value}) "
+        f"({term.id})"
     )
 
-    instructor = await _tb_ensure_instructor(session)
-    print(f"   instructor:    {TB_INSTRUCTOR_FIRST} {TB_INSTRUCTOR_LAST}")
-    print(f"                  login: staff-9991-15@aau.edu.et / password123")
+    course = await _tb_get_course(session, TB_COURSE_CODE)
+    secondary_course = await _tb_get_course(session, TB_SECONDARY_COURSE_CODE)
+    print(
+        f"   courses:       {course.code} ({course.title}) + "
+        f"{secondary_course.code} ({secondary_course.title})"
+    )
 
-    dh = await _tb_ensure_department_head(session)
-    print(f"   dept head:     {TB_DH_FIRST} {TB_DH_LAST}")
-    print(f"                  login: reg-9999-15@aau.edu.et / password123")
+    instructor = await _tb_get_instructor(session)
+    print(f"   instructor:    {TB_INSTRUCTOR_STAFF_ID} (catalog SE staff)")
+    print("                  login: staff-0001-10@aau.edu.et / password123")
+
+    dh = await _tb_get_department_head(session)
+    print(f"   dept head:     {TB_DH_STAFF_ID} (catalog SE dept head)")
+    print("                  login: se.dept.head@aau.edu.et / password123")
 
     await _tb_ensure_instructor_assignment(
         session, instructor=instructor, course=course, term=term,
@@ -1952,7 +1973,7 @@ async def _seed_track_b_roster(session: AsyncSession) -> None:
         session, term=term, section_code="B", capacity=30,
     )
 
-    # CS101 slots: instructor teaches in both A and B.
+    # SE101 slots: instructor teaches in both A and B.
     slot_a_cs101 = await _tb_ensure_slot(
         session,
         section=section_a, course=course, instructor=instructor,
@@ -1978,7 +1999,7 @@ async def _seed_track_b_roster(session: AsyncSession) -> None:
         section=section_b, course=course, instructor=instructor,
         day_of_week="THU", start_hour=11, end_hour=12, room="LAB-2",
     )
-    # MATH101 slot in Section A — verifies GET /me/sections returns
+    # SE102 slot in Section A — verifies GET /me/sections returns
     # two (section, course) pairs for Section A rather than collapsing.
     await _tb_ensure_slot(
         session,
@@ -2009,7 +2030,7 @@ async def _seed_track_b_roster(session: AsyncSession) -> None:
                 session, registration=reg, course=course, is_dropped=dropped,
             )
 
-    # Section B students — one moves CS101 to Section A.
+    # Section B students — one moves SE101 to Section A.
     for i, (student_id, full_name) in enumerate(TB_SECTION_B_STUDENTS):
         student = await _tb_ensure_student(
             session, student_id=student_id, full_name=full_name,
@@ -2033,8 +2054,10 @@ async def _seed_track_b_roster(session: AsyncSession) -> None:
             )
 
     await session.commit()
-    print("✅ Track B PR 1 roster seeded (Section A: 4 originals + 1 added; "
-          "Section B: 4 originals).")
+    print(
+        "✅ Track B PR 1 roster seeded against the open 2026/27 phase-1 term — "
+        "Section A: 4 originals + 1 added; Section B: 4 originals."
+    )
 
 
 # ══════════════════════════════════════════════════════════════
