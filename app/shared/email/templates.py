@@ -14,10 +14,19 @@ _UNIVERSITY_NAME = "Addis Ababa University"
 _UNIVERSITY_TAGLINE = "Office of the Registrar"
 
 
+# Hosted AAU emblem — pointed at a public CDN URL so the logo renders in
+# real inboxes without depending on PUBLIC_APP_BASE_URL being publicly
+# reachable. The on-disk copy at app/shared/email/assets/aau-logo.png is
+# kept as a backup but no longer referenced by the welcome email.
+_UNIVERSITY_LOGO_URL = (
+    "https://www.image2url.com/r2/default/images/"
+    "1779647532429-d3aa9e69-2fc5-4f38-8894-8e34e826ad2c.png"
+)
+
+
 def _university_logo_url() -> str:
-    """Public URL for the AAU emblem, served by the backend static mount."""
-    base = settings.PUBLIC_APP_BASE_URL.rstrip("/")
-    return f"{base}/static/email/aau-logo.png"
+    """Public URL for the AAU emblem used in outbound email."""
+    return _UNIVERSITY_LOGO_URL
 
 
 # Placeholder copy for in-person UAT until scheduling is integrated.
