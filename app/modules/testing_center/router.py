@@ -118,7 +118,9 @@ async def uat_simulation_session(uat_id: str):
     prefix = settings.API_V1_PREFIX
     if not prefix.startswith("/"):
         prefix = "/" + prefix
-    action = f"{base}{prefix}/testing-center/callback/{uat_id}"
+    callback_url = html.escape(
+        f"{base}{prefix}/testing-center/callback/{uat_id}", quote=True
+    )
 
     page = f"""<!DOCTYPE html>
 <html lang="en">
@@ -127,21 +129,127 @@ async def uat_simulation_session(uat_id: str):
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>UAT simulation — {safe_id}</title>
   <style>
-    body {{ font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; color: #0f172a; }}
-    h1 {{ font-size: 1.25rem; }}
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; color: #0f172a; background: #f4f6f8; }}
+    .card {{ background: #fff; border-radius: 12px; padding: 1.75rem 1.5rem; box-shadow: 0 4px 24px rgba(15,23,42,0.08); }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 .75rem; }}
     p {{ color: #475569; line-height: 1.5; }}
     button {{ background: #2563eb; color: #fff; border: none; padding: 0.75rem 1.5rem; border-radius: 999px; font-weight: 600; cursor: pointer; font-size: 1rem; }}
     button:hover {{ background: #1d4ed8; }}
+    button:disabled {{ background: #94a3b8; cursor: not-allowed; }}
     .ref {{ font-family: ui-monospace, monospace; color: #1d4ed8; }}
+
+    /* Popup overlay + modal */
+    .overlay {{
+      position: fixed; inset: 0; background: rgba(15,23,42,0.55);
+      display: none; align-items: center; justify-content: center;
+      padding: 1rem; z-index: 50;
+    }}
+    .overlay.is-open {{ display: flex; }}
+    .modal {{
+      background: #fff; border-radius: 14px; max-width: 26rem; width: 100%;
+      padding: 1.75rem 1.5rem; text-align: center;
+      box-shadow: 0 12px 48px rgba(15,23,42,0.25);
+      animation: pop .18s ease-out;
+    }}
+    @keyframes pop {{ from {{ transform: scale(.94); opacity: 0; }} to {{ transform: scale(1); opacity: 1; }} }}
+    .icon {{
+      width: 56px; height: 56px; border-radius: 50%; margin: 0 auto .75rem;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 28px; font-weight: 700; color: #fff;
+    }}
+    .icon-ok {{ background: #16a34a; }}
+    .icon-err {{ background: #dc2626; }}
+    .modal h2 {{ margin: 0 0 .5rem; font-size: 1.15rem; color: #0f172a; }}
+    .modal .score {{
+      display: inline-block; margin: .5rem 0 1rem;
+      padding: .5rem 1.25rem; background: #ecfdf5; color: #047857;
+      border-radius: 999px; font-family: ui-monospace, monospace;
+      font-size: 1.5rem; font-weight: 700;
+    }}
+    .modal .body {{ color: #475569; font-size: .95rem; line-height: 1.5; margin: 0 0 1.25rem; }}
+    .modal .close {{
+      background: #1d4ed8; color: #fff; border: none;
+      padding: .6rem 1.4rem; border-radius: 999px; font-weight: 600; cursor: pointer;
+    }}
   </style>
 </head>
 <body>
-  <h1>Record simulated UAT result</h1>
-  <p>UAT reference: <span class="ref">{safe_id}</span></p>
-  <p>This simulates completing the on-site UAT and sending the result to the registrar system. Click only when you are ready to record your simulated score.</p>
-  <form method="post" action="{html.escape(action, quote=True)}">
-    <button type="submit">Take test (simulate)</button>
-  </form>
+  <div class="card">
+    <h1>Record simulated UAT result</h1>
+    <p>UAT reference: <span class="ref">{safe_id}</span></p>
+    <p>This simulates completing the on-site UAT and sending the result to the registrar system. Click only when you are ready to record your simulated score.</p>
+    <button id="take-btn" type="button">Take test (simulate)</button>
+  </div>
+
+  <div class="overlay" id="overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal">
+      <div class="icon" id="modal-icon">✓</div>
+      <h2 id="modal-title">UAT recorded</h2>
+      <div class="score" id="modal-score" style="display:none;"></div>
+      <p class="body" id="modal-body"></p>
+      <button class="close" id="close-btn" type="button">Close</button>
+    </div>
+  </div>
+
+  <script>
+    (function () {{
+      const callbackUrl = "{callback_url}";
+      const btn = document.getElementById('take-btn');
+      const overlay = document.getElementById('overlay');
+      const icon = document.getElementById('modal-icon');
+      const title = document.getElementById('modal-title');
+      const scoreEl = document.getElementById('modal-score');
+      const body = document.getElementById('modal-body');
+      const closeBtn = document.getElementById('close-btn');
+
+      function showSuccess(score, message) {{
+        icon.className = 'icon icon-ok';
+        icon.textContent = '✓';
+        title.textContent = 'UAT recorded successfully';
+        scoreEl.textContent = score + ' / 100';
+        scoreEl.style.display = 'inline-block';
+        body.textContent = message || 'Your simulated UAT result has been sent to the registrar. You can close this window.';
+        overlay.classList.add('is-open');
+      }}
+
+      function showError(message) {{
+        icon.className = 'icon icon-err';
+        icon.textContent = '!';
+        title.textContent = 'Could not record UAT';
+        scoreEl.style.display = 'none';
+        body.textContent = message || 'Something went wrong. Please try again later or contact the registrar.';
+        overlay.classList.add('is-open');
+      }}
+
+      closeBtn.addEventListener('click', () => overlay.classList.remove('is-open'));
+      overlay.addEventListener('click', (e) => {{ if (e.target === overlay) overlay.classList.remove('is-open'); }});
+
+      btn.addEventListener('click', async () => {{
+        btn.disabled = true;
+        btn.textContent = 'Submitting…';
+        try {{
+          const res = await fetch(callbackUrl, {{
+            method: 'POST',
+            headers: {{ 'Accept': 'application/json' }},
+          }});
+          const data = await res.json().catch(() => ({{}}));
+          if (res.ok) {{
+            showSuccess(data.score, data.message);
+          }} else {{
+            const detail = (data && (data.detail || data.message)) || ('Request failed (' + res.status + ')');
+            showError(detail);
+            btn.disabled = false;
+            btn.textContent = 'Take test (simulate)';
+          }}
+        }} catch (err) {{
+          showError('Network error. Please check your connection and try again.');
+          btn.disabled = false;
+          btn.textContent = 'Take test (simulate)';
+        }}
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
     return HTMLResponse(content=page)
