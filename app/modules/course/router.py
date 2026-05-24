@@ -297,8 +297,12 @@ async def register_me(
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
     except ComplianceCheckFailedError as exc:
+        # ComplianceCheckFailedError carries .payload (the structured
+        # agent verdict), not .detail. Surface the payload so the
+        # student can see *why* their courses were rejected.
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.payload,
         )
     return RegistrationSubmitResponse(
         registration=registration, compliance=compliance,
