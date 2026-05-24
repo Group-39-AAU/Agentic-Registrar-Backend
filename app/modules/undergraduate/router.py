@@ -74,6 +74,59 @@ async def list_open_admission_terms(
     return await svc.list_open_admission_terms()
 
 
+@router.get("/admission-terms", response_model=list[AdmissionTermResponse])
+async def list_admission_terms(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List every admission term (newest-first), regardless of ``is_open``.
+    Used by the officer terms-management page.
+    """
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(403, "Only registrar officers or admins can browse all admission terms")
+    svc = ApplicationService(db)
+    return await svc.list_admission_terms()
+
+
+@router.post(
+    "/admission-terms/{term_id}/open",
+    response_model=AdmissionTermResponse,
+)
+async def open_admission_term(
+    term_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set ``is_open=true`` on an admission term (idempotent)."""
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(403, "Only registrar officers or admins can open admission terms")
+    svc = ApplicationService(db)
+    try:
+        return await svc.set_admission_term_open(term_id, True)
+    except EntityNotFoundError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.post(
+    "/admission-terms/{term_id}/close",
+    response_model=AdmissionTermResponse,
+)
+async def close_admission_term(
+    term_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set ``is_open=false`` on an admission term (idempotent)."""
+    if current_user.role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+        raise HTTPException(403, "Only registrar officers or admins can close admission terms")
+    svc = ApplicationService(db)
+    try:
+        return await svc.set_admission_term_open(term_id, False)
+    except EntityNotFoundError as e:
+        raise HTTPException(404, str(e))
+
+
 # ── Exception → HTTP mapping ─────────────────────────────────
 
 def _handle_domain_error(e: Exception) -> None:

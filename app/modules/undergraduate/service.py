@@ -532,6 +532,38 @@ class ApplicationService:
         )
         return [AdmissionTermResponse.model_validate(t) for t in result.scalars().all()]
 
+    async def list_admission_terms(self) -> list[AdmissionTermResponse]:
+        """All non-deleted admission terms (newest-first), regardless of is_open."""
+        result = await self._db.execute(
+            select(UndergraduateAdmissionTerm)
+            .where(UndergraduateAdmissionTerm.is_deleted == False)  # noqa: E712
+            .order_by(UndergraduateAdmissionTerm.start_date.desc())
+        )
+        return [AdmissionTermResponse.model_validate(t) for t in result.scalars().all()]
+
+    async def set_admission_term_open(
+        self, term_id: uuid.UUID, is_open: bool,
+    ) -> AdmissionTermResponse:
+        """
+        Toggle the ``is_open`` flag. Idempotent: setting open=true on an
+        already-open term (or close on an already-closed one) just
+        returns the current state.
+        """
+        result = await self._db.execute(
+            select(UndergraduateAdmissionTerm).where(
+                UndergraduateAdmissionTerm.id == term_id,
+                UndergraduateAdmissionTerm.is_deleted == False,  # noqa: E712
+            )
+        )
+        term = result.scalar_one_or_none()
+        if term is None:
+            raise EntityNotFoundError("UndergraduateAdmissionTerm", str(term_id))
+        if term.is_open != is_open:
+            term.is_open = is_open
+            await self._db.commit()
+            await self._db.refresh(term)
+        return AdmissionTermResponse.model_validate(term)
+
     async def _ensure_open_admission_term(self, term_id: uuid.UUID) -> None:
         result = await self._db.execute(
             select(UndergraduateAdmissionTerm).where(
