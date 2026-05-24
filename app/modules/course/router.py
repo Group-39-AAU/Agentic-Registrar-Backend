@@ -411,13 +411,13 @@ async def officer_allocate_sections(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer-only: group every REGISTERED student in this department
-    (across semesters 1–10) into cohort sections sized to the
-    department's :class:`Classroom` inventory. Every
-    ``Registration.section_id`` in the department gets pinned.
+    Department-Head-only (admins also allowed): group every REGISTERED
+    student in this department (across semesters 1–10) into cohort
+    sections sized to the department's :class:`Classroom` inventory.
+    Every ``Registration.section_id`` in the department gets pinned.
 
     Does *not* emit weekly class meetings — that's the separate
-    :func:`officer_generate_timetable` call below, which the officer
+    :func:`officer_generate_timetable` call below, which the DH
     runs after reviewing the cohort split.
 
     Idempotent on re-runs: students already pinned stay put; new
@@ -430,8 +430,7 @@ async def officer_allocate_sections(
         result = await svc.allocate_sections(
             term_id=payload.term_id,
             department=department,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            officer_user_id=current_user.id,
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
@@ -455,9 +454,10 @@ async def officer_generate_timetable(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer-only: build the per-section weekly schedule
-    (``ClassScheduleSlot`` rows) for every Section the department
-    has. Total weekly hours per course == ``course.credit_hours``.
+    Department-Head-only (admins also allowed): build the per-section
+    weekly schedule (``ClassScheduleSlot`` rows) for every Section
+    the department has. Total weekly hours per course ==
+    ``course.credit_hours``.
 
     Prerequisite: :func:`officer_allocate_sections` must have run for
     this (term, department) — if no sections exist yet, the response
@@ -472,8 +472,7 @@ async def officer_generate_timetable(
         result = await svc.generate_timetable(
             term_id=payload.term_id,
             department=department,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            officer_user_id=current_user.id,
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
@@ -503,7 +502,7 @@ async def officer_list_conflicts(
     try:
         rows = await svc.list_open_conflicts(
             term_id=term_id,
-            officer_role=current_user.role,
+            officer_user_id=current_user.id,
             department=department,
         )
     except UnauthorizedActorError as exc:
@@ -523,18 +522,17 @@ async def officer_assign_slot_instructor(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer-only: replace the instructor on a single
-    ``ClassScheduleSlot``. Refuses with 422 if the new instructor is
-    already booked elsewhere in the term at the same
-    ``(day_of_week, start_time)``.
+    Department-Head-only (admins also allowed): replace the
+    instructor on a single ``ClassScheduleSlot``. Refuses with 422
+    if the new instructor is already booked elsewhere in the term
+    at the same ``(day_of_week, start_time)``.
     """
     svc = SchedulingService(db)
     try:
         slot = await svc.assign_instructor_to_slot(
             slot_id=slot_id,
             instructor_id=payload.instructor_id,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            officer_user_id=current_user.id,
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)

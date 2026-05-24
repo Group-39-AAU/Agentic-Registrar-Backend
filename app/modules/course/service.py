@@ -1490,20 +1490,22 @@ class SchedulingService:
         self,
         term_id: uuid.UUID,
         department: str,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
     ) -> dict:
         """
         Run cohort allocation only (no schedule slots yet) for a
-        single (term, department) pair. Officer-only.
+        single (term, department) pair. Department-Head-only (admins
+        also allowed); plain registrar officers cannot trigger.
 
         After this returns, every REGISTERED student in the
         department has a ``Registration.section_id`` set. The
         per-class meetings (``ClassScheduleSlot`` rows) come from a
-        separate :meth:`generate_timetable` call so the officer can
+        separate :meth:`generate_timetable` call so the DH can
         review the allocation before locking in the schedule.
         """
-        self._require_officer(officer_role)
+        actor_role = await self._require_dh_or_admin(
+            officer_user_id, requested_department=department,
+        )
         term = await self.terms.get(term_id)
         if term is None:
             raise EntityNotFoundError("AcademicTerm", str(term_id))
@@ -1532,8 +1534,8 @@ class SchedulingService:
 
         write_audit_log(
             action="course.sections.allocated",
-            actor_role=officer_role.value,
-            actor_id=officer_id,
+            actor_role=actor_role,
+            actor_id=officer_user_id,
             resource_type="AcademicTerm",
             resource_id=term_id,
             decision="ok",
@@ -1559,12 +1561,12 @@ class SchedulingService:
         self,
         term_id: uuid.UUID,
         department: str,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
     ) -> dict:
         """
         Build the per-section weekly schedule (``ClassScheduleSlot``
-        rows) for every Section the department already has. Requires
+        rows) for every Section the department already has.
+        Department-Head-only (admins also allowed). Requires
         :meth:`allocate_sections` to have run first — if no sections
         exist for this (term, department), the response will be
         empty.
@@ -1572,7 +1574,9 @@ class SchedulingService:
         Idempotent: re-runs delete the department's existing slots
         and rebuild from scratch.
         """
-        self._require_officer(officer_role)
+        actor_role = await self._require_dh_or_admin(
+            officer_user_id, requested_department=department,
+        )
         term = await self.terms.get(term_id)
         if term is None:
             raise EntityNotFoundError("AcademicTerm", str(term_id))
@@ -1602,8 +1606,8 @@ class SchedulingService:
 
         write_audit_log(
             action="course.timetable.generated",
-            actor_role=officer_role.value,
-            actor_id=officer_id,
+            actor_role=actor_role,
+            actor_id=officer_user_id,
             resource_type="AcademicTerm",
             resource_id=term_id,
             decision="ok",
@@ -1624,11 +1628,60 @@ class SchedulingService:
             "conflict_ids": [str(cid) for cid in artefact.conflict_ids],
         }
 
-    def _require_officer(self, officer_role: UserRole) -> None:
-        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
-            raise UnauthorizedActorError(
-                "Only registrar officers or admins can run scheduling."
+    async def _require_dh_or_admin(
+        self,
+        officer_user_id: uuid.UUID,
+        requested_department: Optional[str] = None,
+    ) -> str:
+        """
+        Resolve the calling user; allow `ADMIN` users through, or
+        users whose ``CourseManagementOfficer.role`` is
+        ``DEPARTMENT_HEAD``. Plain registrar officers and any other
+        role are rejected.
+
+        When ``requested_department`` is provided and the caller is a
+        DH, the helper additionally enforces that the DH's
+        ``CourseManagementOfficer.department`` matches it. Admins
+        bypass this check (they can operate across departments).
+
+        Returns the resolved actor role label ("ADMIN" or
+        "DEPARTMENT_HEAD") for use in audit-log entries.
+        """
+        from app.modules.auth.models import User as _User
+        user = await self.db.get(_User, officer_user_id)
+        if user is None:
+            raise UnauthorizedActorError("Calling user not found.")
+        if user.role == UserRole.ADMIN:
+            return UserRole.ADMIN.value
+        officer = (
+            await self.db.execute(
+                select(CourseManagementOfficer).where(
+                    CourseManagementOfficer.user_id == officer_user_id,
+                    CourseManagementOfficer.is_deleted == False,  # noqa: E712
+                )
             )
+        ).scalar_one_or_none()
+        if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
+            raise UnauthorizedActorError(
+                "Only a Department Head (or admin) may run scheduling."
+            )
+        # DH must have a department assigned, and (when the caller
+        # specified one) the two must match.
+        if officer.department is None:
+            raise UnauthorizedActorError(
+                f"Department Head '{officer.staff_id}' has no department "
+                "assigned — cannot run scheduling. Contact an administrator."
+            )
+        if (
+            requested_department is not None
+            and officer.department != requested_department
+        ):
+            raise UnauthorizedActorError(
+                f"Department Head '{officer.staff_id}' is scoped to "
+                f"'{officer.department}' and cannot run scheduling for "
+                f"'{requested_department}'."
+            )
+        return OfficerRole.DEPARTMENT_HEAD.value
 
     # ── Read views ───────────────────────────────────────────────
 
@@ -2093,23 +2146,23 @@ class SchedulingService:
         self,
         slot_id: uuid.UUID,
         instructor_id: uuid.UUID,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
     ) -> ClassScheduleSlot:
         """
-        Officer-only: change the instructor pinned to one
-        ``ClassScheduleSlot`` row. Refuses if the new instructor is
-        already booked at the same ``(day_of_week, start_time)`` in
-        any other slot in the term — that would create the same
-        collision the generator avoids.
+        Department-Head-only (admins also allowed): change the
+        instructor pinned to one ``ClassScheduleSlot`` row. Refuses
+        if the new instructor is already booked at the same
+        ``(day_of_week, start_time)`` in any other slot in the term —
+        that would create the same collision the generator avoids.
 
         Raises:
-            UnauthorizedActorError: caller is not officer/admin.
+            UnauthorizedActorError: caller is not DH or admin, or the
+                slot belongs to a different department than the DH.
             EntityNotFoundError: slot or instructor doesn't exist.
             InvalidAdjustmentRequestError: instructor already booked.
         """
-        self._require_officer(officer_role)
-
+        # Resolve the slot's department first so DH scoping rejects a
+        # cross-department reassignment attempt before any other work.
         slot = (
             await self.db.execute(
                 select(ClassScheduleSlot).where(
@@ -2119,6 +2172,14 @@ class SchedulingService:
         ).scalar_one_or_none()
         if slot is None:
             raise EntityNotFoundError("ClassScheduleSlot", str(slot_id))
+        slot_dept = (
+            await self.db.execute(
+                select(Section.department).where(Section.id == slot.section_id)
+            )
+        ).scalar_one()
+        actor_role = await self._require_dh_or_admin(
+            officer_user_id, requested_department=slot_dept,
+        )
 
         instructor = (
             await self.db.execute(
@@ -2166,8 +2227,8 @@ class SchedulingService:
 
         write_audit_log(
             action="course.slot.instructor_reassigned",
-            actor_role=officer_role.value,
-            actor_id=officer_id,
+            actor_role=actor_role,
+            actor_id=officer_user_id,
             resource_type="ClassScheduleSlot",
             resource_id=slot.id,
             decision="ok",
@@ -2184,21 +2245,39 @@ class SchedulingService:
     async def list_open_conflicts(
         self,
         term_id: uuid.UUID,
-        officer_role: UserRole,
+        officer_user_id: uuid.UUID,
         department: Optional[str] = None,
     ) -> list[ScheduleConflict]:
-        """Officer-only: list every OPEN ScheduleConflict in the term."""
-        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
-            raise UnauthorizedActorError(
-                "Only registrar officers or admins can view the conflict report."
-            )
+        """
+        Department-Head-only (admins allowed): list every OPEN
+        ScheduleConflict in the term. For DHs, results are always
+        scoped to the DH's own department even if no ``department``
+        filter is passed — they should never see another department's
+        conflicts. Admins see all departments unless they pass a
+        filter.
+        """
+        actor_role = await self._require_dh_or_admin(
+            officer_user_id, requested_department=department,
+        )
         from app.shared.enums import ScheduleConflictStatus
         stmt = select(ScheduleConflict).where(
             ScheduleConflict.term_id == term_id,
             ScheduleConflict.status == ScheduleConflictStatus.OPEN,
         )
-        if department:
-            stmt = stmt.where(ScheduleConflict.department == department)
+        effective_dept = department
+        if actor_role == OfficerRole.DEPARTMENT_HEAD.value and not effective_dept:
+            # DH didn't pass a filter — pin to their own department.
+            officer = (
+                await self.db.execute(
+                    select(CourseManagementOfficer).where(
+                        CourseManagementOfficer.user_id == officer_user_id,
+                        CourseManagementOfficer.is_deleted == False,  # noqa: E712
+                    )
+                )
+            ).scalar_one()
+            effective_dept = officer.department
+        if effective_dept:
+            stmt = stmt.where(ScheduleConflict.department == effective_dept)
         return list((await self.db.execute(stmt)).scalars().all())
 
 

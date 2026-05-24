@@ -446,16 +446,53 @@ STUDENTS = [
 #  Officers
 # ══════════════════════════════════════════════════════════════
 
+# Tuple shape: (staff_id, first_name, last_name, role, level, email, department)
+# Department is None for plain registrar officers; required for every
+# DEPARTMENT_HEAD because scheduling auth checks scope DH access to
+# their own department only. One DH per department (6 total) so every
+# department in the catalog has its own scheduling owner.
 OFFICERS = [
     (
         "REG/9001/10", "Tewodros", "Adane",
         OfficerRole.REGISTRAR_OFFICER, 5,
         "registrar.officer@aau.edu.et",
+        None,
     ),
     (
         "REG/9002/10", "Selamawit", "Mengistu",
         OfficerRole.DEPARTMENT_HEAD, 3,
         "se.dept.head@aau.edu.et",
+        "Software Engineering",
+    ),
+    (
+        "REG/9003/10", "Mulu", "Tadesse",
+        OfficerRole.DEPARTMENT_HEAD, 3,
+        "ee.dept.head@aau.edu.et",
+        "Electrical Engineering",
+    ),
+    (
+        "REG/9004/10", "Henok", "Asfaw",
+        OfficerRole.DEPARTMENT_HEAD, 3,
+        "che.dept.head@aau.edu.et",
+        "Chemical Engineering",
+    ),
+    (
+        "REG/9005/10", "Genet", "Worku",
+        OfficerRole.DEPARTMENT_HEAD, 3,
+        "ce.dept.head@aau.edu.et",
+        "Civil Engineering",
+    ),
+    (
+        "REG/9006/10", "Bereket", "Gebre",
+        OfficerRole.DEPARTMENT_HEAD, 3,
+        "me.dept.head@aau.edu.et",
+        "Mechanical Engineering",
+    ),
+    (
+        "REG/9007/10", "Tigist", "Kebede",
+        OfficerRole.DEPARTMENT_HEAD, 3,
+        "bme.dept.head@aau.edu.et",
+        "Bio Medical Engineering",
     ),
 ]
 
@@ -924,8 +961,15 @@ async def _seed_officers(session: AsyncSession) -> None:
     by_staff = {o.staff_id: o for o in existing}
 
     new_count = 0
-    for staff_id, first_name, last_name, role, level, email in OFFICERS:
+    reconciled = 0
+    for staff_id, first_name, last_name, role, level, email, department in OFFICERS:
         if staff_id in by_staff:
+            # Re-runs reconcile the department column on existing
+            # rows so seeds predating the column gain it on next seed.
+            row = by_staff[staff_id]
+            if row.department != department:
+                row.department = department
+                reconciled += 1
             continue
         user = await _ensure_user(
             session,
@@ -941,6 +985,7 @@ async def _seed_officers(session: AsyncSession) -> None:
                 user_id=user.id,
                 staff_id=staff_id,
                 role=role,
+                department=department,
                 authorization_level=level,
             )
         )
@@ -949,6 +994,8 @@ async def _seed_officers(session: AsyncSession) -> None:
     await session.commit()
     if new_count:
         print(f"✅ Seeded {new_count} course-management officers.")
+    elif reconciled:
+        print(f"↻  Reconciled department on {reconciled} existing officer(s).")
     else:
         print(f"⚠️  All {len(existing)} officers already present — skipping.")
 
