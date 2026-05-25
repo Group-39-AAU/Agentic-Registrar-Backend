@@ -1825,8 +1825,15 @@ class SchedulingService:
                 }
                 cohort_rows = list((
                     await self.db.execute(
-                        select(ClassScheduleSlot, Course).join(
+                        select(
+                            ClassScheduleSlot, Course, Instructor, User,
+                        ).join(
                             Course, Course.id == ClassScheduleSlot.course_id,
+                        ).outerjoin(
+                            Instructor,
+                            Instructor.id == ClassScheduleSlot.instructor_id,
+                        ).outerjoin(
+                            User, User.id == Instructor.user_id,
                         ).where(
                             ClassScheduleSlot.section_id == registration.section_id,
                             ClassScheduleSlot.course_id.in_(active_course_ids)
@@ -1845,6 +1852,8 @@ class SchedulingService:
                     ClassScheduleSlot,
                     Course,
                     Section,
+                    Instructor,
+                    User,
                 ).join(
                     ClassScheduleSlot,
                     ClassScheduleSlot.id == StudentScheduleAddition.schedule_slot_id,
@@ -1852,6 +1861,11 @@ class SchedulingService:
                     Course, Course.id == ClassScheduleSlot.course_id,
                 ).join(
                     Section, Section.id == ClassScheduleSlot.section_id,
+                ).outerjoin(
+                    Instructor,
+                    Instructor.id == ClassScheduleSlot.instructor_id,
+                ).outerjoin(
+                    User, User.id == Instructor.user_id,
                 ).where(
                     StudentScheduleAddition.registration_id == registration.id,
                 )
@@ -1861,7 +1875,7 @@ class SchedulingService:
         # Effective slot list = cohort slots + addition slots, sorted
         # together so the portal renders a single weekly view.
         items: list[dict] = []
-        for slot, course in cohort_rows:
+        for slot, course, instructor, user in cohort_rows:
             items.append({
                 "course_id": str(course.id),
                 "course_code": course.code,
@@ -1871,6 +1885,13 @@ class SchedulingService:
                 "end_time": slot.end_time.isoformat(timespec="minutes"),
                 "instructor_id": (
                     str(slot.instructor_id) if slot.instructor_id else None
+                ),
+                "instructor_name": (
+                    f"{user.first_name} {user.last_name}".strip()
+                    if user is not None else None
+                ),
+                "instructor_staff_id": (
+                    instructor.instructor_id if instructor is not None else None
                 ),
                 "room": slot.room,
                 "source": "cohort",
@@ -1879,7 +1900,7 @@ class SchedulingService:
                     if registration.section_id else None
                 ),
             })
-        for _addition, slot, course, source_section in addition_rows:
+        for _addition, slot, course, source_section, instructor, user in addition_rows:
             items.append({
                 "course_id": str(course.id),
                 "course_code": course.code,
@@ -1889,6 +1910,13 @@ class SchedulingService:
                 "end_time": slot.end_time.isoformat(timespec="minutes"),
                 "instructor_id": (
                     str(slot.instructor_id) if slot.instructor_id else None
+                ),
+                "instructor_name": (
+                    f"{user.first_name} {user.last_name}".strip()
+                    if user is not None else None
+                ),
+                "instructor_staff_id": (
+                    instructor.instructor_id if instructor is not None else None
                 ),
                 "room": slot.room,
                 "source": "addition",
