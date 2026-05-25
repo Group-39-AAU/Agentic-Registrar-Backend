@@ -325,7 +325,7 @@ async def test_submit_batch_lands_in_agent_approved_when_clean(
 
 async def test_officer_approve_applies_changes_and_records_decision(
     async_session, cs_student, cs_registration, cs_catalog, paid_pay,
-    seeded_officer,
+    seeded_department_head,
 ):
     # Pad load so DROP doesn't trip the floor.
     extra_course = Course(
@@ -353,11 +353,10 @@ async def test_officer_approve_applies_changes_and_records_decision(
 
     applied = await svc.officer_approve_batch(
         batch.id,
-        officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=seeded_officer.user_id,
+        user_id=seeded_department_head.user_id,
     )
     assert applied.status == AddDropBatchStatus.APPLIED
-    assert applied.officer_id == seeded_officer.user_id
+    assert applied.officer_id == seeded_department_head.user_id
     assert applied.officer_decision_at is not None
 
     # Registration mutation visible: CS202 link is now dropped.
@@ -374,7 +373,7 @@ async def test_officer_approve_applies_changes_and_records_decision(
 
 async def test_officer_override_applies_denied_batch_with_justification(
     async_session, cs_student, cs_registration, cs_catalog, paid_pay,
-    seeded_officer,
+    seeded_department_head,
 ):
     agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
     svc = AddDropService(async_session, adjustment_agent=agent)
@@ -389,8 +388,7 @@ async def test_officer_override_applies_denied_batch_with_justification(
 
     applied = await svc.officer_override_batch(
         batch.id,
-        officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=seeded_officer.user_id,
+        user_id=seeded_department_head.user_id,
         justification="Student needs CS101 for an out-of-cycle make-up.",
     )
     assert applied.status == AddDropBatchStatus.APPLIED
@@ -411,7 +409,7 @@ async def test_officer_override_applies_denied_batch_with_justification(
 
 async def test_officer_override_requires_agent_denied_status(
     async_session, cs_student, cs_registration, cs_catalog, paid_pay,
-    seeded_officer,
+    seeded_department_head,
 ):
     """Cannot 'override' an AGENT_APPROVED batch — use approve."""
     # Pad load + drop so the batch is AGENT_APPROVED.
@@ -439,15 +437,14 @@ async def test_officer_override_requires_agent_denied_status(
     with pytest.raises(InvalidAdjustmentRequestError):
         await svc.officer_override_batch(
             batch.id,
-            officer_role=UserRole.REGISTRAR_OFFICER,
-            officer_id=seeded_officer.user_id,
+            user_id=seeded_department_head.user_id,
             justification="trying to override an approved batch",
         )
 
 
 async def test_officer_reject_finalises_denial_without_applying(
     async_session, cs_student, cs_registration, cs_catalog, paid_pay,
-    seeded_officer,
+    seeded_department_head,
 ):
     agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
     svc = AddDropService(async_session, adjustment_agent=agent)
@@ -459,8 +456,7 @@ async def test_officer_reject_finalises_denial_without_applying(
     )
     rejected = await svc.officer_reject_batch(
         batch.id,
-        officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=seeded_officer.user_id,
+        user_id=seeded_department_head.user_id,
         justification="Agent decision stands.",
     )
     assert rejected.status == AddDropBatchStatus.REJECTED
@@ -476,9 +472,72 @@ async def test_officer_reject_finalises_denial_without_applying(
     assert link is None
 
 
-async def test_officer_actions_reject_non_officer_role(
+async def test_officer_actions_reject_non_dh_role(
+    async_session, cs_student, cs_registration, cs_catalog, paid_pay,
+    seeded_officer,
+):
+    """
+    Plain students AND plain REGISTRAR_OFFICERs are now rejected —
+    only DEPARTMENT_HEAD officers (or ADMIN users) may act on
+    add/drop batches.
+    """
+    agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
+    svc = AddDropService(async_session, adjustment_agent=agent)
+    batch = await svc.submit_batch(
+        registration_id=cs_registration.id,
+        items=[(cs_catalog["CS101"].id, AddDropAction.ADD)],
+        student_user_id=cs_student.user_id,
+        deadline=date(2099, 1, 1),
+    )
+    # Student → 403
+    with pytest.raises(UnauthorizedActorError):
+        await svc.officer_override_batch(
+            batch.id,
+            user_id=cs_student.user_id,
+            justification="not allowed",
+        )
+    # Plain registrar officer (non-DH) → 403
+    with pytest.raises(UnauthorizedActorError):
+        await svc.officer_override_batch(
+            batch.id,
+            user_id=seeded_officer.user_id,
+            justification="non-DH officer",
+        )
+
+
+async def test_officer_actions_reject_dh_from_other_department(
     async_session, cs_student, cs_registration, cs_catalog, paid_pay,
 ):
+    """
+    A DH for a different department cannot act on a CS student's
+    batch — the per-batch department guard fires even though the
+    role check passes.
+    """
+    from app.modules.auth.models import User
+    from app.modules.course.models import CourseManagementOfficer
+
+    other_user = User(
+        id=uuid.uuid4(),
+        email="dh-ee@aau.edu.et",
+        first_name="Other",
+        last_name="DH",
+        hashed_password="not-a-real-hash",
+        role=UserRole.REGISTRAR_OFFICER,
+        is_active=True,
+    )
+    async_session.add(other_user)
+    await async_session.flush()
+    async_session.add(CourseManagementOfficer(
+        user_id=other_user.id,
+        staff_id="DH/EE/01",
+        role=__import__(
+            "app.shared.enums", fromlist=["OfficerRole"],
+        ).OfficerRole.DEPARTMENT_HEAD,
+        department="Electrical Engineering",
+        authorization_level=5,
+    ))
+    await async_session.flush()
+
     agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
     svc = AddDropService(async_session, adjustment_agent=agent)
     batch = await svc.submit_batch(
@@ -488,19 +547,18 @@ async def test_officer_actions_reject_non_officer_role(
         deadline=date(2099, 1, 1),
     )
     with pytest.raises(UnauthorizedActorError):
-        await svc.officer_override_batch(
+        await svc.officer_reject_batch(
             batch.id,
-            officer_role=UserRole.STUDENT,
-            officer_id=cs_student.user_id,
-            justification="not allowed",
+            user_id=other_user.id,
+            justification="cross-department attempt",
         )
 
 
 async def test_pending_queue_returns_only_awaiting_decision(
     async_session, cs_student, cs_registration, cs_catalog, paid_pay,
-    seeded_officer,
+    seeded_department_head,
 ):
-    """Officer queue surfaces AGENT_APPROVED and AGENT_DENIED only."""
+    """DH queue surfaces AGENT_APPROVED and AGENT_DENIED only."""
     agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
     svc = AddDropService(async_session, adjustment_agent=agent)
     denied = await svc.submit_batch(
@@ -510,25 +568,25 @@ async def test_pending_queue_returns_only_awaiting_decision(
         deadline=date(2099, 1, 1),
     )
     queue = await svc.list_pending_batches(
-        officer_role=UserRole.REGISTRAR_OFFICER,
+        user_id=seeded_department_head.user_id,
     )
     assert denied.id in {b.id for b in queue}
 
     # Reject it — should drain from the queue.
     await svc.officer_reject_batch(
         denied.id,
-        officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=seeded_officer.user_id,
+        user_id=seeded_department_head.user_id,
         justification="closed",
     )
     queue_after = await svc.list_pending_batches(
-        officer_role=UserRole.REGISTRAR_OFFICER,
+        user_id=seeded_department_head.user_id,
     )
     assert denied.id not in {b.id for b in queue_after}
 
 
 async def test_pending_queue_status_filter_narrows_to_one_state(
     async_session, cs_student, cs_registration, cs_catalog, paid_pay,
+    seeded_department_head,
 ):
     """
     Passing ``statuses={AGENT_DENIED}`` returns denied batches only,
@@ -568,16 +626,90 @@ async def test_pending_queue_status_filter_narrows_to_one_state(
     assert approved.status == AddDropBatchStatus.AGENT_APPROVED
 
     only_denied = await svc.list_pending_batches(
-        officer_role=UserRole.REGISTRAR_OFFICER,
+        user_id=seeded_department_head.user_id,
         statuses={AddDropBatchStatus.AGENT_DENIED},
     )
     assert {b.id for b in only_denied} == {denied.id}
 
     only_approved = await svc.list_pending_batches(
-        officer_role=UserRole.REGISTRAR_OFFICER,
+        user_id=seeded_department_head.user_id,
         statuses={AddDropBatchStatus.AGENT_APPROVED},
     )
     assert {b.id for b in only_approved} == {approved.id}
+
+
+async def test_pending_queue_scopes_to_dh_department(
+    async_session, cs_student, cs_registration, cs_catalog, paid_pay,
+    seeded_department_head,
+):
+    """
+    The DH only sees batches whose student belongs to their
+    department. Batches for a student in a different department are
+    filtered out of the queue.
+    """
+    from app.modules.auth.models import User
+    from app.modules.course.models import Student as StudentModel
+
+    # Build a sibling student in a different department + their own
+    # CS registration so we can submit a batch for them.
+    other_user = User(
+        id=uuid.uuid4(),
+        email="ugr-9000@aau.edu.et",
+        first_name="Other",
+        last_name="Student",
+        hashed_password="not-a-real-hash",
+        role=UserRole.STUDENT,
+        is_active=True,
+    )
+    async_session.add(other_user)
+    await async_session.flush()
+    other_student = StudentModel(
+        user_id=other_user.id,
+        student_id="UGR/9000/14",
+        full_name="Other Student",
+        current_semester=2,
+        department="Electrical Engineering",
+    )
+    async_session.add(other_student)
+    await async_session.flush()
+    other_reg = Registration(
+        student_id=other_student.id,
+        term_id=cs_registration.term_id,
+        status=RegistrationStatus.REGISTERED,
+        sponsorship_type=SponsorshipType.GOVERNMENT,
+    )
+    async_session.add(other_reg)
+    await async_session.flush()
+    async_session.add(RegistrationCourse(
+        registration_id=other_reg.id,
+        course_id=cs_catalog["CS201"].id,
+        is_dropped=False,
+    ))
+    await async_session.flush()
+
+    agent = EnrollmentAdjustmentAgent(payment_service=paid_pay)
+    svc = AddDropService(async_session, adjustment_agent=agent)
+    # In-department batch (cs_student) → should appear.
+    in_dept = await svc.submit_batch(
+        registration_id=cs_registration.id,
+        items=[(cs_catalog["CS101"].id, AddDropAction.ADD)],
+        student_user_id=cs_student.user_id,
+        deadline=date(2099, 1, 1),
+    )
+    # Out-of-department batch (other_student) → should be hidden.
+    out_dept = await svc.submit_batch(
+        registration_id=other_reg.id,
+        items=[(cs_catalog["CS101"].id, AddDropAction.ADD)],
+        student_user_id=other_user.id,
+        deadline=date(2099, 1, 1),
+    )
+
+    queue = await svc.list_pending_batches(
+        user_id=seeded_department_head.user_id,
+    )
+    queue_ids = {b.id for b in queue}
+    assert in_dept.id in queue_ids
+    assert out_dept.id not in queue_ids
 
 
 async def test_submit_batch_rejects_duplicate_course(

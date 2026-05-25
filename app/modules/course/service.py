@@ -2731,17 +2731,18 @@ class AddDropService:
         self,
         batch_id: uuid.UUID,
         *,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        user_id: uuid.UUID,
     ) -> AddDropBatch:
         """
-        Officer approves an AGENT_APPROVED batch. Materialises every
-        item against the registration and transitions the batch to
-        APPLIED. The officer is recorded on the batch + items so the
-        audit trail attributes the apply to a human.
+        Department head approves an AGENT_APPROVED batch. Materialises
+        every item against the registration and transitions the batch
+        to APPLIED. The DH is recorded on the batch + items so the
+        audit trail attributes the apply to a human. DH callers may
+        only act on batches whose student is in their department.
         """
-        self._require_officer_role(officer_role)
+        user, department = await self._resolve_dh_or_403(user_id)
         batch = await self._get_batch_or_404(batch_id)
+        await self._authorize_batch_for_department(batch, department)
         if batch.status != AddDropBatchStatus.AGENT_APPROVED:
             raise InvalidAdjustmentRequestError(
                 f"Cannot approve batch in status {batch.status.value}; "
@@ -2750,8 +2751,8 @@ class AddDropService:
             )
         return await self._apply_batch(
             batch=batch,
-            officer_role=officer_role,
-            officer_id=officer_id,
+            officer_role=user.role,
+            officer_id=user_id,
             justification=None,
             audit_action="course.add_drop.officer_approved",
         )
@@ -2760,21 +2761,22 @@ class AddDropService:
         self,
         batch_id: uuid.UUID,
         *,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        user_id: uuid.UUID,
         justification: str,
     ) -> AddDropBatch:
         """
-        Officer overrides an AGENT_DENIED batch and applies it anyway.
-        Justification is required (and persisted) since the officer is
-        going against the agent's verdict.
+        Department head overrides an AGENT_DENIED batch and applies it
+        anyway. Justification is required (and persisted) since the DH
+        is going against the agent's verdict. DH callers may only act
+        on batches whose student is in their department.
         """
-        self._require_officer_role(officer_role)
+        user, department = await self._resolve_dh_or_403(user_id)
         if not justification or not justification.strip():
             raise InvalidAdjustmentRequestError(
                 "Override justification is required."
             )
         batch = await self._get_batch_or_404(batch_id)
+        await self._authorize_batch_for_department(batch, department)
         if batch.status != AddDropBatchStatus.AGENT_DENIED:
             raise InvalidAdjustmentRequestError(
                 f"Cannot override batch in status {batch.status.value}; "
@@ -2783,8 +2785,8 @@ class AddDropService:
             )
         return await self._apply_batch(
             batch=batch,
-            officer_role=officer_role,
-            officer_id=officer_id,
+            officer_role=user.role,
+            officer_id=user_id,
             justification=justification.strip(),
             audit_action="course.add_drop.officer_override",
         )
@@ -2793,22 +2795,23 @@ class AddDropService:
         self,
         batch_id: uuid.UUID,
         *,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        user_id: uuid.UUID,
         justification: str,
     ) -> AddDropBatch:
         """
-        Officer finalises the denial — no items are applied. Works
-        from either AGENT_APPROVED (officer disagrees with the agent)
-        or AGENT_DENIED (officer agrees with the agent and closes the
-        case). Justification is required.
+        Department head finalises the denial — no items are applied.
+        Works from either AGENT_APPROVED (DH disagrees with the agent)
+        or AGENT_DENIED (DH agrees with the agent and closes the case).
+        Justification is required. DH callers may only act on batches
+        whose student is in their department.
         """
-        self._require_officer_role(officer_role)
+        user, department = await self._resolve_dh_or_403(user_id)
         if not justification or not justification.strip():
             raise InvalidAdjustmentRequestError(
                 "Rejection justification is required."
             )
         batch = await self._get_batch_or_404(batch_id)
+        await self._authorize_batch_for_department(batch, department)
         if batch.status not in {
             AddDropBatchStatus.AGENT_APPROVED,
             AddDropBatchStatus.AGENT_DENIED,
@@ -2819,13 +2822,13 @@ class AddDropService:
                 "a rejection."
             )
         batch.status = AddDropBatchStatus.REJECTED
-        batch.officer_id = officer_id
+        batch.officer_id = user_id
         batch.officer_decision_at = datetime.now(timezone.utc)
         batch.officer_justification = justification.strip()
         write_audit_log(
             action="course.add_drop.officer_rejected",
-            actor_role=officer_role.value,
-            actor_id=officer_id,
+            actor_role=user.role.value,
+            actor_id=user_id,
             resource_type="AddDropBatch",
             resource_id=batch.id,
             decision=AddDropBatchStatus.REJECTED.value,
@@ -2950,11 +2953,54 @@ class AddDropService:
         for row in addition_rows:
             await self.db.delete(row)
 
-    def _require_officer_role(self, role: UserRole) -> None:
-        if role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
+    async def _resolve_dh_or_403(
+        self, user_id: uuid.UUID,
+    ) -> tuple[User, Optional[str]]:
+        """
+        Returns ``(user, department)``:
+          - ADMIN: ``(user, None)`` — sees every department's queue.
+          - DEPARTMENT_HEAD officer: ``(user, officer.department)``.
+          - Anyone else (incl. plain REGISTRAR_OFFICER): 403.
+
+        Mirrors the gate used by
+        :class:`DepartmentHeadGradingService._resolve_dh_with_department`
+        so the add/drop authorization model matches the grading flow.
+        """
+        user = await self.db.get(User, user_id)
+        if user is None:
+            raise UnauthorizedActorError("Calling user not found.")
+        if user.role == UserRole.ADMIN:
+            return user, None
+        officer = (
+            await self.db.execute(
+                select(CourseManagementOfficer).where(
+                    CourseManagementOfficer.user_id == user_id,
+                    CourseManagementOfficer.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
             raise UnauthorizedActorError(
-                "Only registrar officers or admins can act on an "
+                "Only department heads (or admins) can act on an "
                 "add/drop batch."
+            )
+        return user, officer.department
+
+    async def _authorize_batch_for_department(
+        self, batch: AddDropBatch, dh_department: Optional[str],
+    ) -> None:
+        """
+        Department-scope guard: a DH may only act on batches whose
+        student belongs to their department. Admins (``dh_department
+        is None``) bypass.
+        """
+        if dh_department is None:
+            return
+        student = await self.db.get(Student, batch.student_id)
+        if student is None or student.department != dh_department:
+            raise UnauthorizedActorError(
+                "This add/drop batch belongs to a student outside your "
+                "department."
             )
 
     @staticmethod
@@ -3068,32 +3114,39 @@ class AddDropService:
     async def list_pending_batches(
         self,
         *,
-        officer_role: UserRole,
+        user_id: uuid.UUID,
         statuses: Optional[set[AddDropBatchStatus]] = None,
     ) -> list[AddDropBatch]:
         """
-        Officer queue. Defaults to {AGENT_APPROVED, AGENT_DENIED} —
-        the two states that need a human decision. Callers can pass
-        a custom set to surface APPLIED / REJECTED history.
+        Department head queue. Defaults to {AGENT_APPROVED,
+        AGENT_DENIED} — the two states that need a human decision.
+        Callers can pass a custom set to surface APPLIED / REJECTED
+        history.
+
+        DH callers see only batches whose student belongs to their
+        department (``Student.department ==
+        CourseManagementOfficer.department``). Admins see every
+        department.
         """
-        self._require_officer_role(officer_role)
+        _user, department = await self._resolve_dh_or_403(user_id)
         target = statuses or {
             AddDropBatchStatus.AGENT_APPROVED,
             AddDropBatchStatus.AGENT_DENIED,
         }
-        return list(
-            (
-                await self.db.execute(
-                    select(AddDropBatch)
-                    .where(
-                        AddDropBatch.status.in_(target),
-                        AddDropBatch.is_deleted == False,  # noqa: E712
-                    )
-                    .order_by(AddDropBatch.created_at.asc())
-                    .options(*self._batch_eager_load_opts())
-                )
-            ).scalars().all()
+        stmt = (
+            select(AddDropBatch)
+            .where(
+                AddDropBatch.status.in_(target),
+                AddDropBatch.is_deleted == False,  # noqa: E712
+            )
+            .order_by(AddDropBatch.created_at.asc())
+            .options(*self._batch_eager_load_opts())
         )
+        if department is not None:
+            stmt = stmt.join(
+                Student, Student.id == AddDropBatch.student_id,
+            ).where(Student.department == department)
+        return list((await self.db.execute(stmt)).scalars().all())
 
 
 class AdvisoryService:

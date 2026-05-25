@@ -1151,10 +1151,11 @@ async def list_officer_add_drop_batches(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer queue. Defaults to batches awaiting a human decision —
-    status in {AGENT_APPROVED, AGENT_DENIED}. Pass ``?status=...``
-    to fetch only one. Officers see every student's pending batch;
-    sorted oldest-first so the queue drains in submission order.
+    Department-head queue. Defaults to batches awaiting a human
+    decision — status in {AGENT_APPROVED, AGENT_DENIED}. Pass
+    ``?status=...`` to fetch only one. A DH sees only batches whose
+    student belongs to their department (admins see all). Sorted
+    oldest-first so the queue drains in submission order.
     """
     if status_filter is not None and status_filter not in {
         AddDropBatchStatus.AGENT_APPROVED,
@@ -1168,7 +1169,7 @@ async def list_officer_add_drop_batches(
     svc = AddDropService(db)
     try:
         return await svc.list_pending_batches(
-            officer_role=current_user.role,
+            user_id=current_user.id,
             statuses={status_filter} if status_filter else None,
         )
     except UnauthorizedActorError as exc:
@@ -1186,16 +1187,16 @@ async def officer_approve_add_drop_batch(
     email_service: EmailService = Depends(get_email_service),
 ):
     """
-    Officer approves an AGENT_APPROVED batch — every item is
-    materialised against the registration and the batch transitions
-    to APPLIED.
+    Department head approves an AGENT_APPROVED batch — every item
+    is materialised against the registration and the batch
+    transitions to APPLIED. A DH may only approve batches whose
+    student is in their department.
     """
     svc = AddDropService(db, email_service=email_service)
     try:
         return await svc.officer_approve_batch(
             batch_id,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            user_id=current_user.id,
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
@@ -1217,16 +1218,17 @@ async def officer_override_add_drop_batch(
     email_service: EmailService = Depends(get_email_service),
 ):
     """
-    Officer overrides an AGENT_DENIED batch — applies every item
-    against the registration despite the agent's denial.
-    Justification is required (officer is going against the agent).
+    Department head overrides an AGENT_DENIED batch — applies every
+    item against the registration despite the agent's denial.
+    Justification is required (the DH is going against the agent).
+    A DH may only override batches whose student is in their
+    department.
     """
     svc = AddDropService(db, email_service=email_service)
     try:
         return await svc.officer_override_batch(
             batch_id,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            user_id=current_user.id,
             justification=payload.justification,
         )
     except UnauthorizedActorError as exc:
@@ -1248,16 +1250,17 @@ async def officer_reject_add_drop_batch(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer finalises the denial — no changes are applied.
-    Works on either AGENT_APPROVED (officer disagrees with agent)
-    or AGENT_DENIED (officer confirms agent). Justification required.
+    Department head finalises the denial — no changes are applied.
+    Works on either AGENT_APPROVED (DH disagrees with the agent)
+    or AGENT_DENIED (DH confirms the agent). Justification required.
+    A DH may only reject batches whose student is in their
+    department.
     """
     svc = AddDropService(db)
     try:
         return await svc.officer_reject_batch(
             batch_id,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            user_id=current_user.id,
             justification=payload.justification,
         )
     except UnauthorizedActorError as exc:
