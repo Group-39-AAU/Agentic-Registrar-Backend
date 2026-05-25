@@ -321,13 +321,14 @@ class RegistrationSubmitResponse(BaseModel):
 class ScheduleGenerateRequest(BaseModel):
     """
     Officer payload for the scheduling officer endpoints. Scheduling
-    is one department at a time — pass the term + the
-    :class:`AcademicProgram` UUID of the owning department, and the
-    agent allocates cohorts (semesters 1-10 within that department)
-    and emits ClassScheduleSlot rows. Other departments are untouched.
+    is one department at a time. Department Heads run scheduling for
+    their own department — ``program_id`` is optional in that case,
+    and the department is resolved from the caller's
+    ``CourseManagementOfficer.department``. Admins, who can operate
+    across departments, must pass ``program_id`` to pick a target.
     """
     term_id: uuid.UUID
-    program_id: uuid.UUID
+    program_id: uuid.UUID | None = None
 
 
 class SectionRead(BaseModel):
@@ -472,6 +473,22 @@ class TimetableGenerateResponse(BaseModel):
     sections: list[dict] = Field(default_factory=list)
     conflict_count: int
     conflict_ids: list[str] = Field(default_factory=list)
+
+
+class DepartmentTermOverviewResponse(BaseModel):
+    """
+    Read-only snapshot of what scheduling has already produced for a
+    (term, department) — drives the Department-Head landing page so
+    previously generated sections + schedule status are visible
+    without re-running the agents.
+    """
+    term_id: str
+    department: str
+    sections: list[dict] = Field(default_factory=list)
+    students_placed_count: int
+    slots_count: int
+    has_sections: bool
+    has_slots: bool
 
 
 # ══════════════════════════════════════════════════════════════

@@ -13,7 +13,8 @@ from app.core.dependencies import get_current_user, get_email_service
 from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    AdvisoryRecommendation, ClassScheduleSlot, Instructor,
+    AdvisoryRecommendation, ClassScheduleSlot, CourseManagementOfficer,
+    Instructor,
 )
 from app.modules.programs.models import AcademicProgram
 from app.modules.course.exceptions import (
@@ -40,6 +41,7 @@ from app.modules.course.schemas import (
     AdvisoryRecommendationRead,
     AdvisoryReviewCloseRequest,
     ConsultationRecommendedCourse,
+    DepartmentTermOverviewResponse,
     GraduationImpactRead,
     AssignInstructorToSlotRequest,
     AvailableCoursesRequest,
@@ -79,7 +81,7 @@ from app.modules.course.service import (
     RegistrationService, SchedulingService, TermService,
 )
 from app.shared.email.service import EmailService
-from app.shared.enums import AddDropBatchStatus, UserRole
+from app.shared.enums import AddDropBatchStatus, OfficerRole, UserRole
 
 
 router = APIRouter(prefix="/courses", tags=["Course Management"])
@@ -400,6 +402,53 @@ async def _resolve_program_department(
     return program.department
 
 
+async def _resolve_scheduling_department(
+    db: AsyncSession,
+    current_user: User,
+    program_id: uuid.UUID | None,
+) -> str:
+    """
+    Resolve the department a scheduling action should run against.
+
+    Department Heads operate on their own department: when
+    ``program_id`` is omitted, the department is read from the
+    caller's ``CourseManagementOfficer.department``. Admins (who can
+    operate across departments) must pass ``program_id`` to pick a
+    target. If ``program_id`` is provided, it wins for both roles —
+    the service-layer auth check still enforces that a DH can only
+    target their own department.
+    """
+    if program_id is not None:
+        return await _resolve_program_department(db, program_id)
+
+    if current_user.role == UserRole.ADMIN:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Admins must pass program_id to choose a department.",
+        )
+
+    officer = (
+        await db.execute(
+            select(CourseManagementOfficer).where(
+                CourseManagementOfficer.user_id == current_user.id,
+                CourseManagementOfficer.is_deleted == False,  # noqa: E712
+            )
+        )
+    ).scalar_one_or_none()
+    if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only a Department Head (or admin) may run scheduling.",
+        )
+    if officer.department is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Department Head '{officer.staff_id}' has no department "
+            "assigned — cannot run scheduling. Contact an administrator.",
+        )
+    return officer.department
+
+
 @router.post(
     "/officer/sections/allocate",
     response_model=SectionAllocationResponse,
@@ -424,7 +473,9 @@ async def officer_allocate_sections(
     students fill remaining capacity before fresh sections are
     created.
     """
-    department = await _resolve_program_department(db, payload.program_id)
+    department = await _resolve_scheduling_department(
+        db, current_user, payload.program_id,
+    )
     svc = SchedulingService(db)
     try:
         result = await svc.allocate_sections(
@@ -466,7 +517,9 @@ async def officer_generate_timetable(
     Idempotent: re-runs delete the department's existing slots and
     rebuild from scratch.
     """
-    department = await _resolve_program_department(db, payload.program_id)
+    department = await _resolve_scheduling_department(
+        db, current_user, payload.program_id,
+    )
     svc = SchedulingService(db)
     try:
         result = await svc.generate_timetable(
@@ -483,6 +536,44 @@ async def officer_generate_timetable(
             status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
         )
     return TimetableGenerateResponse(**result)
+
+
+@router.get(
+    "/officer/sections/overview",
+    response_model=DepartmentTermOverviewResponse,
+    summary="Read-only view of what scheduling has produced for the caller's department",
+)
+async def officer_department_term_overview(
+    term_id: uuid.UUID,
+    program_id: uuid.UUID | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns existing sections + schedule status for a (term,
+    department) without mutating anything. Department Heads omit
+    ``program_id`` — their department is read from their
+    ``CourseManagementOfficer`` row. Admins must pass ``program_id``.
+
+    The frontend uses ``has_sections`` / ``has_slots`` to gate the
+    allocate / generate buttons, and ``sections`` to render the
+    previously generated cohort split without a re-run.
+    """
+    department = await _resolve_scheduling_department(
+        db, current_user, program_id,
+    )
+    svc = SchedulingService(db)
+    try:
+        result = await svc.get_department_term_overview(
+            term_id=term_id,
+            department=department,
+            officer_user_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    return DepartmentTermOverviewResponse(**result)
 
 
 @router.get(

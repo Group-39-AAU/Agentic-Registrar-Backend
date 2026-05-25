@@ -1628,6 +1628,84 @@ class SchedulingService:
             "conflict_ids": [str(cid) for cid in artefact.conflict_ids],
         }
 
+    # ── Read view: existing sections + schedule status ──────────
+
+    async def get_department_term_overview(
+        self,
+        term_id: uuid.UUID,
+        department: str,
+        officer_user_id: uuid.UUID,
+    ) -> dict:
+        """
+        Read-only snapshot of what scheduling has already produced for
+        a single (term, department). Lets the Department-Head landing
+        page render previously allocated sections and decide whether
+        the allocate/generate buttons should still be available
+        without re-running the agents.
+        """
+        await self._require_dh_or_admin(
+            officer_user_id, requested_department=department,
+        )
+        term = await self.terms.get(term_id)
+        if term is None:
+            raise EntityNotFoundError("AcademicTerm", str(term_id))
+
+        sections = (
+            await self.db.execute(
+                select(Section).where(
+                    Section.term_id == term_id,
+                    Section.department == department,
+                    Section.is_deleted == False,  # noqa: E712
+                ).order_by(Section.semester, Section.section_code)
+            )
+        ).scalars().all()
+
+        section_dicts = [
+            {
+                "section_id": str(s.id),
+                "section_code": s.section_code,
+                "department": s.department,
+                "semester": s.semester,
+                "capacity": s.capacity,
+                "enrolled_count": s.enrolled_count,
+            }
+            for s in sections
+        ]
+
+        section_ids = [s.id for s in sections]
+        if section_ids:
+            slots_count = len(
+                (
+                    await self.db.execute(
+                        select(ClassScheduleSlot.id).where(
+                            ClassScheduleSlot.section_id.in_(section_ids),
+                        )
+                    )
+                ).scalars().all()
+            )
+            students_placed_count = len(
+                (
+                    await self.db.execute(
+                        select(Registration.id).where(
+                            Registration.section_id.in_(section_ids),
+                        )
+                    )
+                ).scalars().all()
+            )
+        else:
+            slots_count = 0
+            students_placed_count = 0
+
+        return {
+            "term_id": str(term_id),
+            "department": department,
+            "sections": section_dicts,
+            "students_placed_count": students_placed_count,
+            "slots_count": slots_count,
+            "has_sections": bool(section_ids),
+            "has_slots": slots_count > 0,
+        }
+
     async def _require_dh_or_admin(
         self,
         officer_user_id: uuid.UUID,
