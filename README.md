@@ -78,8 +78,7 @@ agentic-registrar-backend/
 ├── alembic/                     # Database migration scripts
 ├── scripts/
 │   ├── reset_db.py              # Drops all tables
-│   ├── seed.py                  # Seeds programs, MoE records, quotas, officer
-│   └── seed_ranking_test.py     # Seeds 20 diverse test applicants
+│   └── seed_undergraduate_admission.py  # Seeds programs, MoE records, quotas, officer + 200 ranking applicants
 ├── docker-compose.yml           # PostgreSQL + App + pgAdmin
 ├── Dockerfile
 ├── pyproject.toml
@@ -148,11 +147,9 @@ alembic upgrade head
 ### 5. Seed the Database
 
 ```bash
-# Core data: programs, MoE records, stream quotas, officer account
-python scripts/seed.py
-
-# Test data: 20 diverse applicants for ranking verification
-python scripts/seed_ranking_test.py
+# Core data (programs, MoE records, stream quotas, officer account) +
+# 200 diverse test applicants for ranking verification.
+python scripts/seed_undergraduate_admission.py
 ```
 
 ### 6. Start the Server

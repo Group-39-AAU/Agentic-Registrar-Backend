@@ -47,8 +47,9 @@ from app.modules.course.exceptions import (
     UnauthorizedActorError,
 )
 from app.modules.course.grade_points import points_for
+from app.modules.auth.models import User as _AuthUser
 from app.modules.course.models import (
-    ClassScheduleSlot, Course, Grade, Instructor, Section,
+    AcademicTerm, ClassScheduleSlot, Course, Grade, Instructor, Section,
 )
 from app.modules.course.grading.agents import (
     GradingMonitorAgent, GradingReview,
@@ -608,16 +609,32 @@ class InstructorGradingService:
                 )
             )
 
+        term = await self.db.get(AcademicTerm, batch.term_id)
+        instructor_row = await self.db.get(Instructor, batch.instructor_id)
+        instructor_user = (
+            await self.db.get(_AuthUser, instructor_row.user_id)
+            if instructor_row is not None
+            else None
+        )
+        instructor_name = (
+            f"{instructor_user.first_name} {instructor_user.last_name}".strip()
+            if instructor_user is not None
+            else ""
+        )
+
         return GradeBatchResponse(
             id=batch.id,
             section_id=batch.section_id,
             section_code=section.section_code,
+            section_semester=section.semester,
             course_id=batch.course_id,
             course_code=course.code,
             course_title=course.title,
             course_credit_hours=course.credit_hours,
             term_id=batch.term_id,
+            term_name=term.term_name if term is not None else "",
             instructor_id=batch.instructor_id,
+            instructor_name=instructor_name,
             breakdown_id=batch.breakdown_id,
             status=batch.status,
             iteration_count=batch.iteration_count,

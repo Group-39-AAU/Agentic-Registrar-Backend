@@ -70,17 +70,19 @@ async def _populate_seeded_student_sponsorship(async_session, seeded_student):
 
 @pytest_asyncio.fixture
 async def cs_courses(async_session) -> dict[str, Course]:
-    """Three CS courses with no prereq edges, each at semester 1."""
+    """Three CS courses with no prereq edges, each at semester 1.
+    Credits sized at 6 each so any 2- or 3-course pick clears the
+    12-ECTS floor without breaching the 22-ECTS ceiling."""
     cs101 = Course(
-        code="CS101", title="Intro Programming", credit_hours=4,
+        code="CS101", title="Intro Programming", credit_hours=6,
         semester=1, department="Computer Science",
     )
     cs102 = Course(
-        code="CS102", title="Discrete Math", credit_hours=3,
+        code="CS102", title="Discrete Math", credit_hours=6,
         semester=1, department="Computer Science",
     )
     cs103 = Course(
-        code="CS103", title="Engineering Drawing", credit_hours=3,
+        code="CS103", title="Engineering Drawing", credit_hours=6,
         semester=1, department="Computer Science",
     )
     async_session.add_all([cs101, cs102, cs103])

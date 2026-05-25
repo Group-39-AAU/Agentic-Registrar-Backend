@@ -67,19 +67,29 @@ class AvailableCoursesRequest(BaseModel):
 
 class AvailableCoursesResponse(BaseModel):
     """
-    200-only payload from ``POST /me/available-courses``. Two shapes,
-    keyed off whether a Registration exists for the (student, term)
-    pair (errors are surfaced as 404 / 409 instead of returned here):
+    200-only payload from ``POST /me/available-courses``. Four shapes,
+    keyed off whether a Registration exists and the term's open/start
+    status (the only error path is 404 if the term or student row is
+    missing):
 
-      * Has a Registration → ``is_registered=True``,
-        ``registration_id`` + ``registration_status`` populated, and
-        ``courses`` is the active (non-dropped) registered selection.
-        Frontends drive the action button off ``registration_status``:
-        ``REGISTRATION_OPEN`` → still in draft, ``PAYMENT_HOLD`` →
-        prompt to pay, ``REGISTERED`` → show "Registered ✓", etc.
-      * No Registration (only reachable when the term is OPEN) →
-        ``is_registered=False`` and ``courses`` is the curriculum
-        picker the student will submit from.
+      * Has a Registration (term may be open or closed) →
+        ``is_registered=True``, ``registration_id`` +
+        ``registration_status`` populated, ``courses`` is the active
+        (non-dropped) registered selection. Frontends drive the
+        action button off ``registration_status``: ``REGISTRATION_OPEN``
+        → still in draft, ``PAYMENT_HOLD`` → prompt to pay,
+        ``REGISTERED`` → show "Registered ✓", etc.
+      * No Registration, term OPEN → ``is_registered=False`` and
+        ``courses`` is the curriculum picker the student will submit
+        from.
+      * No Registration, term CLOSED (already started) →
+        ``is_registered=False`` with an empty ``courses`` list. The
+        frontend renders a calm "you weren't registered for this
+        term" empty state.
+      * No Registration, term CLOSED (not yet started) →
+        ``is_registered=False`` with an empty ``courses`` list, same
+        shape as above. The frontend compares ``term.start_date`` to
+        today and renders a "this term hasn't opened yet" empty state.
     """
     term: AcademicTermResponse
     is_registered: bool
@@ -311,13 +321,14 @@ class RegistrationSubmitResponse(BaseModel):
 class ScheduleGenerateRequest(BaseModel):
     """
     Officer payload for the scheduling officer endpoints. Scheduling
-    is one department at a time — pass the term + the
-    :class:`AcademicProgram` UUID of the owning department, and the
-    agent allocates cohorts (semesters 1-10 within that department)
-    and emits ClassScheduleSlot rows. Other departments are untouched.
+    is one department at a time. Department Heads run scheduling for
+    their own department — ``program_id`` is optional in that case,
+    and the department is resolved from the caller's
+    ``CourseManagementOfficer.department``. Admins, who can operate
+    across departments, must pass ``program_id`` to pick a target.
     """
     term_id: uuid.UUID
-    program_id: uuid.UUID
+    program_id: uuid.UUID | None = None
 
 
 class SectionRead(BaseModel):
@@ -340,6 +351,12 @@ class ClassScheduleSlotRead(BaseModel):
     start_time: str
     end_time: str
     instructor_id: Optional[uuid.UUID] = None
+    # Human-readable instructor identity, joined in by the service
+    # layer so the timetable can show "Alemayehu Bekele · STAFF/0001/10"
+    # without the client doing a second round-trip. Both are nullable
+    # because a slot can be placed before an instructor is assigned.
+    instructor_name: Optional[str] = None
+    instructor_staff_id: Optional[str] = None
     room: Optional[str] = None
     # New fields surfaced by /me/schedule once the add/drop schedule
     # delta path lands. Optional so cohort-only consumers
@@ -464,6 +481,22 @@ class TimetableGenerateResponse(BaseModel):
     conflict_ids: list[str] = Field(default_factory=list)
 
 
+class DepartmentTermOverviewResponse(BaseModel):
+    """
+    Read-only snapshot of what scheduling has already produced for a
+    (term, department) — drives the Department-Head landing page so
+    previously generated sections + schedule status are visible
+    without re-running the agents.
+    """
+    term_id: str
+    department: str
+    sections: list[dict] = Field(default_factory=list)
+    students_placed_count: int
+    slots_count: int
+    has_sections: bool
+    has_slots: bool
+
+
 # ══════════════════════════════════════════════════════════════
 #  Add/Drop
 # ══════════════════════════════════════════════════════════════
@@ -550,6 +583,8 @@ class ScheduleSlotSummary(BaseModel):
     end_time: str
     room: Optional[str] = None
     instructor_id: Optional[uuid.UUID] = None
+    instructor_name: Optional[str] = None
+    instructor_staff_id: Optional[str] = None
 
 
 class ScheduleConflictDetail(BaseModel):

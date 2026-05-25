@@ -41,6 +41,7 @@ from app.modules.course.services import PayMock, pay_mock
 
 # Hard invariants from SDS Tables 65, 80 — names match the SDS
 # verbatim so a reader of the design doc can grep the codebase.
+MIN_CREDIT_LOAD_ECTS = 12
 MAX_CREDIT_LOAD_ECTS = 22
 
 
@@ -64,7 +65,8 @@ class CurriculumComplianceAgent(CourseBaseAgent):
 
       1. Prerequisites — every chosen course's prereq graph must
          resolve against the student's completed-course set.
-      2. Credit load — total ECTS must not exceed 22 (SDS Table 65).
+      2. Credit load — total ECTS must fall within [12, 22] per AAU
+         policy (SDS Table 65).
       3. Payment    — every chosen course must be marked paid in
          PayMock.
 
@@ -80,6 +82,7 @@ class CurriculumComplianceAgent(CourseBaseAgent):
         agent_id: Optional[str] = None,
         *,
         payment_service: Optional[PayMock] = None,
+        min_credit_load: int = MIN_CREDIT_LOAD_ECTS,
         max_credit_load: int = MAX_CREDIT_LOAD_ECTS,
     ) -> None:
         super().__init__(agent_id=agent_id or f"{self.AGENT_ID_PREFIX}DEFAULT")
@@ -87,6 +90,7 @@ class CurriculumComplianceAgent(CourseBaseAgent):
         # could legitimately be empty, and `or` would silently fall back
         # to the module singleton, breaking test isolation.
         self._pay = payment_service if payment_service is not None else pay_mock
+        self._min_credit_load = min_credit_load
         self._max_credit_load = max_credit_load
 
     # ── verify_prerequisites (SDS Table 66) ──────────────────────
@@ -167,10 +171,10 @@ class CurriculumComplianceAgent(CourseBaseAgent):
         registration: Registration,
     ) -> ComplianceCheckResult:
         """
-        Confirms the registration's total credit load does not exceed
-        the SDS-mandated 22 ECTS ceiling. Dropped courses are
-        excluded from the sum so a student who drops below the
-        ceiling clears the check.
+        Confirms the registration's total credit load falls within
+        the SDS-mandated [12, 22] ECTS window. Dropped courses are
+        excluded from the sum so a student who adjusts back inside
+        the window clears the check.
 
         An empty registration is treated as a failure so the service
         layer can surface "you have no courses selected" cleanly.
@@ -182,7 +186,11 @@ class CurriculumComplianceAgent(CourseBaseAgent):
             return ComplianceCheckResult(
                 passed=False,
                 reasons=["Registration has no active courses."],
-                details={"total_credits": 0, "ceiling": self._max_credit_load},
+                details={
+                    "total_credits": 0,
+                    "floor": self._min_credit_load,
+                    "ceiling": self._max_credit_load,
+                },
             )
 
         courses = (
@@ -201,6 +209,21 @@ class CurriculumComplianceAgent(CourseBaseAgent):
                 ],
                 details={
                     "total_credits": total_credits,
+                    "floor": self._min_credit_load,
+                    "ceiling": self._max_credit_load,
+                },
+            )
+
+        if total_credits < self._min_credit_load:
+            return ComplianceCheckResult(
+                passed=False,
+                reasons=[
+                    f"Total credit load {total_credits} ECTS is below the "
+                    f"{self._min_credit_load} ECTS floor per AAU policy."
+                ],
+                details={
+                    "total_credits": total_credits,
+                    "floor": self._min_credit_load,
                     "ceiling": self._max_credit_load,
                 },
             )
@@ -209,6 +232,7 @@ class CurriculumComplianceAgent(CourseBaseAgent):
             passed=True,
             details={
                 "total_credits": total_credits,
+                "floor": self._min_credit_load,
                 "ceiling": self._max_credit_load,
             },
         )

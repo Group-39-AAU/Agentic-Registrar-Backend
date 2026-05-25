@@ -29,12 +29,12 @@ from app.database.session import get_db
 from app.main import app
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    ClassScheduleSlot, Classroom, Course, Registration, ScheduleConflict,
-    Section, Student,
+    ClassScheduleSlot, Classroom, Course, CourseManagementOfficer,
+    Registration, ScheduleConflict, Section, Student,
 )
 from app.modules.programs.models import AcademicProgram
 from app.shared.enums import (
-    EnrollmentStatus, RegistrationStatus, ScheduleConflictStatus,
+    EnrollmentStatus, OfficerRole, RegistrationStatus, ScheduleConflictStatus,
     ScheduleConflictType, SponsorshipType, StreamType, UserRole,
 )
 
@@ -55,6 +55,12 @@ async def client(async_session) -> AsyncClient:
 
 @pytest_asyncio.fixture
 async def officer(async_session) -> User:
+    """
+    Scheduling-authority test actor. Scheduling permission moved from
+    plain registrar officers to Department Heads, so this fixture
+    pairs the underlying User (role=REGISTRAR_OFFICER) with a
+    CourseManagementOfficer row whose role is DEPARTMENT_HEAD.
+    """
     user = User(
         id=uuid.uuid4(),
         email="sched-officer@aau.edu.et",
@@ -63,6 +69,20 @@ async def officer(async_session) -> User:
         role=UserRole.REGISTRAR_OFFICER, is_active=True,
     )
     async_session.add(user)
+    await async_session.flush()
+    async_session.add(
+        CourseManagementOfficer(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            staff_id="REG/SCHED/01",
+            role=OfficerRole.DEPARTMENT_HEAD,
+            # Must match cs_world's "Computer Science" department —
+            # scheduling auth checks the DH's department against the
+            # requested department now.
+            department="Computer Science",
+            authorization_level=5,
+        )
+    )
     await async_session.commit()
     return user
 

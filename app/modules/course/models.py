@@ -551,6 +551,14 @@ class CourseManagementOfficer(SoftDeleteBase):
     role: Mapped[OfficerRole] = mapped_column(
         nullable=False, default=OfficerRole.REGISTRAR_OFFICER, index=True
     )
+    # Per-department scoping for DEPARTMENT_HEAD officers. Required at
+    # the application layer when role==DEPARTMENT_HEAD; nullable in the
+    # DB so plain registrar officers (who operate across departments)
+    # don't need a value. The scheduling auth helper rejects a DH
+    # request whose target department doesn't match this column.
+    department: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, index=True,
+    )
     authorization_level: Mapped[int] = mapped_column(Integer, nullable=False)
 
     __table_args__ = (

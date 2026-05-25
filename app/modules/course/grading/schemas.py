@@ -224,12 +224,15 @@ class GradeBatchResponse(BaseModel):
     id: uuid.UUID
     section_id: uuid.UUID
     section_code: str
+    section_semester: int
     course_id: uuid.UUID
     course_code: str
     course_title: str
     course_credit_hours: int
     term_id: uuid.UUID
+    term_name: str
     instructor_id: uuid.UUID
+    instructor_name: str
     breakdown_id: uuid.UUID
     status: GradeSubmissionStatus
     iteration_count: int

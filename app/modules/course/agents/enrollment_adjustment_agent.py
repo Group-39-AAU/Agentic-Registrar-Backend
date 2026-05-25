@@ -39,17 +39,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
 from app.modules.course.agents.curriculum_compliance_agent import (
-    ComplianceCheckResult, CurriculumComplianceAgent, MAX_CREDIT_LOAD_ECTS,
+    ComplianceCheckResult, CurriculumComplianceAgent,
+    MAX_CREDIT_LOAD_ECTS, MIN_CREDIT_LOAD_ECTS,
 )
 from app.modules.course.models import (
     AddDropRequest, ClassScheduleSlot, Course, Registration, Section, Student,
 )
 from app.modules.course.services import PayMock, pay_mock
 from app.shared.enums import AddDropAction
-
-
-# SDS Table 80 invariant — cannot drop below 12 ECTS.
-MIN_CREDIT_LOAD_ECTS = 12
 
 
 # ── Result container ────────────────────────────────────────────

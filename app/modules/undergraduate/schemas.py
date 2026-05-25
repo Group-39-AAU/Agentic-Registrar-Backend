@@ -73,10 +73,11 @@ class CorrectionUpdateRequest(BaseModel):
     admission_number: Optional[str] = Field(default=None, min_length=1, max_length=50)
     first_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     last_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    stream: Optional[StreamType] = None
 
     @model_validator(mode="after")
     def validate_at_least_one_field(self):
-        if not any([self.admission_number, self.first_name, self.last_name]):
+        if not any([self.admission_number, self.first_name, self.last_name, self.stream]):
             raise ValueError("Provide at least one field to update")
         return self
 

@@ -65,13 +65,14 @@ async def test_classroom_name_is_unique(async_session):
 
 @pytest_asyncio.fixture
 async def seeded_classrooms(async_session):
-    """Run only the classroom block of seed_course.py against the test DB."""
+    """Run only the classroom block of seed_course_management.py against the test DB."""
     import importlib.util
     import pathlib
 
     repo_root = pathlib.Path(__file__).resolve().parents[2]
     spec = importlib.util.spec_from_file_location(
-        "seed_course", repo_root / "scripts" / "seed_course.py",
+        "seed_course_management",
+        repo_root / "scripts" / "seed_course_management.py",
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

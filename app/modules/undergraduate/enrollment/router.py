@@ -46,6 +46,29 @@ from app.shared.enums import (
 router = APIRouter(prefix="/undergraduate/enrollment", tags=["Undergraduate Enrollment & Onboarding"])
 
 
+# Approximate GC-to-EC offset for the academic-year suffix used in
+# AAU university IDs (GC year - 7 ≈ EC year). Accurate enough for
+# September-starting academic years.
+_GC_TO_EC_YEAR_OFFSET = 7
+
+
+def _ethiopian_batch_suffix(term_name: str | None) -> str:
+    """
+    Convert a GC academic-year term name (e.g. ``"2026/27"`` or
+    ``"2026/2027"``) into a 2-digit Ethiopian batch suffix
+    (e.g. ``"19"``). Falls back to the current GC year if the term
+    name can't be parsed.
+    """
+    if term_name:
+        try:
+            gc_year = int(term_name.split("/", 1)[0])
+            ec_year = gc_year - _GC_TO_EC_YEAR_OFFSET
+            return f"{ec_year % 100:02d}"
+        except (ValueError, IndexError):
+            pass
+    return datetime.now().strftime("%y")
+
+
 # ══════════════════════════════════════════════════════════════
 #  POST /enrollment/run — Trigger enrollment batch
 # ══════════════════════════════════════════════════════════════
@@ -99,13 +122,17 @@ async def run_enrollment(
         raise HTTPException(400, "All admitted applications are already enrolled")
 
     # ── 3. Fetch ranking results for program assignment ──
+    # Each applicant has one RankingResult row per run; the latest run holds
+    # the authoritative locked assignment. Order desc and keep first per app.
     enroll_ids = [a.id for a in to_enroll]
     rr_result = await db.execute(
-        select(RankingResult).where(
-            RankingResult.application_id.in_(enroll_ids)
-        )
+        select(RankingResult)
+        .where(RankingResult.application_id.in_(enroll_ids))
+        .order_by(RankingResult.ranking_run_number.desc())
     )
-    rr_map = {r.application_id: r for r in rr_result.scalars().all()}
+    rr_map: dict[uuid.UUID, RankingResult] = {}
+    for r in rr_result.scalars().all():
+        rr_map.setdefault(r.application_id, r)
 
     # ── 4. Fetch program info ──
     prog_result = await db.execute(select(AcademicProgram))
@@ -124,7 +151,15 @@ async def run_enrollment(
     else:
         counter_start = 6400  # Starting ID
 
-    year_suffix = datetime.now().strftime("%y")  # "26"
+    # Ethiopian batch suffix: the admission term name encodes the GC
+    # academic year (e.g. "2026/27"); university IDs use the Ethiopian
+    # calendar batch suffix, which is GC year − 7 (e.g. "/19" for the
+    # 2026/27 cohort, matching the seed-data convention).
+    admission_term_name = (
+        to_enroll[0].admission_term.term_name
+        if to_enroll[0].admission_term else None
+    )
+    year_suffix = _ethiopian_batch_suffix(admission_term_name)
 
     # ── 6. Build admitted student data and run agent ──
     from app.modules.undergraduate.agents.enrollment_agent import (

@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_user
@@ -129,6 +129,7 @@ async def run_ranking(
 
     applicant_list = []
     skipped = []
+    new_application_ids: set[uuid.UUID] = set()
     for app in applications:
         moe = moe_map.get(app.admission_number)
         uat = uat_map.get(app.id)
@@ -149,6 +150,60 @@ async def run_ranking(
             grade12_score=moe.total_score,
             uat_score=uat.score,
         ))
+        new_application_ids.add(app.id)
+
+    # ── 7b. For reruns, merge applicants from all prior runs so the new
+    #        rank_position is computed across the full cohort, not just
+    #        the new batch. Prior applicants' assignments stay locked.
+    prior_locked_assignments: dict[uuid.UUID, dict] = {}
+    if run_number > 1:
+        prior_rows_all = (await db.execute(
+            select(RankingResult)
+            .where(RankingResult.admission_term_id == admission_term_id)
+            .order_by(RankingResult.ranking_run_number.desc())
+        )).scalars().all()
+
+        latest_prior_by_app: dict[uuid.UUID, RankingResult] = {}
+        for row in prior_rows_all:
+            if row.application_id not in latest_prior_by_app:
+                latest_prior_by_app[row.application_id] = row
+
+        prior_only_ids = [
+            app_id for app_id in latest_prior_by_app
+            if app_id not in new_application_ids
+        ]
+        if prior_only_ids:
+            prior_apps_result = await db.execute(
+                select(UndergraduateApplication).where(
+                    UndergraduateApplication.id.in_(prior_only_ids)
+                )
+            )
+            prior_apps = {a.id: a for a in prior_apps_result.scalars().all()}
+
+            for app_id in prior_only_ids:
+                row = latest_prior_by_app[app_id]
+                prior_app = prior_apps.get(app_id)
+                if prior_app is None:
+                    continue
+
+                applicant_list.append(ApplicantData(
+                    application_id=app_id,
+                    applicant_id=prior_app.applicant_id,
+                    sponsorship_type=row.category,
+                    stream=prior_app.stream.value,
+                    admission_number=prior_app.admission_number,
+                    program_choice_1_id=prior_app.program_choice_1_id,
+                    program_choice_2_id=prior_app.program_choice_2_id,
+                    program_choice_3_id=prior_app.program_choice_3_id,
+                    grade12_score=row.grade12_score,
+                    uat_score=row.uat_score,
+                ))
+                prior_locked_assignments[app_id] = {
+                    "is_assigned": row.is_assigned,
+                    "assigned_program_id": row.assigned_program_id,
+                    "assigned_stream": row.assigned_stream.value if row.assigned_stream else None,
+                    "assignment_detail": row.assignment_detail,
+                }
 
     if not applicant_list:
         raise HTTPException(400, f"No applicants with complete data. Skipped: {skipped}")
@@ -169,7 +224,8 @@ async def run_ranking(
 
     # Re-runs use cutoffs locked in by prior runs. Programs/streams that
     # have never received an assignment have no floor and will get a cutoff
-    # set by this run's assignments.
+    # set by this run's assignments. Prior applicants are skipped — their
+    # original assignment is restored verbatim afterwards.
     if run_number > 1:
         try:
             await ranking_service.apply_locked_cutoffs_for_rerun(
@@ -177,9 +233,20 @@ async def run_ranking(
                 current_run_number=run_number,
                 final_state=final_state,
                 program_info=program_info,
+                skip_application_ids=set(prior_locked_assignments.keys()),
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+        for category_list in (final_state["self_sponsored"], final_state["government"]):
+            for a in category_list:
+                locked = prior_locked_assignments.get(a.application_id)
+                if locked is None:
+                    continue
+                a.is_assigned = locked["is_assigned"]
+                a.assigned_program_id = locked["assigned_program_id"]
+                a.assigned_stream = locked["assigned_stream"]
+                a.assignment_detail = locked["assignment_detail"]
 
     # ── 9. Persist results ──
     all_ranked = final_state["self_sponsored"] + final_state["government"]
@@ -212,7 +279,11 @@ async def run_ranking(
         else:
             unassigned_count += 1
 
-        # Transition application to PENDING_REVIEW
+        # Prior-run applicants are already past UAT_COMPLETED — only transition
+        # the newly-ranked batch to PENDING_REVIEW.
+        if a.application_id not in new_application_ids:
+            continue
+
         try:
             from app.modules.undergraduate.schemas import ApplicationStatusUpdate as StatusUpd
             await svc.change_status(
@@ -303,16 +374,30 @@ async def get_ranking_results(
     category: str = Query(None, description="Filter by SELF_SPONSORED or GOVERNMENT"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get all ranking rows for an admission term, optionally filtered by category."""
+    """
+    Get the unified ranking for an admission term.
+
+    Returns rows from the latest run only — each rerun re-ranks the full
+    cohort (prior + new applicants together), so the latest run is the
+    authoritative unified ranking. Optionally filter by category.
+    """
+    latest_run = (await db.execute(
+        select(func.max(RankingResult.ranking_run_number)).where(
+            RankingResult.admission_term_id == term_id,
+        )
+    )).scalar()
+    if latest_run is None:
+        raise HTTPException(404, f"No results found for term: {term_id}")
+
     query = select(RankingResult).where(
         RankingResult.admission_term_id == term_id,
+        RankingResult.ranking_run_number == latest_run,
     )
 
     if category:
         query = query.where(RankingResult.category == category.upper())
 
     query = query.order_by(
-        RankingResult.ranking_run_number,
         RankingResult.category,
         RankingResult.rank_position,
     )
@@ -379,11 +464,25 @@ async def get_ranking_summary(
     term_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get ranking summary aggregated across all runs for an admission term."""
-    # Fetch all results for this term
+    """
+    Get ranking summary for an admission term.
+
+    Aggregates over the latest run only — each rerun re-ranks and re-persists
+    the full cohort, so the latest run holds the authoritative totals and
+    cutoffs. Aggregating across all runs would double-count prior applicants.
+    """
+    latest_run = (await db.execute(
+        select(func.max(RankingResult.ranking_run_number)).where(
+            RankingResult.admission_term_id == term_id,
+        )
+    )).scalar()
+    if latest_run is None:
+        raise HTTPException(404, f"No results found for term: {term_id}")
+
     result = await db.execute(
         select(RankingResult).where(
             RankingResult.admission_term_id == term_id,
+            RankingResult.ranking_run_number == latest_run,
         )
     )
     results = result.scalars().all()

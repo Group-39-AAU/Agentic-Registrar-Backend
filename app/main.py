@@ -2,8 +2,11 @@
 Agentic Registrar Backend — Application Entry Point.
 """
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 
@@ -74,6 +77,14 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+
+    # ── Static assets (logos used by outbound emails, etc.) ──
+    email_assets_dir = Path(__file__).parent / "shared" / "email" / "assets"
+    app.mount(
+        "/static/email",
+        StaticFiles(directory=str(email_assets_dir)),
+        name="email-assets",
     )
 
     # ── Module Routers ──

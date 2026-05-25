@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.logging import get_logger, write_audit_log
+from app.modules.auth.models import User
 from app.modules.course.agents import (
     AcademicAdvisoryAgent, AcademicSchedulingAgent, Advice, BatchResult,
     ConsultationResult, CurriculumComplianceAgent, EnrollmentAdjustmentAgent,
@@ -305,15 +306,19 @@ class RegistrationService:
                  student will submit from.
 
           2. Term is CLOSED and has already started (``today >=
-             start_date``) → must have a Registration.
-               * Found → return the registered courses.
-               * Not found → raise ``EntityNotFoundError`` so the
-                 router surfaces "you didn't register for this term"
-                 as a 404.
+             start_date``).
+               * Has a Registration → return the registered courses.
+               * No Registration → return ``is_registered=False`` with
+                 an empty ``courses`` list. The frontend renders a
+                 calm "you weren't registered for this term" empty
+                 state. This is not an error — a past term you didn't
+                 register for is a valid state to ask about.
 
           3. Term is CLOSED and has not started yet (``today <
-             start_date``) → raise :class:`TermNotYetOpenError` so
-             the router can surface a 409 "this term is not open yet".
+             start_date``) → return ``is_registered=False`` with an
+             empty ``courses`` list, same shape as Rule 2's no-reg
+             branch. The frontend compares ``term.start_date`` to
+             today and renders a "this term hasn't opened yet" card.
 
         Also raises ``EntityNotFoundError`` if either the Student or
         the AcademicTerm itself is missing.
@@ -339,10 +344,19 @@ class RegistrationService:
 
         today = date.today()
 
-        # Rule 3 — closed and not yet started: surface "not open yet"
-        # before we touch registrations.
+        # Rule 3 — closed and not yet started: return an empty state
+        # payload with ``is_registered=False``. The frontend distinguishes
+        # "past term you didn't register for" vs "future term that hasn't
+        # opened yet" by comparing ``term.start_date`` to today, and
+        # renders the appropriate empty-state card.
         if not term.is_open and today < term.start_date:
-            raise TermNotYetOpenError(term.term_name)
+            return {
+                "term": term,
+                "is_registered": False,
+                "registration_id": None,
+                "registration_status": None,
+                "courses": [],
+            }
 
         registration = (
             await self.db.execute(
@@ -381,14 +395,19 @@ class RegistrationService:
                 "courses": list(rows),
             }
 
-        # No registration. If the window is closed (Rule 2 with no
-        # registration), 404. If it's still open (Rule 1, never
-        # submitted yet), return the curriculum picker.
+        # No registration for this term. Two flavors:
+        #   * Term is CLOSED → return a state payload (is_registered=False,
+        #     no courses). The frontend renders "you weren't registered
+        #     for this term" — not an error, just a state.
+        #   * Term is OPEN  → fall through to the curriculum picker below.
         if not term.is_open:
-            raise EntityNotFoundError(
-                "Registration",
-                f"student={student.student_id}, term='{term.term_name}'",
-            )
+            return {
+                "term": term,
+                "is_registered": False,
+                "registration_id": None,
+                "registration_status": None,
+                "courses": [],
+            }
 
         target_semester = await self._semester_for_term(student, term)
         if target_semester is None or not (1 <= target_semester <= 10):
@@ -1472,20 +1491,22 @@ class SchedulingService:
         self,
         term_id: uuid.UUID,
         department: str,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
     ) -> dict:
         """
         Run cohort allocation only (no schedule slots yet) for a
-        single (term, department) pair. Officer-only.
+        single (term, department) pair. Department-Head-only (admins
+        also allowed); plain registrar officers cannot trigger.
 
         After this returns, every REGISTERED student in the
         department has a ``Registration.section_id`` set. The
         per-class meetings (``ClassScheduleSlot`` rows) come from a
-        separate :meth:`generate_timetable` call so the officer can
+        separate :meth:`generate_timetable` call so the DH can
         review the allocation before locking in the schedule.
         """
-        self._require_officer(officer_role)
+        actor_role = await self._require_dh_or_admin(
+            officer_user_id, requested_department=department,
+        )
         term = await self.terms.get(term_id)
         if term is None:
             raise EntityNotFoundError("AcademicTerm", str(term_id))
@@ -1514,8 +1535,8 @@ class SchedulingService:
 
         write_audit_log(
             action="course.sections.allocated",
-            actor_role=officer_role.value,
-            actor_id=officer_id,
+            actor_role=actor_role,
+            actor_id=officer_user_id,
             resource_type="AcademicTerm",
             resource_id=term_id,
             decision="ok",
@@ -1541,12 +1562,12 @@ class SchedulingService:
         self,
         term_id: uuid.UUID,
         department: str,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
     ) -> dict:
         """
         Build the per-section weekly schedule (``ClassScheduleSlot``
-        rows) for every Section the department already has. Requires
+        rows) for every Section the department already has.
+        Department-Head-only (admins also allowed). Requires
         :meth:`allocate_sections` to have run first — if no sections
         exist for this (term, department), the response will be
         empty.
@@ -1554,7 +1575,9 @@ class SchedulingService:
         Idempotent: re-runs delete the department's existing slots
         and rebuild from scratch.
         """
-        self._require_officer(officer_role)
+        actor_role = await self._require_dh_or_admin(
+            officer_user_id, requested_department=department,
+        )
         term = await self.terms.get(term_id)
         if term is None:
             raise EntityNotFoundError("AcademicTerm", str(term_id))
@@ -1584,8 +1607,8 @@ class SchedulingService:
 
         write_audit_log(
             action="course.timetable.generated",
-            actor_role=officer_role.value,
-            actor_id=officer_id,
+            actor_role=actor_role,
+            actor_id=officer_user_id,
             resource_type="AcademicTerm",
             resource_id=term_id,
             decision="ok",
@@ -1606,11 +1629,138 @@ class SchedulingService:
             "conflict_ids": [str(cid) for cid in artefact.conflict_ids],
         }
 
-    def _require_officer(self, officer_role: UserRole) -> None:
-        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
-            raise UnauthorizedActorError(
-                "Only registrar officers or admins can run scheduling."
+    # ── Read view: existing sections + schedule status ──────────
+
+    async def get_department_term_overview(
+        self,
+        term_id: uuid.UUID,
+        department: str,
+        officer_user_id: uuid.UUID,
+    ) -> dict:
+        """
+        Read-only snapshot of what scheduling has already produced for
+        a single (term, department). Lets the Department-Head landing
+        page render previously allocated sections and decide whether
+        the allocate/generate buttons should still be available
+        without re-running the agents.
+        """
+        await self._require_dh_or_admin(
+            officer_user_id, requested_department=department,
+        )
+        term = await self.terms.get(term_id)
+        if term is None:
+            raise EntityNotFoundError("AcademicTerm", str(term_id))
+
+        sections = (
+            await self.db.execute(
+                select(Section).where(
+                    Section.term_id == term_id,
+                    Section.department == department,
+                    Section.is_deleted == False,  # noqa: E712
+                ).order_by(Section.semester, Section.section_code)
             )
+        ).scalars().all()
+
+        section_dicts = [
+            {
+                "section_id": str(s.id),
+                "section_code": s.section_code,
+                "department": s.department,
+                "semester": s.semester,
+                "capacity": s.capacity,
+                "enrolled_count": s.enrolled_count,
+            }
+            for s in sections
+        ]
+
+        section_ids = [s.id for s in sections]
+        if section_ids:
+            slots_count = len(
+                (
+                    await self.db.execute(
+                        select(ClassScheduleSlot.id).where(
+                            ClassScheduleSlot.section_id.in_(section_ids),
+                        )
+                    )
+                ).scalars().all()
+            )
+            students_placed_count = len(
+                (
+                    await self.db.execute(
+                        select(Registration.id).where(
+                            Registration.section_id.in_(section_ids),
+                        )
+                    )
+                ).scalars().all()
+            )
+        else:
+            slots_count = 0
+            students_placed_count = 0
+
+        return {
+            "term_id": str(term_id),
+            "department": department,
+            "sections": section_dicts,
+            "students_placed_count": students_placed_count,
+            "slots_count": slots_count,
+            "has_sections": bool(section_ids),
+            "has_slots": slots_count > 0,
+        }
+
+    async def _require_dh_or_admin(
+        self,
+        officer_user_id: uuid.UUID,
+        requested_department: Optional[str] = None,
+    ) -> str:
+        """
+        Resolve the calling user; allow `ADMIN` users through, or
+        users whose ``CourseManagementOfficer.role`` is
+        ``DEPARTMENT_HEAD``. Plain registrar officers and any other
+        role are rejected.
+
+        When ``requested_department`` is provided and the caller is a
+        DH, the helper additionally enforces that the DH's
+        ``CourseManagementOfficer.department`` matches it. Admins
+        bypass this check (they can operate across departments).
+
+        Returns the resolved actor role label ("ADMIN" or
+        "DEPARTMENT_HEAD") for use in audit-log entries.
+        """
+        from app.modules.auth.models import User as _User
+        user = await self.db.get(_User, officer_user_id)
+        if user is None:
+            raise UnauthorizedActorError("Calling user not found.")
+        if user.role == UserRole.ADMIN:
+            return UserRole.ADMIN.value
+        officer = (
+            await self.db.execute(
+                select(CourseManagementOfficer).where(
+                    CourseManagementOfficer.user_id == officer_user_id,
+                    CourseManagementOfficer.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
+            raise UnauthorizedActorError(
+                "Only a Department Head (or admin) may run scheduling."
+            )
+        # DH must have a department assigned, and (when the caller
+        # specified one) the two must match.
+        if officer.department is None:
+            raise UnauthorizedActorError(
+                f"Department Head '{officer.staff_id}' has no department "
+                "assigned — cannot run scheduling. Contact an administrator."
+            )
+        if (
+            requested_department is not None
+            and officer.department != requested_department
+        ):
+            raise UnauthorizedActorError(
+                f"Department Head '{officer.staff_id}' is scoped to "
+                f"'{officer.department}' and cannot run scheduling for "
+                f"'{requested_department}'."
+            )
+        return OfficerRole.DEPARTMENT_HEAD.value
 
     # ── Read views ───────────────────────────────────────────────
 
@@ -1675,8 +1825,15 @@ class SchedulingService:
                 }
                 cohort_rows = list((
                     await self.db.execute(
-                        select(ClassScheduleSlot, Course).join(
+                        select(
+                            ClassScheduleSlot, Course, Instructor, User,
+                        ).join(
                             Course, Course.id == ClassScheduleSlot.course_id,
+                        ).outerjoin(
+                            Instructor,
+                            Instructor.id == ClassScheduleSlot.instructor_id,
+                        ).outerjoin(
+                            User, User.id == Instructor.user_id,
                         ).where(
                             ClassScheduleSlot.section_id == registration.section_id,
                             ClassScheduleSlot.course_id.in_(active_course_ids)
@@ -1695,6 +1852,8 @@ class SchedulingService:
                     ClassScheduleSlot,
                     Course,
                     Section,
+                    Instructor,
+                    User,
                 ).join(
                     ClassScheduleSlot,
                     ClassScheduleSlot.id == StudentScheduleAddition.schedule_slot_id,
@@ -1702,6 +1861,11 @@ class SchedulingService:
                     Course, Course.id == ClassScheduleSlot.course_id,
                 ).join(
                     Section, Section.id == ClassScheduleSlot.section_id,
+                ).outerjoin(
+                    Instructor,
+                    Instructor.id == ClassScheduleSlot.instructor_id,
+                ).outerjoin(
+                    User, User.id == Instructor.user_id,
                 ).where(
                     StudentScheduleAddition.registration_id == registration.id,
                 )
@@ -1711,7 +1875,7 @@ class SchedulingService:
         # Effective slot list = cohort slots + addition slots, sorted
         # together so the portal renders a single weekly view.
         items: list[dict] = []
-        for slot, course in cohort_rows:
+        for slot, course, instructor, user in cohort_rows:
             items.append({
                 "course_id": str(course.id),
                 "course_code": course.code,
@@ -1721,6 +1885,13 @@ class SchedulingService:
                 "end_time": slot.end_time.isoformat(timespec="minutes"),
                 "instructor_id": (
                     str(slot.instructor_id) if slot.instructor_id else None
+                ),
+                "instructor_name": (
+                    f"{user.first_name} {user.last_name}".strip()
+                    if user is not None else None
+                ),
+                "instructor_staff_id": (
+                    instructor.instructor_id if instructor is not None else None
                 ),
                 "room": slot.room,
                 "source": "cohort",
@@ -1729,7 +1900,7 @@ class SchedulingService:
                     if registration.section_id else None
                 ),
             })
-        for _addition, slot, course, source_section in addition_rows:
+        for _addition, slot, course, source_section, instructor, user in addition_rows:
             items.append({
                 "course_id": str(course.id),
                 "course_code": course.code,
@@ -1739,6 +1910,13 @@ class SchedulingService:
                 "end_time": slot.end_time.isoformat(timespec="minutes"),
                 "instructor_id": (
                     str(slot.instructor_id) if slot.instructor_id else None
+                ),
+                "instructor_name": (
+                    f"{user.first_name} {user.last_name}".strip()
+                    if user is not None else None
+                ),
+                "instructor_staff_id": (
+                    instructor.instructor_id if instructor is not None else None
                 ),
                 "room": slot.room,
                 "source": "addition",
@@ -1836,13 +2014,20 @@ class SchedulingService:
         if section is None:
             raise EntityNotFoundError("Section", str(section_id))
 
+        # Instructor + User are LEFT-JOINed so a slot whose instructor
+        # has never been assigned (instructor_id NULL) still comes
+        # back — it just has nulls in the name/staff_id columns and
+        # the UI renders "TBA".
         slot_rows = (
             await self.db.execute(
-                select(ClassScheduleSlot, Course).join(
-                    Course, Course.id == ClassScheduleSlot.course_id,
-                ).where(
-                    ClassScheduleSlot.section_id == section_id,
-                ).order_by(
+                select(ClassScheduleSlot, Course, Instructor, User)
+                .join(Course, Course.id == ClassScheduleSlot.course_id)
+                .outerjoin(
+                    Instructor, Instructor.id == ClassScheduleSlot.instructor_id,
+                )
+                .outerjoin(User, User.id == Instructor.user_id)
+                .where(ClassScheduleSlot.section_id == section_id)
+                .order_by(
                     ClassScheduleSlot.day_of_week.asc(),
                     ClassScheduleSlot.start_time.asc(),
                 )
@@ -1870,9 +2055,16 @@ class SchedulingService:
                     "instructor_id": (
                         str(slot.instructor_id) if slot.instructor_id else None
                     ),
+                    "instructor_name": (
+                        f"{user.first_name} {user.last_name}".strip()
+                        if user is not None else None
+                    ),
+                    "instructor_staff_id": (
+                        instructor.instructor_id if instructor is not None else None
+                    ),
                     "room": slot.room,
                 }
-                for slot, course in slot_rows
+                for slot, course, instructor, user in slot_rows
             ],
         }
 
@@ -2075,23 +2267,23 @@ class SchedulingService:
         self,
         slot_id: uuid.UUID,
         instructor_id: uuid.UUID,
-        officer_role: UserRole,
-        officer_id: uuid.UUID,
+        officer_user_id: uuid.UUID,
     ) -> ClassScheduleSlot:
         """
-        Officer-only: change the instructor pinned to one
-        ``ClassScheduleSlot`` row. Refuses if the new instructor is
-        already booked at the same ``(day_of_week, start_time)`` in
-        any other slot in the term — that would create the same
-        collision the generator avoids.
+        Department-Head-only (admins also allowed): change the
+        instructor pinned to one ``ClassScheduleSlot`` row. Refuses
+        if the new instructor is already booked at the same
+        ``(day_of_week, start_time)`` in any other slot in the term —
+        that would create the same collision the generator avoids.
 
         Raises:
-            UnauthorizedActorError: caller is not officer/admin.
+            UnauthorizedActorError: caller is not DH or admin, or the
+                slot belongs to a different department than the DH.
             EntityNotFoundError: slot or instructor doesn't exist.
             InvalidAdjustmentRequestError: instructor already booked.
         """
-        self._require_officer(officer_role)
-
+        # Resolve the slot's department first so DH scoping rejects a
+        # cross-department reassignment attempt before any other work.
         slot = (
             await self.db.execute(
                 select(ClassScheduleSlot).where(
@@ -2101,6 +2293,14 @@ class SchedulingService:
         ).scalar_one_or_none()
         if slot is None:
             raise EntityNotFoundError("ClassScheduleSlot", str(slot_id))
+        slot_dept = (
+            await self.db.execute(
+                select(Section.department).where(Section.id == slot.section_id)
+            )
+        ).scalar_one()
+        actor_role = await self._require_dh_or_admin(
+            officer_user_id, requested_department=slot_dept,
+        )
 
         instructor = (
             await self.db.execute(
@@ -2148,8 +2348,8 @@ class SchedulingService:
 
         write_audit_log(
             action="course.slot.instructor_reassigned",
-            actor_role=officer_role.value,
-            actor_id=officer_id,
+            actor_role=actor_role,
+            actor_id=officer_user_id,
             resource_type="ClassScheduleSlot",
             resource_id=slot.id,
             decision="ok",
@@ -2166,21 +2366,39 @@ class SchedulingService:
     async def list_open_conflicts(
         self,
         term_id: uuid.UUID,
-        officer_role: UserRole,
+        officer_user_id: uuid.UUID,
         department: Optional[str] = None,
     ) -> list[ScheduleConflict]:
-        """Officer-only: list every OPEN ScheduleConflict in the term."""
-        if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
-            raise UnauthorizedActorError(
-                "Only registrar officers or admins can view the conflict report."
-            )
+        """
+        Department-Head-only (admins allowed): list every OPEN
+        ScheduleConflict in the term. For DHs, results are always
+        scoped to the DH's own department even if no ``department``
+        filter is passed — they should never see another department's
+        conflicts. Admins see all departments unless they pass a
+        filter.
+        """
+        actor_role = await self._require_dh_or_admin(
+            officer_user_id, requested_department=department,
+        )
         from app.shared.enums import ScheduleConflictStatus
         stmt = select(ScheduleConflict).where(
             ScheduleConflict.term_id == term_id,
             ScheduleConflict.status == ScheduleConflictStatus.OPEN,
         )
-        if department:
-            stmt = stmt.where(ScheduleConflict.department == department)
+        effective_dept = department
+        if actor_role == OfficerRole.DEPARTMENT_HEAD.value and not effective_dept:
+            # DH didn't pass a filter — pin to their own department.
+            officer = (
+                await self.db.execute(
+                    select(CourseManagementOfficer).where(
+                        CourseManagementOfficer.user_id == officer_user_id,
+                        CourseManagementOfficer.is_deleted == False,  # noqa: E712
+                    )
+                )
+            ).scalar_one()
+            effective_dept = officer.department
+        if effective_dept:
+            stmt = stmt.where(ScheduleConflict.department == effective_dept)
         return list((await self.db.execute(stmt)).scalars().all())
 
 

@@ -51,13 +51,14 @@ async def closed_term(async_session, seeded_term):
 
 @pytest_asyncio.fixture
 async def cs_chain_with_payments(async_session) -> dict[str, Course]:
-    """CS101 -> CS201 prereq chain."""
+    """CS101 -> CS201 prereq chain. Credits sized so a 2-course
+    registration (12 ECTS) clears the credit-load floor."""
     cs101 = Course(
-        code="CS101", title="Intro", credit_hours=4, semester=1,
+        code="CS101", title="Intro", credit_hours=12, semester=1,
         department="Computer Science",
     )
     cs201 = Course(
-        code="CS201", title="Data Structures", credit_hours=4, semester=2,
+        code="CS201", title="Data Structures", credit_hours=12, semester=2,
         department="Computer Science",
     )
     async_session.add_all([cs101, cs201])

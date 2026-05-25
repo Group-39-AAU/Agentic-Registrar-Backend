@@ -13,7 +13,8 @@ from app.core.dependencies import get_current_user, get_email_service
 from app.database.session import get_db
 from app.modules.auth.models import User
 from app.modules.course.models import (
-    AdvisoryRecommendation, ClassScheduleSlot, Instructor,
+    AdvisoryRecommendation, ClassScheduleSlot, CourseManagementOfficer,
+    Instructor,
 )
 from app.modules.programs.models import AcademicProgram
 from app.modules.course.exceptions import (
@@ -40,6 +41,7 @@ from app.modules.course.schemas import (
     AdvisoryRecommendationRead,
     AdvisoryReviewCloseRequest,
     ConsultationRecommendedCourse,
+    DepartmentTermOverviewResponse,
     GraduationImpactRead,
     AssignInstructorToSlotRequest,
     AvailableCoursesRequest,
@@ -79,7 +81,7 @@ from app.modules.course.service import (
     RegistrationService, SchedulingService, TermService,
 )
 from app.shared.email.service import EmailService
-from app.shared.enums import AddDropBatchStatus, UserRole
+from app.shared.enums import AddDropBatchStatus, OfficerRole, UserRole
 
 
 router = APIRouter(prefix="/courses", tags=["Course Management"])
@@ -239,22 +241,26 @@ async def list_my_available_courses(
            * No Registration → 200 with ``is_registered=false`` and
              ``courses`` = curriculum picker (department + per-term
              semester filter).
-      2. Term is CLOSED and has already started → 200 with the
-         student's active (non-dropped) registered courses, plus
-         ``registration_id`` + ``registration_status``. **404** if
-         the student has no Registration for that term.
-      3. Term is CLOSED and has not started yet → **409** "this term
-         is not open yet".
+      2. Term is CLOSED and has already started.
+           * Has a Registration → 200 with the student's active
+             (non-dropped) registered courses, plus ``registration_id``
+             + ``registration_status``.
+           * No Registration → 200 with ``is_registered=false`` and
+             ``courses=[]``. Not an error — the frontend renders the
+             "you weren't registered for this term" empty state.
+      3. Term is CLOSED and has not started yet → 200 with
+         ``is_registered=false`` and ``courses=[]``. Same shape as the
+         past-term no-registration case; the frontend renders a "this
+         term hasn't opened yet" empty-state card.
 
-    Returns 404 also when ``term_id`` does not match any existing
-    (non-deleted) AcademicTerm.
+    Returns 404 when ``term_id`` does not match any existing
+    (non-deleted) AcademicTerm, or when the calling student row is
+    missing.
     """
     student = await _resolve_student(db, current_user)
     svc = RegistrationService(db)
     try:
         return await svc.list_available_courses(student.id, payload.term_id)
-    except TermNotYetOpenError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
 
@@ -297,13 +303,25 @@ async def register_me(
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
     except ComplianceCheckFailedError as exc:
-        # ComplianceCheckFailedError carries .payload (the structured
-        # agent verdict), not .detail. Surface the payload so the
-        # student can see *why* their courses were rejected.
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=exc.payload,
-        )
+        # Stitch the agent's per-check reasons into one human-readable
+        # string. The exception carries the full structured payload on
+        # ``exc.payload`` (prereq_results / load_result / payment_result),
+        # each with a ``reasons`` list of plain-language strings.
+        reasons: list[str] = []
+        payload = exc.payload or {}
+        for prereq in payload.get("prereq_results", []) or []:
+            if not prereq.get("passed", True):
+                reasons.extend(prereq.get("reasons", []) or [])
+        for key in ("load_result", "payment_result"):
+            result = payload.get(key) or {}
+            if not result.get("passed", True):
+                reasons.extend(result.get("reasons", []) or [])
+        # Use "\n" as the separator — individual reason strings can
+        # contain semicolons (e.g. "Payment outstanding for 10 course(s);
+        # registration cannot be finalised until settled."), so the
+        # frontend needs an unambiguous splitter to render bullets.
+        detail = "\n".join(r for r in reasons if r) or str(exc)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail)
     return RegistrationSubmitResponse(
         registration=registration, compliance=compliance,
     )
@@ -384,6 +402,53 @@ async def _resolve_program_department(
     return program.department
 
 
+async def _resolve_scheduling_department(
+    db: AsyncSession,
+    current_user: User,
+    program_id: uuid.UUID | None,
+) -> str:
+    """
+    Resolve the department a scheduling action should run against.
+
+    Department Heads operate on their own department: when
+    ``program_id`` is omitted, the department is read from the
+    caller's ``CourseManagementOfficer.department``. Admins (who can
+    operate across departments) must pass ``program_id`` to pick a
+    target. If ``program_id`` is provided, it wins for both roles —
+    the service-layer auth check still enforces that a DH can only
+    target their own department.
+    """
+    if program_id is not None:
+        return await _resolve_program_department(db, program_id)
+
+    if current_user.role == UserRole.ADMIN:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Admins must pass program_id to choose a department.",
+        )
+
+    officer = (
+        await db.execute(
+            select(CourseManagementOfficer).where(
+                CourseManagementOfficer.user_id == current_user.id,
+                CourseManagementOfficer.is_deleted == False,  # noqa: E712
+            )
+        )
+    ).scalar_one_or_none()
+    if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only a Department Head (or admin) may run scheduling.",
+        )
+    if officer.department is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Department Head '{officer.staff_id}' has no department "
+            "assigned — cannot run scheduling. Contact an administrator.",
+        )
+    return officer.department
+
+
 @router.post(
     "/officer/sections/allocate",
     response_model=SectionAllocationResponse,
@@ -395,27 +460,29 @@ async def officer_allocate_sections(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer-only: group every REGISTERED student in this department
-    (across semesters 1–10) into cohort sections sized to the
-    department's :class:`Classroom` inventory. Every
-    ``Registration.section_id`` in the department gets pinned.
+    Department-Head-only (admins also allowed): group every REGISTERED
+    student in this department (across semesters 1–10) into cohort
+    sections sized to the department's :class:`Classroom` inventory.
+    Every ``Registration.section_id`` in the department gets pinned.
 
     Does *not* emit weekly class meetings — that's the separate
-    :func:`officer_generate_timetable` call below, which the officer
+    :func:`officer_generate_timetable` call below, which the DH
     runs after reviewing the cohort split.
 
-    Idempotent on re-runs: students already pinned stay put; new
-    students fill remaining capacity before fresh sections are
-    created.
+    Idempotent on re-runs: every existing section, its weekly slots,
+    its schedule-conflict rows, and the ``Registration.section_id``
+    pins it owned are wiped first, then the fresh allocation is
+    built from scratch. Safe to invoke from a "Regenerate" button.
     """
-    department = await _resolve_program_department(db, payload.program_id)
+    department = await _resolve_scheduling_department(
+        db, current_user, payload.program_id,
+    )
     svc = SchedulingService(db)
     try:
         result = await svc.allocate_sections(
             term_id=payload.term_id,
             department=department,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            officer_user_id=current_user.id,
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
@@ -439,9 +506,10 @@ async def officer_generate_timetable(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer-only: build the per-section weekly schedule
-    (``ClassScheduleSlot`` rows) for every Section the department
-    has. Total weekly hours per course == ``course.credit_hours``.
+    Department-Head-only (admins also allowed): build the per-section
+    weekly schedule (``ClassScheduleSlot`` rows) for every Section
+    the department has. Total weekly hours per course ==
+    ``course.credit_hours``.
 
     Prerequisite: :func:`officer_allocate_sections` must have run for
     this (term, department) — if no sections exist yet, the response
@@ -450,14 +518,15 @@ async def officer_generate_timetable(
     Idempotent: re-runs delete the department's existing slots and
     rebuild from scratch.
     """
-    department = await _resolve_program_department(db, payload.program_id)
+    department = await _resolve_scheduling_department(
+        db, current_user, payload.program_id,
+    )
     svc = SchedulingService(db)
     try:
         result = await svc.generate_timetable(
             term_id=payload.term_id,
             department=department,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            officer_user_id=current_user.id,
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
@@ -468,6 +537,44 @@ async def officer_generate_timetable(
             status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail,
         )
     return TimetableGenerateResponse(**result)
+
+
+@router.get(
+    "/officer/sections/overview",
+    response_model=DepartmentTermOverviewResponse,
+    summary="Read-only view of what scheduling has produced for the caller's department",
+)
+async def officer_department_term_overview(
+    term_id: uuid.UUID,
+    program_id: uuid.UUID | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns existing sections + schedule status for a (term,
+    department) without mutating anything. Department Heads omit
+    ``program_id`` — their department is read from their
+    ``CourseManagementOfficer`` row. Admins must pass ``program_id``.
+
+    The frontend uses ``has_sections`` / ``has_slots`` to gate the
+    allocate / generate buttons, and ``sections`` to render the
+    previously generated cohort split without a re-run.
+    """
+    department = await _resolve_scheduling_department(
+        db, current_user, program_id,
+    )
+    svc = SchedulingService(db)
+    try:
+        result = await svc.get_department_term_overview(
+            term_id=term_id,
+            department=department,
+            officer_user_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    return DepartmentTermOverviewResponse(**result)
 
 
 @router.get(
@@ -487,7 +594,7 @@ async def officer_list_conflicts(
     try:
         rows = await svc.list_open_conflicts(
             term_id=term_id,
-            officer_role=current_user.role,
+            officer_user_id=current_user.id,
             department=department,
         )
     except UnauthorizedActorError as exc:
@@ -507,18 +614,17 @@ async def officer_assign_slot_instructor(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Officer-only: replace the instructor on a single
-    ``ClassScheduleSlot``. Refuses with 422 if the new instructor is
-    already booked elsewhere in the term at the same
-    ``(day_of_week, start_time)``.
+    Department-Head-only (admins also allowed): replace the
+    instructor on a single ``ClassScheduleSlot``. Refuses with 422
+    if the new instructor is already booked elsewhere in the term
+    at the same ``(day_of_week, start_time)``.
     """
     svc = SchedulingService(db)
     try:
         slot = await svc.assign_instructor_to_slot(
             slot_id=slot_id,
             instructor_id=payload.instructor_id,
-            officer_role=current_user.role,
-            officer_id=current_user.id,
+            officer_user_id=current_user.id,
         )
     except UnauthorizedActorError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)

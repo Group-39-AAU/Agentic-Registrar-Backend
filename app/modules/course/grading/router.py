@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from typing import Optional
@@ -55,7 +55,7 @@ from app.modules.course.grading.service import InstructorGradingService
 from app.modules.course.grading.transcript_service import (
     StudentTranscriptService,
 )
-from app.shared.enums import UserRole
+from app.shared.enums import GradeSubmissionStatus, UserRole
 
 
 # Nested under the same /courses prefix as the rest of the module so
@@ -563,29 +563,46 @@ async def list_queue_departments(
 @router.get(
     "/officer/queue",
     response_model=list[DepartmentHeadQueueEntry],
-    summary="Batches awaiting department-head decision (SUBMITTED or FLAGGED)",
+    summary="Batches in the requested statuses for the caller's department",
 )
 async def list_dh_queue(
     term_id: Optional[uuid.UUID] = None,
     department: Optional[str] = None,
+    status_filter: Optional[str] = Query(default=None, alias="status"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Sorted oldest-first by ``submitted_at`` so the most overdue
-    batch surfaces at the top. Each entry carries enough metadata
-    (course, instructor, latest agent verdict, flag count, roster
-    size) for the DH to triage without fetching the full packet.
+    Pending batches by default (``SUBMITTED`` + ``FLAGGED``), sorted
+    oldest-first. Pass ``status`` as a comma-separated list (e.g.
+    ``AUTHORISED`` or ``AUTHORISED,REJECTED``) to fetch terminal
+    history — terminal lists sort most-recent-first.
 
-    Optional filters: ``term_id`` and ``department``.
+    Department auto-scopes to the calling Department Head's own
+    department; admins see every department unless they pass
+    ``department``.
 
     403 if the caller is not a department head (or admin).
+    422 if ``status`` contains an unknown grade-submission status.
     """
+    statuses: Optional[set[GradeSubmissionStatus]] = None
+    if status_filter:
+        try:
+            statuses = {
+                GradeSubmissionStatus(piece.strip().upper())
+                for piece in status_filter.split(",") if piece.strip()
+            } or None
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Unknown status value: {exc}",
+            ) from exc
     svc = DepartmentHeadGradingService(db)
     try:
         return await svc.list_queue(
             user_id=current_user.id,
             term_id=term_id, department=department,
+            statuses=statuses,
         )
     except Exception as exc:
         _raise_grading_errors(exc)

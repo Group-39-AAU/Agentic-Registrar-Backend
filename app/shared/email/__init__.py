@@ -3,6 +3,7 @@
 from app.shared.email.schemas import EmailMessage
 from app.shared.email.service import EmailService
 from app.shared.email.templates import (
+    build_changes_requested_email,
     build_password_reset_email,
     build_portal_credentials_email,
     build_uat_acceptance_email,
@@ -15,5 +16,6 @@ __all__ = [
     "build_welcome_email",
     "build_uat_acceptance_email",
     "build_portal_credentials_email",
+    "build_changes_requested_email",
     "build_password_reset_email",
 ]
