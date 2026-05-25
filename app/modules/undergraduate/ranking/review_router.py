@@ -156,8 +156,9 @@ async def _build_review_card(
 
 @router.get("/students", response_model=StudentReviewListResponse)
 async def list_students_for_review(
-    sponsorship_type: SponsorshipType = Query(
-        ..., description="Filter by SELF_SPONSORED or GOVERNMENT"
+    sponsorship_type: Optional[SponsorshipType] = Query(
+        None,
+        description="Optional filter: SELF_SPONSORED or GOVERNMENT. Omit to list both.",
     ),
     ai_recommended_decision: Optional[DecisionType] = Query(
         None,
@@ -169,9 +170,11 @@ async def list_students_for_review(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Paginated list of students awaiting officer review.
-    Filtered by sponsorship type (self-sponsored or government).
-    Optionally filtered by the latest AI recommended decision.
+    Paginated list of students awaiting officer review, sorted by
+    the latest ranking position (best rank first; unranked rows go
+    last). ``sponsorship_type`` is optional — omit it to list every
+    pending applicant in one paginated stream. ``ai_recommended_decision``
+    additionally narrows by the latest AI evaluation.
     """
     _role_gate(current_user)
 
@@ -188,8 +191,11 @@ async def list_students_for_review(
     base_filter = [
         UndergraduateApplication.current_status == ApplicationStatus.PENDING_REVIEW,
         UndergraduateApplication.is_deleted == False,  # noqa: E712
-        UndergraduateApplication.sponsorship_type == sponsorship_type,
     ]
+    if sponsorship_type is not None:
+        base_filter.append(
+            UndergraduateApplication.sponsorship_type == sponsorship_type,
+        )
 
     # If filtering by AI recommended decision, restrict to applications whose
     # latest AIEvaluation matches the requested decision.
@@ -216,16 +222,50 @@ async def list_students_for_review(
             UndergraduateApplication.id.in_(select(latest_eval.c.application_id))
         )
 
+    # Latest ranking row per application — RankingResult is an
+    # immutable ledger so an applicant can have several runs; we sort
+    # by the most recent one (matches what _build_review_card
+    # surfaces in each card).
+    latest_rank_dates = (
+        select(
+            RankingResult.application_id.label("application_id"),
+            func.max(RankingResult.created_at).label("latest_created_at"),
+        )
+        .group_by(RankingResult.application_id)
+        .subquery()
+    )
+    latest_rank = (
+        select(
+            RankingResult.application_id.label("application_id"),
+            RankingResult.rank_position.label("rank_position"),
+        )
+        .join(
+            latest_rank_dates,
+            (RankingResult.application_id == latest_rank_dates.c.application_id)
+            & (RankingResult.created_at == latest_rank_dates.c.latest_created_at),
+        )
+        .subquery()
+    )
+
     # Total count
     total = (await db.execute(
         select(func.count(UndergraduateApplication.id)).where(*base_filter)
     )).scalar()
 
-    # Paginated query
+    # Paginated query — order by latest rank_position ASC (nulls last
+    # so applications without a ranking still appear, at the bottom).
     offset = (page - 1) * page_size
     result = await db.execute(
         select(UndergraduateApplication)
+        .outerjoin(
+            latest_rank,
+            latest_rank.c.application_id == UndergraduateApplication.id,
+        )
         .where(*base_filter)
+        .order_by(
+            latest_rank.c.rank_position.asc().nulls_last(),
+            UndergraduateApplication.admission_number.asc(),
+        )
         .offset(offset)
         .limit(page_size)
     )
