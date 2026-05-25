@@ -17,8 +17,8 @@ Top-level structure:
     Terms (4 — 2025/26 ph 1 closed, 2025/26 ph 2 closed,
                 2026/27 ph 1 OPEN, 2026/27 ph 2 closed),
     Courses (240 — 6 depts × 10 sems × 4 courses, plus 6 extra SE-sem-1
-    catalog rows SE105–SE110), prerequisites, classrooms, 12 instructors
-    with round-robin course assignments per term, 30 hand-crafted students
+    catalog rows SE105–SE110), prerequisites, classrooms, 30 instructors
+    (5 per dept) with round-robin course assignments per term, 30 hand-crafted students
     across odd semesters (1/3/5/7/9) and 6 departments (5 per dept), and 2
     officers. The registration-flow demo subject is *not* seeded — they
     are created live by running the admission → ranking → enrollment flow,
@@ -324,22 +324,58 @@ PREREQUISITES = [
 
 
 # ══════════════════════════════════════════════════════════════
-#  Instructors (12 across 6 departments — 2 per department)
+#  Instructors (30 across 6 departments — 5 per department)
 # ══════════════════════════════════════════════════════════════
+# With 4 courses per semester × 10 semesters = 40 courses per
+# department, 5 instructors → 8 courses each across the full
+# catalogue. In a single open phase (5 semesters active) this
+# works out to ~4 courses ≈ 12 weekly hours per instructor —
+# comfortably under the 35-hour teaching ceiling, so the
+# scheduling agent's no-double-booking constraint can find a
+# placement for every slot.
 
 INSTRUCTORS = [
-    ("STAFF/0001/10", "Alemayehu", "Bekele",   "Software Engineering"),
-    ("STAFF/0002/10", "Bethel",    "Tadesse",  "Software Engineering"),
-    ("STAFF/0003/10", "Chala",     "Mekonnen", "Electrical Engineering"),
-    ("STAFF/0004/10", "Dawit",     "Girma",    "Electrical Engineering"),
-    ("STAFF/0005/10", "Eyerusalem","Kassa",    "Chemical Engineering"),
-    ("STAFF/0006/10", "Feven",     "Asfaw",    "Chemical Engineering"),
-    ("STAFF/0007/10", "Getachew",  "Lemma",    "Civil Engineering"),
-    ("STAFF/0008/10", "Hanna",     "Negussie", "Civil Engineering"),
-    ("STAFF/0009/10", "Iskinder",  "Worku",    "Mechanical Engineering"),
-    ("STAFF/0010/10", "Jemal",     "Hussein",  "Mechanical Engineering"),
-    ("STAFF/0011/10", "Kalkidan",  "Demeke",   "Bio Medical Engineering"),
-    ("STAFF/0012/10", "Lensa",     "Hailu",    "Bio Medical Engineering"),
+    # ── Software Engineering ─────────────────────────────────
+    ("STAFF/0001/10", "Alemayehu", "Bekele",      "Software Engineering"),
+    ("STAFF/0002/10", "Bethel",    "Tadesse",     "Software Engineering"),
+    ("STAFF/0013/10", "Mekdes",    "Tessema",     "Software Engineering"),
+    ("STAFF/0014/10", "Natnael",   "Solomon",     "Software Engineering"),
+    ("STAFF/0015/10", "Robel",     "Yohannes",    "Software Engineering"),
+
+    # ── Electrical Engineering ───────────────────────────────
+    ("STAFF/0003/10", "Chala",     "Mekonnen",    "Electrical Engineering"),
+    ("STAFF/0004/10", "Dawit",     "Girma",       "Electrical Engineering"),
+    ("STAFF/0016/10", "Samuel",    "Belay",       "Electrical Engineering"),
+    ("STAFF/0017/10", "Tigist",    "Mulugeta",    "Electrical Engineering"),
+    ("STAFF/0018/10", "Yared",     "Abebe",       "Electrical Engineering"),
+
+    # ── Chemical Engineering ─────────────────────────────────
+    ("STAFF/0005/10", "Eyerusalem","Kassa",       "Chemical Engineering"),
+    ("STAFF/0006/10", "Feven",     "Asfaw",       "Chemical Engineering"),
+    ("STAFF/0019/10", "Yordanos",  "Tesfaye",     "Chemical Engineering"),
+    ("STAFF/0020/10", "Zelalem",   "Berhanu",     "Chemical Engineering"),
+    ("STAFF/0021/10", "Marta",     "Gebre",       "Chemical Engineering"),
+
+    # ── Civil Engineering ────────────────────────────────────
+    ("STAFF/0007/10", "Getachew",  "Lemma",       "Civil Engineering"),
+    ("STAFF/0008/10", "Hanna",     "Negussie",    "Civil Engineering"),
+    ("STAFF/0022/10", "Million",   "Kebede",      "Civil Engineering"),
+    ("STAFF/0023/10", "Nardos",    "Wondimu",     "Civil Engineering"),
+    ("STAFF/0024/10", "Selam",     "Adamu",       "Civil Engineering"),
+
+    # ── Mechanical Engineering ───────────────────────────────
+    ("STAFF/0009/10", "Iskinder",  "Worku",       "Mechanical Engineering"),
+    ("STAFF/0010/10", "Jemal",     "Hussein",     "Mechanical Engineering"),
+    ("STAFF/0025/10", "Tadios",    "Hailemariam", "Mechanical Engineering"),
+    ("STAFF/0026/10", "Yodit",     "Engida",      "Mechanical Engineering"),
+    ("STAFF/0027/10", "Zewdu",     "Mengistu",    "Mechanical Engineering"),
+
+    # ── Bio Medical Engineering ──────────────────────────────
+    ("STAFF/0011/10", "Kalkidan",  "Demeke",      "Bio Medical Engineering"),
+    ("STAFF/0012/10", "Lensa",     "Hailu",       "Bio Medical Engineering"),
+    ("STAFF/0028/10", "Naomi",     "Tafesse",     "Bio Medical Engineering"),
+    ("STAFF/0029/10", "Robera",    "Daba",        "Bio Medical Engineering"),
+    ("STAFF/0030/10", "Saron",     "Yilma",       "Bio Medical Engineering"),
 ]
 
 

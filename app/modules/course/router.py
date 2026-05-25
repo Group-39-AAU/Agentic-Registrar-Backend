@@ -469,9 +469,10 @@ async def officer_allocate_sections(
     :func:`officer_generate_timetable` call below, which the DH
     runs after reviewing the cohort split.
 
-    Idempotent on re-runs: students already pinned stay put; new
-    students fill remaining capacity before fresh sections are
-    created.
+    Idempotent on re-runs: every existing section, its weekly slots,
+    its schedule-conflict rows, and the ``Registration.section_id``
+    pins it owned are wiped first, then the fresh allocation is
+    built from scratch. Safe to invoke from a "Regenerate" button.
     """
     department = await _resolve_scheduling_department(
         db, current_user, payload.program_id,
