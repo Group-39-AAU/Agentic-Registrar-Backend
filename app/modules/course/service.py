@@ -49,9 +49,10 @@ from app.modules.course.exceptions import (
 from app.modules.course.models import (
     AcademicTerm, AddDropBatch, AddDropRequest, AdvisoryRecommendation,
     ClassScheduleSlot, Classroom, CourseManagementOfficer, Course,
-    Instructor, InstructorAssignment, PrerequisiteOverride, Registration,
-    RegistrationCourse, RegistrationStatusHistory, ScheduleConflict, Section,
-    Student, StudentScheduleAddition,
+    CoursePrerequisite, Instructor, InstructorAssignment,
+    PrerequisiteOverride, Registration, RegistrationCourse,
+    RegistrationStatusHistory, ScheduleConflict, Section, Student,
+    StudentScheduleAddition,
 )
 from app.modules.course.repository import (
     AcademicTermRepository, AddDropRequestRepository,
@@ -532,6 +533,15 @@ class RegistrationService:
         # any state) and not previously completed with a passing
         # grade. Lets the picker offer past/future curriculum courses
         # the student never took, not just re-adds of dropped rows.
+        #
+        # The picker is the user-facing surface for ADD, so we also
+        # apply the gates the EnrollmentAdjustmentAgent would apply
+        # at submit time — parity, prereq satisfaction, and offered-
+        # in-term. Without these filters the catalog includes choices
+        # that the agent would deterministically reject, which is a
+        # bad UX (the student can pick them and only finds out at
+        # submit). Keeping these in sync with the agent is critical;
+        # the agent remains the source of truth at submit time.
         on_registration_ids = {rc.course_id for rc in registration.courses}
         completed_ids = await GradeRepository(self.db).completed_course_ids(
             student.id,
@@ -550,15 +560,91 @@ class RegistrationService:
                 )
             ).scalars().all()
         )
-        catalog: list[dict] = [
-            {
+
+        # Pre-fetch the auxiliary data each filter needs in batched
+        # queries so this stays O(1) round trips instead of one per
+        # course.
+        candidate_ids = [
+            c.id for c in catalog_rows if c.id not in excluded_ids
+        ]
+        student_parity = (
+            student.current_semester % 2
+            if student.current_semester is not None else None
+        )
+
+        offered_course_ids: set[uuid.UUID] = set()
+        if candidate_ids:
+            offered_rows = (
+                await self.db.execute(
+                    select(ClassScheduleSlot.course_id)
+                    .join(Section, Section.id == ClassScheduleSlot.section_id)
+                    .where(
+                        Section.term_id == open_term.id,
+                        Section.is_deleted == False,  # noqa: E712
+                        ClassScheduleSlot.course_id.in_(candidate_ids),
+                    )
+                    .distinct()
+                )
+            ).scalars().all()
+            offered_course_ids = set(offered_rows)
+
+        prereq_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+        if candidate_ids:
+            prereq_pairs = (
+                await self.db.execute(
+                    select(
+                        CoursePrerequisite.course_id,
+                        CoursePrerequisite.prerequisite_course_id,
+                    ).where(
+                        CoursePrerequisite.course_id.in_(candidate_ids),
+                    )
+                )
+            ).all()
+        prereqs_by_course: dict[uuid.UUID, set[uuid.UUID]] = {}
+        for course_id, prereq_id in prereq_pairs:
+            prereqs_by_course.setdefault(course_id, set()).add(prereq_id)
+
+        # Department-Head bypasses scoped to this registration win
+        # over the prereq check, same as the agent does at submit.
+        override_rows = (
+            await self.db.execute(
+                select(PrerequisiteOverride.course_id).where(
+                    PrerequisiteOverride.registration_id == registration.id,
+                )
+            )
+        ).scalars().all()
+        overridden_course_ids = set(override_rows)
+
+        catalog: list[dict] = []
+        for c in catalog_rows:
+            if c.id in excluded_ids:
+                continue
+            # Parity: AAU only runs odd-semester courses in phase-1
+            # and even-semester courses in phase-2, so a course whose
+            # parity does not match the student's current semester is
+            # not on offer this term and the agent would reject it.
+            if (
+                student_parity is not None
+                and c.semester % 2 != student_parity
+            ):
+                continue
+            # Offered-in-term: at least one Section in the open term
+            # must teach this course (i.e. have a ClassScheduleSlot
+            # for it) or there is nothing to place the student into.
+            if c.id not in offered_course_ids:
+                continue
+            # Prereqs: every required course must already be passed
+            # OR the registration must carry a DH override for c.
+            required = prereqs_by_course.get(c.id, set())
+            if c.id not in overridden_course_ids and not required.issubset(
+                completed_ids
+            ):
+                continue
+            catalog.append({
                 "course_id": c.id,
                 "pending_add": c.id in pending_add_course_ids,
                 "course": c,
-            }
-            for c in catalog_rows
-            if c.id not in excluded_ids
-        ]
+            })
 
         return {
             "registration_id": registration.id,
@@ -3394,6 +3480,7 @@ class AdvisoryService:
 
         student_context: dict[str, Any] = {
             "student_id": student.student_id,
+            "student_db_id": str(student.id),
             "department": department,
             "current_semester": student.current_semester,
             "cgpa": cgpa,                  # may be None — agent + LLM tolerate
@@ -3405,6 +3492,7 @@ class AdvisoryService:
         current_term = {
             "term_id": str(term.id),
             "term_name": term.term_name,
+            "phase": term.phase.value if term.phase else None,
             "start_date": term.start_date.isoformat(),
             "end_date": term.end_date.isoformat(),
             "is_open": term.is_open,
