@@ -1532,8 +1532,24 @@ async def _seed_grades(
 async def _seed_standing_demo_cohort(
     session: AsyncSession,
     terms: list[AcademicTerm],
+    courses_by_code: dict[str, Course],
 ) -> None:
-    """Make ``history_term`` browsable in the Track C standing flow."""
+    """
+    Make ``history_term`` browsable in the Track C standing flow.
+
+    For every demo student, also seed ``RegistrationCourse`` rows so
+    the all-graded gate on standing compute can evaluate the student's
+    expected vs. graded course set:
+
+      * Rows are added for each course the student has an authorised
+        grade for in ``history_term`` → expected set matches graded
+        set → the student passes the gate and is computed.
+      * The *last* student of each department additionally gets one
+        ``RegistrationCourse`` for an un-graded "next semester" course
+        → demonstrates the pending-grades skip path so the seeded
+        demo shows the new feature working (compute returns the
+        student in ``pending_grades_rows`` instead of writing a row).
+    """
     history_term = min(terms, key=lambda t: t.start_date)
 
     students = (
@@ -1557,6 +1573,8 @@ async def _seed_standing_demo_cohort(
 
     new_sections = 0
     new_regs = 0
+    new_reg_courses = 0
+    pending_demo_count = 0
     for dept, dept_students in by_dept.items():
         cohort = dept_students[:5]
         if not cohort:
@@ -1583,41 +1601,106 @@ async def _seed_standing_demo_cohort(
             await session.flush()
             new_sections += 1
 
-        for stu in cohort:
+        for idx, stu in enumerate(cohort):
             existing = (await session.execute(
                 select(Registration).where(
                     Registration.student_id == stu.id,
                     Registration.term_id == history_term.id,
                 )
             )).scalar_one_or_none()
-            if existing is not None:
-                if existing.section_id is None:
-                    existing.section_id = section.id
-                    existing.status = RegistrationStatus.REGISTERED
-                continue
-            reg = Registration(
-                id=_uid(
-                    "standing-demo-reg", str(stu.id), str(history_term.id),
-                ),
-                student_id=stu.id,
-                term_id=history_term.id,
-                status=RegistrationStatus.REGISTERED,
-                sponsorship_type=(
-                    stu.sponsorship_type or SponsorshipType.GOVERNMENT
-                ),
-                section_id=section.id,
-                finalised_at=datetime.now(timezone.utc),
-            )
-            session.add(reg)
-            new_regs += 1
+            if existing is None:
+                reg = Registration(
+                    id=_uid(
+                        "standing-demo-reg",
+                        str(stu.id), str(history_term.id),
+                    ),
+                    student_id=stu.id,
+                    term_id=history_term.id,
+                    status=RegistrationStatus.REGISTERED,
+                    sponsorship_type=(
+                        stu.sponsorship_type or SponsorshipType.GOVERNMENT
+                    ),
+                    section_id=section.id,
+                    finalised_at=datetime.now(timezone.utc),
+                )
+                session.add(reg)
+                await session.flush()
+                new_regs += 1
+            else:
+                reg = existing
+                if reg.section_id is None:
+                    reg.section_id = section.id
+                    reg.status = RegistrationStatus.REGISTERED
+
+            # ── Expected courses for the all-graded gate ──
+            # Mirror the student's authorised grades for this term so
+            # expected == graded → gate passes.
+            grade_course_ids = (await session.execute(
+                select(Grade.course_id).where(
+                    Grade.student_id == stu.id,
+                    Grade.term_id == history_term.id,
+                    Grade.status == GradeSubmissionStatus.AUTHORISED,
+                    Grade.is_deleted == False,  # noqa: E712
+                )
+            )).scalars().all()
+            for course_id in grade_course_ids:
+                rc_id = _uid(
+                    "standing-demo-rc", str(reg.id), str(course_id),
+                )
+                already = (await session.execute(
+                    select(RegistrationCourse).where(
+                        RegistrationCourse.id == rc_id,
+                    )
+                )).scalar_one_or_none()
+                if already is not None:
+                    continue
+                session.add(RegistrationCourse(
+                    id=rc_id,
+                    registration_id=reg.id,
+                    course_id=course_id,
+                    is_dropped=False,
+                ))
+                new_reg_courses += 1
+
+            # The last student of each cohort gets one extra expected
+            # course that is *not* graded — this is the pending-grades
+            # demo. Pick the first slot of their current semester so
+            # the course exists in the catalog but has no grade row
+            # yet (grades only backfill prior semesters).
+            is_last_in_cohort = (idx == len(cohort) - 1)
+            if is_last_in_cohort:
+                pending_code = _course_code(dept, stu.current_semester, 1)
+                pending_course = courses_by_code.get(pending_code)
+                if pending_course is not None:
+                    rc_id = _uid(
+                        "standing-demo-rc-pending",
+                        str(reg.id), str(pending_course.id),
+                    )
+                    already = (await session.execute(
+                        select(RegistrationCourse).where(
+                            RegistrationCourse.id == rc_id,
+                        )
+                    )).scalar_one_or_none()
+                    if already is None:
+                        session.add(RegistrationCourse(
+                            id=rc_id,
+                            registration_id=reg.id,
+                            course_id=pending_course.id,
+                            is_dropped=False,
+                        ))
+                        new_reg_courses += 1
+                        pending_demo_count += 1
 
         section.enrolled_count = min(section.capacity, len(cohort))
 
     await session.commit()
-    if new_sections or new_regs:
+    if new_sections or new_regs or new_reg_courses:
         print(
             f"✅ Seeded standing demo cohort: {new_sections} sections, "
-            f"{new_regs} registrations into '{history_term.term_name}'."
+            f"{new_regs} registrations, {new_reg_courses} expected-"
+            f"course rows ({pending_demo_count} deliberately ungraded "
+            f"to demo the pending-grades gate) "
+            f"into '{history_term.term_name}'."
         )
     else:
         print(
@@ -2124,6 +2207,456 @@ async def _seed_track_b_roster(session: AsyncSession) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+#  Add/Drop demo — year-4 SE student retaking a year-2 course
+# ══════════════════════════════════════════════════════════════
+# Builds a coherent academic-history story on top of the bulk SE
+# year-4 cohort (UGR/0516–/0575 in batch /16) already REGISTERED
+# for SE701–SE704 in the open 2026/27 phase-1 term.
+#
+# THE STORY
+# Yonatan Bekele (UGR/0516/16) is a fourth-year Software-Engineering
+# student. In his second year (semester 3) he failed SE303 — Data
+# Structures. Because SE303 is the prerequisite for two semester-4
+# courses, SE402 (Algorithms) and SE403 (Database Systems), the
+# prerequisite gate locked him out of registering for those two
+# the following term, so they never landed on any past registration
+# (the seed wipes the auto-backfilled grade rows for them — see
+# step 6 below — to keep that consistent with reality). He pushed
+# on with the rest of the curriculum and is now scheduled for the
+# four semester-7 courses, but he must clear SE303 this term so
+# SE402 / SE403 can run in the upcoming phase-2 term and let him
+# graduate on time. He arrives at the add/drop window and asks
+# the registrar portal to add SE303 to his current load.
+#
+# WHAT THE SEED WIRES UP
+#
+#   * A scheduled year-4 cohort section (SE sem-7 Section A) with
+#     ClassScheduleSlot rows for SE701–SE704 — so the demo student
+#     has a real generated timetable to compare additions against.
+#
+#   * Three year-2 cohort sections offering SE303 (Data Structures)
+#     in the open term with hand-picked slot times: one collides
+#     with the demo student's existing schedule, two are conflict-
+#     free. Each carries 5 real second-year cohort students so the
+#     roster + enrolled_count reflect a believable populated section
+#     rather than an empty room.
+#
+#   * A deterministic F grade for the demo student in SE303
+#     (overwriting the hash-picked default from ``_seed_grades``)
+#     so the picker surfaces SE303 as an addable catalog course
+#     and the advisory agent puts it in failed_retakes.
+#
+#   * Deletion of the demo student's bulk-backfilled grade rows for
+#     SE402 and SE403 — those courses depend on SE303 and so could
+#     never have been attempted in his real timeline. After the
+#     deletion they read as outstanding-never-attempted graduation
+#     requirements (phase-2 semester, so the advisory agent will
+#     surface them as "next term" rather than this term).
+#
+#   * A memorable name on the demo student so the screen-record
+#     reads "Yonatan Bekele" instead of "Year4Student516 Batch16".
+#
+# Login for manual testing:
+#   demo student   ugr-0516-16@aau.edu.et   password123
+
+ADDROP_DEMO_STUDENT_ID = "UGR/0516/16"
+ADDROP_DEMO_FIRST_NAME = "Yonatan"
+ADDROP_DEMO_LAST_NAME = "Bekele"
+ADDROP_DEMO_FAILED_COURSE = "SE303"
+# Courses whose only listed prerequisite is SE303 — Yonatan's F in
+# SE303 would have blocked him from registering for them in year 2
+# phase 2, so the demo wipes the bulk-backfilled grade rows for
+# them. They then surface as outstanding-but-never-attempted on
+# the advisory agent's priority list.
+ADDROP_DEMO_BLOCKED_BY_FAILED_COURSE = ["SE402", "SE403"]
+
+# Bulk-cohort students that share the year-4 Section A with the
+# demo student. 30 keeps Section A's enrolled_count realistic
+# without blocking the rest of the cohort from sitting un-allocated
+# (so the schedule-generation demo still has work to do elsewhere).
+ADDROP_DEMO_Y4_COHORT_SIZE = 30
+
+# Number of second-year SE cohort students allocated into each of
+# the three SE303 demo sections, so the roster + enrolled_count
+# reflect real Registration rows rather than just a tally.
+ADDROP_DEMO_Y2_SECTION_ROSTER_SIZE = 5
+
+# Year-4 Section A weekly schedule. Every slot is one hour. Yonatan's
+# resulting busy windows are:
+#   MON 08–09, 10–11        TUE 08–09, 13–15
+#   WED 08–09, 10–11        THU 08–09, 09–10, 13–14
+#   FRI 08–09, 10–11
+# (course_code, day_of_week, start_hour, end_hour, room)
+ADDROP_DEMO_Y4_SCHEDULE: list[tuple[str, str, int, int, str]] = [
+    ("SE701", "MON",  8,  9, "SE-201"),
+    ("SE701", "WED",  8,  9, "SE-201"),
+    ("SE701", "FRI",  8,  9, "SE-201"),
+    ("SE702", "MON", 10, 11, "SE-201"),
+    ("SE702", "WED", 10, 11, "SE-201"),
+    ("SE702", "FRI", 10, 11, "SE-201"),
+    ("SE703", "TUE",  8,  9, "SE-202"),
+    ("SE703", "THU",  8,  9, "SE-202"),
+    ("SE703", "THU",  9, 10, "SE-202"),
+    ("SE704", "TUE", 13, 14, "SE-202"),
+    ("SE704", "TUE", 14, 15, "SE-202"),
+    ("SE704", "THU", 13, 14, "SE-202"),
+]
+
+# Year-2 (semester 3) sections each carrying SE303 slots. Slot times
+# are deliberately chosen so:
+#   Section A → collides with SE702 (MON/WED/FRI 10–11)
+#   Section B → fits the open TUE/THU 10–12 window — viable
+#   Section C → fits the open MON/WED/FRI 14–15 window — viable
+# enrolled_count is set programmatically from
+# ADDROP_DEMO_Y2_SECTION_ROSTER_SIZE so the field matches the
+# Registration rows actually allocated below.
+ADDROP_DEMO_SE303_SECTIONS: list[dict] = [
+    {
+        "section_code": "A",
+        "capacity": 30,
+        "slots": [
+            ("MON", 10, 11, "SE-101"),
+            ("WED", 10, 11, "SE-101"),
+            ("FRI", 10, 11, "SE-101"),
+        ],
+    },
+    {
+        "section_code": "B",
+        "capacity": 30,
+        "slots": [
+            ("TUE", 10, 11, "SE-102"),
+            ("THU", 10, 11, "SE-102"),
+            ("THU", 11, 12, "SE-102"),
+        ],
+    },
+    {
+        "section_code": "C",
+        "capacity": 30,
+        "slots": [
+            ("MON", 14, 15, "SE-101"),
+            ("WED", 14, 15, "SE-101"),
+            ("FRI", 14, 15, "SE-101"),
+        ],
+    },
+]
+
+
+async def _addrop_instructor_for_course(
+    session: AsyncSession,
+    *,
+    course: Course,
+    term: AcademicTerm,
+) -> Instructor | None:
+    """Resolve the term's round-robin instructor for ``course``."""
+    assignment = (
+        await session.execute(
+            select(InstructorAssignment).where(
+                InstructorAssignment.course_id == course.id,
+                InstructorAssignment.term_id == term.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if assignment is None:
+        return None
+    return await session.get(Instructor, assignment.instructor_id)
+
+
+async def _addrop_ensure_section(
+    session: AsyncSession,
+    *,
+    term: AcademicTerm,
+    department: str,
+    semester: int,
+    section_code: str,
+    capacity: int,
+    enrolled_count: int,
+) -> Section:
+    existing = (
+        await session.execute(
+            select(Section).where(
+                Section.term_id == term.id,
+                Section.department == department,
+                Section.semester == semester,
+                Section.section_code == section_code,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.capacity = capacity
+        existing.enrolled_count = min(enrolled_count, capacity)
+        return existing
+    section = Section(
+        id=_uid(
+            "addrop-section", str(term.id), department,
+            str(semester), section_code,
+        ),
+        term_id=term.id,
+        department=department,
+        semester=semester,
+        section_code=section_code,
+        capacity=capacity,
+        enrolled_count=min(enrolled_count, capacity),
+    )
+    session.add(section)
+    await session.flush()
+    return section
+
+
+async def _addrop_ensure_slot(
+    session: AsyncSession,
+    *,
+    section: Section,
+    course: Course,
+    instructor: Instructor | None,
+    day_of_week: str,
+    start_hour: int,
+    end_hour: int,
+    room: str,
+) -> ClassScheduleSlot:
+    existing = (
+        await session.execute(
+            select(ClassScheduleSlot).where(
+                ClassScheduleSlot.section_id == section.id,
+                ClassScheduleSlot.day_of_week == day_of_week,
+                ClassScheduleSlot.start_time == time(start_hour, 0),
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    slot = ClassScheduleSlot(
+        id=_uid(
+            "addrop-slot",
+            str(section.id), str(course.id),
+            day_of_week, str(start_hour),
+        ),
+        section_id=section.id,
+        course_id=course.id,
+        instructor_id=instructor.id if instructor is not None else None,
+        day_of_week=day_of_week,
+        start_time=time(start_hour, 0),
+        end_time=time(end_hour, 0),
+        room=room,
+    )
+    session.add(slot)
+    await session.flush()
+    return slot
+
+
+async def _seed_addrop_demo_scenario(
+    session: AsyncSession,
+    term: AcademicTerm,
+    courses_by_code: dict[str, Course],
+) -> None:
+    """Wire up the add/drop demo scenario on top of the bulk year-4 cohort."""
+    print(">> Add/Drop demo — year-4 SE retake scenario")
+
+    demo_student = (
+        await session.execute(
+            select(Student).where(
+                Student.student_id == ADDROP_DEMO_STUDENT_ID,
+            )
+        )
+    ).scalar_one_or_none()
+    if demo_student is None:
+        raise RuntimeError(
+            f"Add/Drop demo requires bulk year-4 cohort student "
+            f"'{ADDROP_DEMO_STUDENT_ID}' — did "
+            "_seed_bulk_se_upper_year_cohorts run?"
+        )
+
+    # ── 1. Rename the demo student so the demo reads naturally. ──
+    demo_full_name = f"{ADDROP_DEMO_FIRST_NAME} {ADDROP_DEMO_LAST_NAME}"
+    if demo_student.full_name != demo_full_name:
+        demo_student.full_name = demo_full_name
+    demo_user = await session.get(User, demo_student.user_id)
+    if demo_user is not None:
+        if demo_user.first_name != ADDROP_DEMO_FIRST_NAME:
+            demo_user.first_name = ADDROP_DEMO_FIRST_NAME
+        if demo_user.last_name != ADDROP_DEMO_LAST_NAME:
+            demo_user.last_name = ADDROP_DEMO_LAST_NAME
+
+    # ── 2. Create the year-4 cohort section + SE701–704 timetable. ──
+    y4_section = await _addrop_ensure_section(
+        session,
+        term=term, department="Software Engineering", semester=7,
+        section_code="A", capacity=40,
+        enrolled_count=ADDROP_DEMO_Y4_COHORT_SIZE,
+    )
+
+    slot_count = 0
+    for code, day, start_h, end_h, room in ADDROP_DEMO_Y4_SCHEDULE:
+        course = courses_by_code.get(code)
+        if course is None:
+            raise RuntimeError(
+                f"Add/Drop demo: catalog course '{code}' missing — "
+                "did _seed_courses run?"
+            )
+        instructor = await _addrop_instructor_for_course(
+            session, course=course, term=term,
+        )
+        await _addrop_ensure_slot(
+            session,
+            section=y4_section, course=course, instructor=instructor,
+            day_of_week=day, start_hour=start_h, end_hour=end_h, room=room,
+        )
+        slot_count += 1
+
+    # ── 3. Allocate Yonatan + first 29 bulk-cohort peers into the Y4 section. ──
+    cohort_seq_start = SE_UPPER_BULK_START_SEQ                         # 500
+    cohort_seq_end = cohort_seq_start + ADDROP_DEMO_Y4_COHORT_SIZE     # 530
+    cohort_ids = [
+        f"UGR/{seq:04d}/16"
+        for seq in range(cohort_seq_start, cohort_seq_end)
+    ]
+    cohort_students = (
+        await session.execute(
+            select(Student).where(Student.student_id.in_(cohort_ids))
+        )
+    ).scalars().all()
+    cohort_student_ids = [s.id for s in cohort_students]
+    allocated = 0
+    if cohort_student_ids:
+        cohort_regs = (
+            await session.execute(
+                select(Registration).where(
+                    Registration.student_id.in_(cohort_student_ids),
+                    Registration.term_id == term.id,
+                )
+            )
+        ).scalars().all()
+        for reg in cohort_regs:
+            if reg.section_id != y4_section.id:
+                reg.section_id = y4_section.id
+                allocated += 1
+
+    # ── 4. Create year-2 cohort sections carrying SE303 slots. ──
+    se303 = courses_by_code.get(ADDROP_DEMO_FAILED_COURSE)
+    if se303 is None:
+        raise RuntimeError(
+            f"Add/Drop demo: catalog course '{ADDROP_DEMO_FAILED_COURSE}' "
+            "missing — did _seed_courses run?"
+        )
+    se303_instructor = await _addrop_instructor_for_course(
+        session, course=se303, term=term,
+    )
+
+    # Pull the year-2 SE bulk cohort once; we'll slice it into runs
+    # of ADDROP_DEMO_Y2_SECTION_ROSTER_SIZE to populate each section.
+    # Sort by student_id so allocation is stable across re-runs.
+    y2_cohort_ids = [
+        f"UGR/{seq:04d}/18"
+        for seq in range(
+            SE_UPPER_BULK_START_SEQ,
+            SE_UPPER_BULK_START_SEQ
+            + len(ADDROP_DEMO_SE303_SECTIONS)
+            * ADDROP_DEMO_Y2_SECTION_ROSTER_SIZE,
+        )
+    ]
+    y2_cohort_students = (
+        await session.execute(
+            select(Student)
+            .where(Student.student_id.in_(y2_cohort_ids))
+            .order_by(Student.student_id.asc())
+        )
+    ).scalars().all()
+    y2_regs_by_student: dict[uuid.UUID, Registration] = {}
+    if y2_cohort_students:
+        y2_regs = (
+            await session.execute(
+                select(Registration).where(
+                    Registration.student_id.in_(
+                        [s.id for s in y2_cohort_students]
+                    ),
+                    Registration.term_id == term.id,
+                )
+            )
+        ).scalars().all()
+        y2_regs_by_student = {r.student_id: r for r in y2_regs}
+
+    se303_sections_created = 0
+    se303_slots_created = 0
+    se303_students_allocated = 0
+    for spec_idx, spec in enumerate(ADDROP_DEMO_SE303_SECTIONS):
+        section = await _addrop_ensure_section(
+            session,
+            term=term, department="Software Engineering", semester=3,
+            section_code=spec["section_code"],
+            capacity=spec["capacity"],
+            enrolled_count=ADDROP_DEMO_Y2_SECTION_ROSTER_SIZE,
+        )
+        se303_sections_created += 1
+        for day, start_h, end_h, room in spec["slots"]:
+            await _addrop_ensure_slot(
+                session,
+                section=section, course=se303,
+                instructor=se303_instructor,
+                day_of_week=day, start_hour=start_h, end_hour=end_h, room=room,
+            )
+            se303_slots_created += 1
+
+        roster_start = spec_idx * ADDROP_DEMO_Y2_SECTION_ROSTER_SIZE
+        roster_end = roster_start + ADDROP_DEMO_Y2_SECTION_ROSTER_SIZE
+        for stu in y2_cohort_students[roster_start:roster_end]:
+            reg = y2_regs_by_student.get(stu.id)
+            if reg is None:
+                continue
+            if reg.section_id != section.id:
+                reg.section_id = section.id
+                se303_students_allocated += 1
+
+    # ── 5. Overwrite Yonatan's SE303 backfill grade to F. ──
+    se303_grade = (
+        await session.execute(
+            select(Grade).where(
+                Grade.student_id == demo_student.id,
+                Grade.course_id == se303.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if se303_grade is not None:
+        se303_grade.letter_grade = GradeLetter.F
+        se303_grade.numeric_score = 30.0
+        se303_grade.grade_points = 0.0
+
+    # ── 6. Wipe Yonatan's prereq-blocked SE402 / SE403 grade rows. ──
+    # The bulk backfill awards an authorised grade for every prior-
+    # semester course; for SE402 / SE403 that contradicts the story
+    # because Yonatan's F in SE303 (the prereq) would have blocked
+    # him from registering for them. Removing the rows makes them
+    # read as outstanding-never-attempted, which is what the
+    # advisory agent needs to surface them correctly.
+    blocked_grades_removed = 0
+    for code in ADDROP_DEMO_BLOCKED_BY_FAILED_COURSE:
+        blocked_course = courses_by_code.get(code)
+        if blocked_course is None:
+            continue
+        blocked_grade = (
+            await session.execute(
+                select(Grade).where(
+                    Grade.student_id == demo_student.id,
+                    Grade.course_id == blocked_course.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if blocked_grade is not None:
+            await session.delete(blocked_grade)
+            blocked_grades_removed += 1
+
+    await session.commit()
+    blocked_codes_str = ", ".join(ADDROP_DEMO_BLOCKED_BY_FAILED_COURSE)
+    print(
+        f"✅ Add/Drop demo seeded: Y4 Section A ({slot_count} slots, "
+        f"{allocated} students allocated); SE303 has "
+        f"{se303_sections_created} sections / {se303_slots_created} slots "
+        f"with {se303_students_allocated} second-year students rostered; "
+        f"{demo_full_name} ({ADDROP_DEMO_STUDENT_ID}) carries an F in "
+        f"{ADDROP_DEMO_FAILED_COURSE} and has had {blocked_grades_removed} "
+        f"prereq-blocked grade rows ({blocked_codes_str}) wiped."
+    )
+
+
+# ══════════════════════════════════════════════════════════════
 #  Final state summary (was: migrate_terms_to_ethiopian_phases.py)
 # ══════════════════════════════════════════════════════════════
 
@@ -2180,7 +2713,14 @@ async def seed() -> None:
         )
 
         await _seed_grades(session, terms, courses_by_code)
-        await _seed_standing_demo_cohort(session, terms)
+        await _seed_standing_demo_cohort(session, terms, courses_by_code)
+
+        # Add/Drop demo — wires the year-4 SE cohort's Section A
+        # (with SE701–SE704 schedule slots) and three SE303 sections
+        # so the demo student (UGR/0516/16 — Yonatan Bekele) has a
+        # generated timetable and visible add candidates with both a
+        # schedule conflict and a clean fit.
+        await _seed_addrop_demo_scenario(session, open_term, courses_by_code)
 
         # Track B PR 1 demo — skipped so the open 2026/27 phase 1 term
         # starts with no sections or schedule slots, letting Department

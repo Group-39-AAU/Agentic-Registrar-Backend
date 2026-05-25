@@ -139,3 +139,27 @@ async def seeded_officer(async_session) -> CourseManagementOfficer:
     async_session.add(officer)
     await async_session.flush()
     return officer
+
+
+@pytest_asyncio.fixture
+async def seeded_department_head(async_session) -> CourseManagementOfficer:
+    """
+    DEPARTMENT_HEAD officer for Computer Science. Matches the
+    department on ``cs_student`` / ``seeded_course`` so add/drop
+    tests that scope by ``Student.department`` line up out of the
+    box.
+    """
+    user = _new_user(role=UserRole.REGISTRAR_OFFICER, email_slug="dh-cs")
+    async_session.add(user)
+    await async_session.flush()
+
+    officer = CourseManagementOfficer(
+        user_id=user.id,
+        staff_id="DH/9001/10",
+        role=OfficerRole.DEPARTMENT_HEAD,
+        department="Computer Science",
+        authorization_level=5,
+    )
+    async_session.add(officer)
+    await async_session.flush()
+    return officer

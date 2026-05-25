@@ -71,11 +71,20 @@ class StandingSectionResponse(BaseModel):
 
 class StudentTermGrade(BaseModel):
     """
-    One authorised grade row for a student in the target term, with
-    the add/drop context the officer needs to read the row correctly.
-    Status filtering happens in the service — only rows visible here
-    are ones that should count toward (or be flagged against) the
-    student's SGPA for the term.
+    One course row for a student in the target term, with the
+    add/drop context the officer needs to read the row correctly.
+
+    Three shapes coexist in this list:
+
+      * Graded course (``letter_grade`` set) — an authorised Grade row
+        exists for (student, course, term).
+      * Ungraded course (``is_ungraded=True``) — the course is on the
+        registration (or was added via add/drop) but no authorised
+        Grade row exists yet. Surfaced so the officer can see what is
+        still pending before computing standing.
+      * Dropped course (``is_dropped=True``) — the student dropped
+        during add/drop. Does NOT contribute to SGPA; shown for
+        audit context.
     """
     course_id: uuid.UUID
     course_code: str
@@ -93,6 +102,11 @@ class StudentTermGrade(BaseModel):
     # add/drop batch — it's not part of their cohort's default
     # course list. Still counts toward SGPA when authorised.
     is_added_via_drop: bool = False
+    # True when the course is registered (or added via add/drop) but
+    # no AUTHORISED Grade row exists yet. The roster surfaces these so
+    # the DH can see standing cannot be computed until every expected
+    # course is graded (per the all-graded gate in compute).
+    is_ungraded: bool = False
 
 
 class ExistingStandingSummary(BaseModel):
@@ -132,11 +146,16 @@ class StudentStandingPreview(BaseModel):
     current_semester: int
     department: Optional[str] = None
 
-    # Per-course grades in the target term (including dropped /
-    # added context).
+    # Per-course rows in the target term — every registered or added
+    # course (non-dropped) appears here, with ``is_ungraded=True``
+    # when no authorised grade exists yet. Dropped courses also
+    # surface for audit context with ``is_dropped=True``.
     grades_this_term: list[StudentTermGrade]
 
-    # Live-computed math from authorised grades only.
+    # SGPA / CGPA sourced from the AcademicStanding snapshot for this
+    # term — null until a compute run has produced a standing row.
+    # Roster never live-computes these from the Grade ledger: the
+    # snapshot is the authoritative answer.
     sgpa: Optional[float] = None
     cgpa: Optional[float] = None
     term_credit_hours: int
@@ -144,10 +163,25 @@ class StudentStandingPreview(BaseModel):
     f_count_term: int
     f_credit_total_term: int
 
+    # CGPA carried over from the most recent prior AcademicStanding
+    # row (any term before the target term). Lets the UI show
+    # "incoming CGPA: 3.20 from 2023/2024" while the current term is
+    # still ungraded / un-computed.
+    prior_cgpa: Optional[float] = None
+    prior_cumulative_credit_hours: Optional[int] = None
+    prior_term_name: Optional[str] = None
+
     # Article-91 evaluation context, computed from term history.
     is_first_semester: bool
     is_first_year: bool
     has_incomplete_marks: bool
+
+    # Expected vs. ungraded course counts so the UI can render a
+    # coloured "X / Y graded" badge and flag students whose term
+    # cannot yet be computed.
+    expected_course_count: int = 0
+    ungraded_count: int = 0
+    has_ungraded_courses: bool = False
 
     # Linked AcademicStanding (if PR C2 has computed one yet).
     existing_standing: Optional[ExistingStandingSummary] = None
@@ -227,17 +261,41 @@ class StandingComputeRow(BaseModel):
     narrative: Optional[str] = None
 
 
+class PendingGradesRow(BaseModel):
+    """
+    A student the compute run skipped because at least one of their
+    registered (or added-via-drop) courses has no AUTHORISED Grade
+    row for the term. No AcademicStanding row is written for these
+    students — the DH must wait for grading to complete and re-run.
+    """
+    student_id: uuid.UUID
+    student_number: str
+    full_name: str
+    department: Optional[str] = None
+    expected_course_count: int
+    graded_course_count: int
+    ungraded_course_codes: list[str]
+
+
 class StandingComputeResponse(BaseModel):
     """
     Summary returned by ``POST /terms/{tid}/compute``. Counts
     grouped by proposed status so the officer sees the shape of the
     cohort at a glance before drilling into individual rows.
+
+    ``pending_grades_*`` surfaces students who were skipped because
+    not every registered course has an authorised grade yet. These
+    students do NOT get an AcademicStanding row — the DH must wait
+    for grading to complete and re-run compute. This is the all-
+    graded gate from the workflow design.
     """
     term_id: uuid.UUID
     computed_count: int
     skipped_count: int
+    pending_grades_count: int = 0
     counts_by_status: dict[str, int]
     rows: list[StandingComputeRow]
+    pending_grades_rows: list[PendingGradesRow] = []
 
 
 class StandingAuthoriseRequest(BaseModel):

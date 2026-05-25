@@ -453,24 +453,34 @@ async def test_drop_apply_removes_existing_schedule_additions(
     )
     assert batch.status == AddDropBatchStatus.AGENT_APPROVED
 
-    # Use the seeded officer
+    # Build a DEPARTMENT_HEAD officer for the student's department so
+    # the add/drop auth gate (DH-scoped) accepts the approval.
+    from app.modules.auth.models import User
     from app.modules.course.models import CourseManagementOfficer
-    officer = (
-        await async_session.execute(
-            _select(CourseManagementOfficer).limit(1),
-        )
-    ).scalar_one_or_none()
-    if officer is None:
-        # Fall back to the student's user — only the audit columns
-        # care about the value here, no FK enforced in test sqlite.
-        officer_id = cs_student.user_id
-    else:
-        officer_id = officer.user_id
+    from app.shared.enums import OfficerRole
+    dh_user = User(
+        id=uuid.uuid4(),
+        email="dh-deltas@aau.edu.et",
+        first_name="DH",
+        last_name="Deltas",
+        hashed_password="not-a-real-hash",
+        role=UserRole.REGISTRAR_OFFICER,
+        is_active=True,
+    )
+    async_session.add(dh_user)
+    await async_session.flush()
+    async_session.add(CourseManagementOfficer(
+        user_id=dh_user.id,
+        staff_id="DH/DELTAS/01",
+        role=OfficerRole.DEPARTMENT_HEAD,
+        department=cs_student.department,
+        authorization_level=5,
+    ))
+    await async_session.flush()
 
     applied = await svc.officer_approve_batch(
         batch.id,
-        officer_role=UserRole.REGISTRAR_OFFICER,
-        officer_id=officer_id,
+        user_id=dh_user.id,
     )
     assert applied.status == AddDropBatchStatus.APPLIED
 

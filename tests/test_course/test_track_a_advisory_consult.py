@@ -363,8 +363,11 @@ async def test_agent_filters_recommendations_for_already_completed_courses(
                 "reason": "LLM forgot to check completion.",
             },
             {
-                "course_code": "CS102",
-                "title": "CS102 title",
+                # CS201 is sem 2 — parity-matches the sem-2 student
+                # so the only filter that fires is "already completed"
+                # on CS101.
+                "course_code": "CS201",
+                "title": "CS201 title",
                 "credit_hours": 3,
                 "is_core": True,
                 "reason": "Valid suggestion.",
@@ -385,7 +388,7 @@ async def test_agent_filters_recommendations_for_already_completed_courses(
     )
 
     kept_codes = [r["course_code"] for r in result.recommended_courses]
-    assert kept_codes == ["CS102"]
+    assert kept_codes == ["CS201"]
     assert any("CS101" in f for f in result.filtered_recommendations)
     assert any("filtered_recommendations" in w for w in result.warnings)
 

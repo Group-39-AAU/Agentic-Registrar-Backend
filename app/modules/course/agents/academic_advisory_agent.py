@@ -40,8 +40,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm_client import LLMClient, LLMUnavailableError
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
-from app.modules.course.models import Course, CoursePrerequisite
-from app.shared.enums import ConsultationMode, RiskStatus
+from app.modules.course.models import (
+    Course, CoursePrerequisite, Grade, Registration, RegistrationCourse,
+)
+from app.shared.enums import (
+    ConsultationMode, GradeLetter, GradeSubmissionStatus, RiskStatus,
+)
 
 
 # ── Result containers ────────────────────────────────────────────
@@ -463,6 +467,10 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
             )
 
         department: str = student_context["department"]
+        student_db_id_raw = student_context.get("student_db_id")
+        current_semester: int = student_context["current_semester"]
+        student_parity = current_semester % 2
+
         curriculum_rows = (
             await session.execute(
                 select(Course).where(
@@ -472,6 +480,7 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
             )
         ).scalars().all()
         curriculum_by_id = {c.id: c for c in curriculum_rows}
+        curriculum_by_code = {c.code: c for c in curriculum_rows}
         curriculum_codes = {c.code for c in curriculum_rows}
 
         # Prerequisite graph: course_id -> [prereq_code, ...]. Only
@@ -523,11 +532,186 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
                 if cid in curriculum_by_id
             )
 
+        # ── Failed (F) and dropped attempt history ──
+        # An F counts as "attempted but not fulfilled" — the student
+        # must retake the course to graduate. Likewise a dropped
+        # RegistrationCourse where the student never went on to pass
+        # the same course in a later term. Both belong on the priority
+        # retake list the LLM must consider before suggesting any
+        # never-attempted course.
+        failed_course_ids: set[uuid.UUID] = set()
+        dropped_course_ids: set[uuid.UUID] = set()
+        if student_db_id_raw is not None:
+            try:
+                student_db_id = (
+                    student_db_id_raw if isinstance(student_db_id_raw, uuid.UUID)
+                    else uuid.UUID(str(student_db_id_raw))
+                )
+            except (TypeError, ValueError):
+                student_db_id = None
+
+            if student_db_id is not None:
+                failed_rows = (
+                    await session.execute(
+                        select(Grade.course_id).where(
+                            Grade.student_id == student_db_id,
+                            Grade.letter_grade == GradeLetter.F,
+                            Grade.status == GradeSubmissionStatus.AUTHORISED,
+                            Grade.is_deleted == False,  # noqa: E712
+                        )
+                    )
+                ).scalars().all()
+                failed_course_ids = {cid for cid in failed_rows}
+
+                dropped_rows = (
+                    await session.execute(
+                        select(RegistrationCourse.course_id)
+                        .join(
+                            Registration,
+                            Registration.id == RegistrationCourse.registration_id,
+                        )
+                        .where(
+                            Registration.student_id == student_db_id,
+                            RegistrationCourse.is_dropped == True,  # noqa: E712
+                        )
+                    )
+                ).scalars().all()
+                dropped_course_ids = {cid for cid in dropped_rows}
+
+        # Outstanding = curriculum minus already-passed. Failed and
+        # dropped courses are still outstanding (an F or a drop does
+        # not satisfy the requirement). A course re-attempted and
+        # passed later is in completed_course_ids and drops out.
+        outstanding_ids = {
+            c.id for c in curriculum_rows
+            if c.id not in completed_course_ids
+        }
+        # Semester parity filter — AAU only offers odd-semester
+        # courses in the first half of the year and even-semester
+        # courses in the second. The student can therefore only
+        # register, this term, for outstanding courses whose semester
+        # parity matches their own current semester.
+        parity_outstanding_ids = {
+            cid for cid in outstanding_ids
+            if curriculum_by_id[cid].semester % 2 == student_parity
+        }
+        # Courses already covered for this term — what the student
+        # is currently registered for plus anything they're already
+        # asking to add. We must keep these out of priority_outstanding
+        # so the LLM does not "recommend" courses the student already
+        # has on the plan; in ADD_DROP mode the registration is the
+        # baseline, not something to be re-suggested.
+        already_covered_ids: set[uuid.UUID] = set()
+        if proposed_course_ids:
+            already_covered_ids.update(proposed_course_ids)
+        if add_course_ids:
+            already_covered_ids.update(add_course_ids)
+        # A drop in the proposed_changes vacates a slot — that course
+        # is no longer covered and should reappear as outstanding so
+        # the LLM can flag any consequent gap.
+        if drop_course_ids:
+            already_covered_ids.difference_update(drop_course_ids)
+
+        def _course_summary(course: Course, reason: str) -> dict[str, Any]:
+            return {
+                "course_code": course.code,
+                "title": course.title,
+                "credit_hours": course.credit_hours,
+                "semester": course.semester,
+                "prerequisite_codes": sorted(
+                    prereq_codes_by_course.get(course.id, [])
+                ),
+                "reason": reason,
+            }
+
+        # All three buckets exclude `already_covered_ids` so the LLM
+        # never sees an active-registration / pending-add course as a
+        # recommendation candidate.
+        failed_retakes = [
+            _course_summary(
+                curriculum_by_id[cid],
+                "Previously attempted and graded F — must be retaken "
+                "to fulfil this curriculum requirement before graduation.",
+            )
+            for cid in parity_outstanding_ids
+            if cid in failed_course_ids
+            and cid not in already_covered_ids
+        ]
+        # A course that was dropped and later passed is not outstanding;
+        # the intersection with outstanding_ids strips those. A course
+        # that was both failed and dropped is reported once under the
+        # failed bucket (failures dominate).
+        dropped_retakes = [
+            _course_summary(
+                curriculum_by_id[cid],
+                "Previously added to a registration and then dropped "
+                "without a passing grade — must be re-attempted to "
+                "fulfil this curriculum requirement before graduation.",
+            )
+            for cid in parity_outstanding_ids
+            if cid in dropped_course_ids
+            and cid not in failed_course_ids
+            and cid not in already_covered_ids
+        ]
+        # Anything outstanding-in-parity that isn't a retake is a
+        # never-attempted gap. Sort all three buckets by semester then
+        # code so the LLM sees a stable, in-program-order list.
+        never_attempted = [
+            _course_summary(
+                curriculum_by_id[cid],
+                f"Required for semester {curriculum_by_id[cid].semester} "
+                "of the program and not yet attempted.",
+            )
+            for cid in parity_outstanding_ids
+            if cid not in failed_course_ids
+            and cid not in dropped_course_ids
+            and cid not in already_covered_ids
+        ]
+        for bucket in (failed_retakes, dropped_retakes, never_attempted):
+            bucket.sort(key=lambda c: (c["semester"], c["course_code"]))
+
+        failed_codes = sorted(
+            curriculum_by_id[cid].code
+            for cid in failed_course_ids
+            if cid in curriculum_by_id
+        )
+        dropped_codes = sorted(
+            curriculum_by_id[cid].code
+            for cid in dropped_course_ids
+            if cid in curriculum_by_id
+        )
+
+        baseline_codes = _codes_for(proposed_course_ids)
+        add_codes = _codes_for(add_course_ids)
+        drop_codes = _codes_for(drop_course_ids)
+        effective_codes = sorted(
+            (set(baseline_codes) - set(drop_codes)) | set(add_codes)
+        )
+        if mode == ConsultationMode.ADD_DROP:
+            baseline_label = (
+                "Courses ALREADY ON the student's active registration "
+                "for this term. The student is enrolled in these — do "
+                "not recommend them again."
+            )
+        elif mode == ConsultationMode.REGISTRATION_PLAN:
+            baseline_label = (
+                "Courses already on the student's in-progress "
+                "registration draft for this term."
+            )
+        else:
+            baseline_label = (
+                "No baseline yet — pre-registration mode. The student "
+                "is asking what to plan from scratch."
+            )
+
         consultation_payload: dict[str, Any] = {
             "mode": mode.value,
             "student": {
                 "id": student_context.get("student_id"),
-                "current_semester": student_context["current_semester"],
+                "current_semester": current_semester,
+                "current_semester_parity": (
+                    "odd" if student_parity == 1 else "even"
+                ),
                 "cgpa": student_context.get("cgpa"),
                 "sponsorship_type": student_context.get("sponsorship_type"),
             },
@@ -538,14 +722,36 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
             "history": {
                 "completed_course_codes": completed_codes,
                 "completed_count": len(completed_codes),
+                "failed_course_codes": failed_codes,
+                "dropped_course_codes": dropped_codes,
             },
             "current_term": current_term or {},
+            # Explicit baseline-vs-delta view of this term's plan so
+            # the LLM doesn't re-recommend already-registered work.
+            "current_term_load": {
+                "baseline_course_codes": baseline_codes,
+                "baseline_meaning": baseline_label,
+                "proposed_add_course_codes": add_codes,
+                "proposed_drop_course_codes": drop_codes,
+                "effective_after_changes_course_codes": effective_codes,
+            },
+            # Kept for backwards-compatible callers. Same data as
+            # current_term_load.baseline_course_codes; see the latter
+            # for the authoritative semantics.
             "draft": {
-                "proposed_course_codes": _codes_for(proposed_course_ids),
+                "proposed_course_codes": baseline_codes,
             },
             "proposed_changes": {
-                "add_course_codes": _codes_for(add_course_ids),
-                "drop_course_codes": _codes_for(drop_course_ids),
+                "add_course_codes": add_codes,
+                "drop_course_codes": drop_codes,
+            },
+            # Pre-filtered, parity-aligned options. The LLM must pick
+            # recommendations from these buckets and prioritise
+            # failed/dropped retakes ahead of never-attempted gaps.
+            "priority_outstanding": {
+                "failed_retakes": failed_retakes,
+                "dropped_retakes": dropped_retakes,
+                "never_attempted": never_attempted,
             },
         }
 
@@ -556,7 +762,9 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
             raw=raw,
             mode=mode,
             curriculum_codes=curriculum_codes,
+            curriculum_by_code=curriculum_by_code,
             completed_codes=set(completed_codes),
+            student_parity=student_parity,
         )
 
     def _postprocess_consultation(
@@ -565,7 +773,9 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
         raw: dict[str, Any],
         mode: ConsultationMode,
         curriculum_codes: set[str],
+        curriculum_by_code: dict[str, Course],
         completed_codes: set[str],
+        student_parity: int,
     ) -> ConsultationResult:
         """
         Apply the agent's hard constraints to the LLM's structured
@@ -598,6 +808,13 @@ class AcademicAdvisoryAgent(CourseBaseAgent):
                 continue
             if code not in curriculum_codes:
                 filtered.append(f"{code} (not in department curriculum)")
+                continue
+            course = curriculum_by_code.get(code)
+            if course is not None and course.semester % 2 != student_parity:
+                filtered.append(
+                    f"{code} (semester {course.semester} is not offered "
+                    "this term — wrong parity)"
+                )
                 continue
             kept.append(rec)
 
