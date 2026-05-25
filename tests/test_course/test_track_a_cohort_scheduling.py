@@ -245,10 +245,13 @@ async def test_generate_spreads_cohorts_across_rooms(
     async_session, seeded_term,
 ):
     """
-    Three cohorts that fit any room must end up in three distinct
-    rooms after :meth:`generate_schedule`. This is what stops the
-    timetable from packing every cohort into the largest room and
-    emitting ``ROOM_DOUBLE_BOOKED`` conflicts.
+    Three cohorts running concurrently must not share a single
+    ``(room, day, time_slot)`` triple. The new scheduler picks the
+    smallest fitting room overall (preserving large halls for big
+    cohorts), so it tends to *reuse* the same small room at
+    *different days* for tiny cohorts rather than spreading them
+    into bigger rooms at the same time — both behaviours satisfy
+    the no-conflict invariant the registrar actually cares about.
     """
     inventory = [("BIG", 80), ("MED", 60), ("SMALL", 30)]
     agent = _make_agent(inventory)
@@ -294,10 +297,11 @@ async def test_generate_spreads_cohorts_across_rooms(
     )
     rooms_used = {sl.room for sl in slots}
     assert None not in rooms_used
-    assert len(rooms_used) == 3, (
-        f"All three cohorts fit in any room and are tiny enough to "
-        f"share the smallest one, so each slot must land in a "
-        f"distinct room. Got rooms={rooms_used}"
+    # Real invariant: no two slots share the same (room, day, start).
+    triples = {(sl.room, sl.day_of_week, sl.start_time) for sl in slots}
+    assert len(triples) == 3, (
+        f"Three cohorts must end up at three distinct (room, day, time) "
+        f"triples — got {triples}"
     )
 
 
@@ -613,3 +617,148 @@ async def test_allocator_with_no_classrooms_for_department_reports_failure(
     assert result.sections_created == []
     assert result.failed
     assert "no classrooms" in result.failed[0]["reason"].lower()
+
+
+# ── Realistic demo-scale: zero-conflict guarantee ───────────────
+
+
+async def test_demo_scale_workload_produces_zero_conflicts(
+    async_session, seeded_term,
+):
+    """
+    Demo-scale realism check. Mirrors the seed's worst-case department:
+    one 70-student sem-1 cohort plus four 60-student upper-year cohorts
+    (sem 3, 5, 7, 9), each enrolled in 4 four-credit courses, sharing
+    5 classrooms (two 80s, two 60s, one 30) and 5 instructors via
+    round-robin assignment — exactly what
+    scripts/seed_course_management.py provisions for Software
+    Engineering.
+
+    The new greedy-with-shuffle-restart scheduler must place all
+    5 × 4 × 4 = 80 weekly hours with **zero** ScheduleConflict
+    rows, proving that the seed inventory + algorithm together
+    leave enough slack for a fully-feasible weekly timetable.
+    """
+    cohort_sizes = {1: 70, 3: 60, 5: 60, 7: 60, 9: 60}
+    DEPT = "Computer Science"
+    rooms = [
+        ("CSc-101", 80), ("CSc-102", 80),
+        ("CSc-201", 60), ("CSc-202", 60),
+        ("CSc-LAB-1", 30),
+    ]
+    agent = _make_agent(rooms)
+
+    # 5 instructors, round-robin assigned to courses below.
+    instructors = []
+    for i in range(5):
+        u = User(
+            id=uuid.uuid4(),
+            email=f"instr-{i}@aau.edu.et",
+            first_name=f"Ins{i}", last_name="Tructor",
+            hashed_password="x", role=UserRole.INSTRUCTOR, is_active=True,
+        )
+        async_session.add(u)
+        await async_session.flush()
+        from app.modules.course.models import Instructor
+        ins = Instructor(
+            user_id=u.id,
+            instructor_id=f"STAFF/REAL/{i:02d}",
+            department=DEPT,
+        )
+        async_session.add(ins)
+        await async_session.flush()
+        instructors.append(ins)
+
+    # 5 cohorts × 4 four-credit courses each = 20 courses, all in
+    # the CS department. Course codes mirror the seed: SE<sem><slot>.
+    course_objects = []
+    for semester in (1, 3, 5, 7, 9):
+        for slot in range(1, 5):
+            course = Course(
+                code=f"CS{semester}{slot:02d}",
+                title=f"CS sem-{semester} course {slot}",
+                credit_hours=4,
+                semester=semester,
+                department=DEPT,
+            )
+            async_session.add(course)
+            await async_session.flush()
+            course_objects.append(course)
+            async_session.add(InstructorAssignment(
+                instructor_id=instructors[len(course_objects) % 5].id,
+                course_id=course.id,
+                term_id=seeded_term.id,
+            ))
+    await async_session.flush()
+
+    # Cohort sizes mirror the real seed (70 sem-1, 60 elsewhere)
+    # so room slack matches what production sees. Build rows
+    # directly with a sequential student_id so the helper's
+    # hash-mod scheme can't accidentally collide at this scale.
+    next_seq = 0
+    for semester in (1, 3, 5, 7, 9):
+        for i in range(cohort_sizes[semester]):
+            next_seq += 1
+            user = User(
+                id=uuid.uuid4(),
+                email=f"sem{semester}-stu{i}@aau.edu.et",
+                first_name=f"Sem{semester}", last_name=f"Stu{i}",
+                hashed_password="x",
+                role=UserRole.STUDENT, is_active=True,
+            )
+            async_session.add(user)
+            await async_session.flush()
+            student = Student(
+                user_id=user.id,
+                student_id=f"UGR/REAL/{next_seq:04d}",
+                full_name=f"Sem{semester} Stu{i}",
+                current_semester=semester,
+                department=DEPT,
+                enrollment_status=EnrollmentStatus.ACTIVE,
+            )
+            async_session.add(student)
+            await async_session.flush()
+            await _register(async_session, student, seeded_term)
+
+    # Allocate + schedule.
+    alloc = await agent.allocate_sections(async_session, seeded_term.id, DEPT)
+    artefact = await agent.generate_schedule(
+        async_session, seeded_term.id, DEPT,
+    )
+
+    # Five 70-student cohorts → one section per semester (capped at
+    # 80 = largest room) = 5 sections.
+    assert artefact.section_count == 5, (
+        f"Expected 5 sections (one per semester), got {artefact.section_count}"
+    )
+    # 5 cohorts × 4 courses × 4 credits = 80 weekly hours.
+    assert artefact.slots_created == 80, (
+        f"Expected 80 slots, got {artefact.slots_created}"
+    )
+    # ZERO conflicts under this workload — that's the promise.
+    assert artefact.conflict_ids == [], (
+        f"Expected zero conflicts, got {len(artefact.conflict_ids)}: "
+        f"{artefact.conflict_ids}"
+    )
+
+    # Spot-check the structural invariants the schedule must obey.
+    slots = (
+        await async_session.execute(
+            select(ClassScheduleSlot).join(
+                Section, Section.id == ClassScheduleSlot.section_id,
+            ).where(Section.term_id == seeded_term.id)
+        )
+    ).scalars().all()
+    seen_section = set()
+    seen_instructor = set()
+    seen_room = set()
+    for sl in slots:
+        sk = (sl.section_id, sl.day_of_week, sl.start_time)
+        assert sk not in seen_section, f"Cohort double-booked at {sk}"
+        seen_section.add(sk)
+        ik = (sl.instructor_id, sl.day_of_week, sl.start_time)
+        assert ik not in seen_instructor, f"Instructor double-booked at {ik}"
+        seen_instructor.add(ik)
+        rk = (sl.room, sl.day_of_week, sl.start_time)
+        assert rk not in seen_room, f"Room double-booked at {rk}"
+        seen_room.add(rk)

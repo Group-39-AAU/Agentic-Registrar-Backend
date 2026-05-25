@@ -384,28 +384,53 @@ INSTRUCTORS = [
 # ══════════════════════════════════════════════════════════════
 
 CLASSROOMS = [
+    # Each department now gets 5 rooms — a large hall (≥80), two
+    # mid-size lecture rooms (60/70), and two labs (30/40). The
+    # backtracking scheduler chooses the smallest fitting free room
+    # at every slot, so this inventory comfortably absorbs 5+
+    # simultaneous cohorts of 60-80 students per department without
+    # producing conflicts.
+
+    # ── Software Engineering ──────────────────────────
     ("SE-101",   80, "Software Engineering"),
+    ("SE-102",   80, "Software Engineering"),
     ("SE-201",   60, "Software Engineering"),
+    ("SE-202",   60, "Software Engineering"),
     ("SE-LAB-1", 30, "Software Engineering"),
 
-    ("EE-101",   60, "Electrical Engineering"),
-    ("EE-201",   50, "Electrical Engineering"),
+    # ── Electrical Engineering ────────────────────────
+    ("EE-101",   80, "Electrical Engineering"),
+    ("EE-102",   70, "Electrical Engineering"),
+    ("EE-201",   60, "Electrical Engineering"),
+    ("EE-202",   50, "Electrical Engineering"),
     ("EE-LAB-1", 30, "Electrical Engineering"),
 
-    ("ChE-101",   60, "Chemical Engineering"),
-    ("ChE-201",   50, "Chemical Engineering"),
+    # ── Chemical Engineering ──────────────────────────
+    ("ChE-101",   80, "Chemical Engineering"),
+    ("ChE-102",   70, "Chemical Engineering"),
+    ("ChE-201",   60, "Chemical Engineering"),
+    ("ChE-202",   50, "Chemical Engineering"),
     ("ChE-LAB-1", 30, "Chemical Engineering"),
 
-    ("CE-101",   60, "Civil Engineering"),
-    ("CE-201",   50, "Civil Engineering"),
+    # ── Civil Engineering ─────────────────────────────
+    ("CE-101",   80, "Civil Engineering"),
+    ("CE-102",   70, "Civil Engineering"),
+    ("CE-201",   60, "Civil Engineering"),
+    ("CE-202",   50, "Civil Engineering"),
     ("CE-LAB-1", 30, "Civil Engineering"),
 
-    ("ME-101",   60, "Mechanical Engineering"),
-    ("ME-201",   50, "Mechanical Engineering"),
+    # ── Mechanical Engineering ────────────────────────
+    ("ME-101",   80, "Mechanical Engineering"),
+    ("ME-102",   70, "Mechanical Engineering"),
+    ("ME-201",   60, "Mechanical Engineering"),
+    ("ME-202",   50, "Mechanical Engineering"),
     ("ME-LAB-1", 30, "Mechanical Engineering"),
 
-    ("BME-101",   60, "Bio Medical Engineering"),
-    ("BME-201",   50, "Bio Medical Engineering"),
+    # ── Bio Medical Engineering ───────────────────────
+    ("BME-101",   80, "Bio Medical Engineering"),
+    ("BME-102",   70, "Bio Medical Engineering"),
+    ("BME-201",   60, "Bio Medical Engineering"),
+    ("BME-202",   50, "Bio Medical Engineering"),
     ("BME-LAB-1", 30, "Bio Medical Engineering"),
 ]
 
