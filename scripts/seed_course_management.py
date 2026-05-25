@@ -1532,8 +1532,24 @@ async def _seed_grades(
 async def _seed_standing_demo_cohort(
     session: AsyncSession,
     terms: list[AcademicTerm],
+    courses_by_code: dict[str, Course],
 ) -> None:
-    """Make ``history_term`` browsable in the Track C standing flow."""
+    """
+    Make ``history_term`` browsable in the Track C standing flow.
+
+    For every demo student, also seed ``RegistrationCourse`` rows so
+    the all-graded gate on standing compute can evaluate the student's
+    expected vs. graded course set:
+
+      * Rows are added for each course the student has an authorised
+        grade for in ``history_term`` → expected set matches graded
+        set → the student passes the gate and is computed.
+      * The *last* student of each department additionally gets one
+        ``RegistrationCourse`` for an un-graded "next semester" course
+        → demonstrates the pending-grades skip path so the seeded
+        demo shows the new feature working (compute returns the
+        student in ``pending_grades_rows`` instead of writing a row).
+    """
     history_term = min(terms, key=lambda t: t.start_date)
 
     students = (
@@ -1557,6 +1573,8 @@ async def _seed_standing_demo_cohort(
 
     new_sections = 0
     new_regs = 0
+    new_reg_courses = 0
+    pending_demo_count = 0
     for dept, dept_students in by_dept.items():
         cohort = dept_students[:5]
         if not cohort:
@@ -1583,41 +1601,106 @@ async def _seed_standing_demo_cohort(
             await session.flush()
             new_sections += 1
 
-        for stu in cohort:
+        for idx, stu in enumerate(cohort):
             existing = (await session.execute(
                 select(Registration).where(
                     Registration.student_id == stu.id,
                     Registration.term_id == history_term.id,
                 )
             )).scalar_one_or_none()
-            if existing is not None:
-                if existing.section_id is None:
-                    existing.section_id = section.id
-                    existing.status = RegistrationStatus.REGISTERED
-                continue
-            reg = Registration(
-                id=_uid(
-                    "standing-demo-reg", str(stu.id), str(history_term.id),
-                ),
-                student_id=stu.id,
-                term_id=history_term.id,
-                status=RegistrationStatus.REGISTERED,
-                sponsorship_type=(
-                    stu.sponsorship_type or SponsorshipType.GOVERNMENT
-                ),
-                section_id=section.id,
-                finalised_at=datetime.now(timezone.utc),
-            )
-            session.add(reg)
-            new_regs += 1
+            if existing is None:
+                reg = Registration(
+                    id=_uid(
+                        "standing-demo-reg",
+                        str(stu.id), str(history_term.id),
+                    ),
+                    student_id=stu.id,
+                    term_id=history_term.id,
+                    status=RegistrationStatus.REGISTERED,
+                    sponsorship_type=(
+                        stu.sponsorship_type or SponsorshipType.GOVERNMENT
+                    ),
+                    section_id=section.id,
+                    finalised_at=datetime.now(timezone.utc),
+                )
+                session.add(reg)
+                await session.flush()
+                new_regs += 1
+            else:
+                reg = existing
+                if reg.section_id is None:
+                    reg.section_id = section.id
+                    reg.status = RegistrationStatus.REGISTERED
+
+            # ── Expected courses for the all-graded gate ──
+            # Mirror the student's authorised grades for this term so
+            # expected == graded → gate passes.
+            grade_course_ids = (await session.execute(
+                select(Grade.course_id).where(
+                    Grade.student_id == stu.id,
+                    Grade.term_id == history_term.id,
+                    Grade.status == GradeSubmissionStatus.AUTHORISED,
+                    Grade.is_deleted == False,  # noqa: E712
+                )
+            )).scalars().all()
+            for course_id in grade_course_ids:
+                rc_id = _uid(
+                    "standing-demo-rc", str(reg.id), str(course_id),
+                )
+                already = (await session.execute(
+                    select(RegistrationCourse).where(
+                        RegistrationCourse.id == rc_id,
+                    )
+                )).scalar_one_or_none()
+                if already is not None:
+                    continue
+                session.add(RegistrationCourse(
+                    id=rc_id,
+                    registration_id=reg.id,
+                    course_id=course_id,
+                    is_dropped=False,
+                ))
+                new_reg_courses += 1
+
+            # The last student of each cohort gets one extra expected
+            # course that is *not* graded — this is the pending-grades
+            # demo. Pick the first slot of their current semester so
+            # the course exists in the catalog but has no grade row
+            # yet (grades only backfill prior semesters).
+            is_last_in_cohort = (idx == len(cohort) - 1)
+            if is_last_in_cohort:
+                pending_code = _course_code(dept, stu.current_semester, 1)
+                pending_course = courses_by_code.get(pending_code)
+                if pending_course is not None:
+                    rc_id = _uid(
+                        "standing-demo-rc-pending",
+                        str(reg.id), str(pending_course.id),
+                    )
+                    already = (await session.execute(
+                        select(RegistrationCourse).where(
+                            RegistrationCourse.id == rc_id,
+                        )
+                    )).scalar_one_or_none()
+                    if already is None:
+                        session.add(RegistrationCourse(
+                            id=rc_id,
+                            registration_id=reg.id,
+                            course_id=pending_course.id,
+                            is_dropped=False,
+                        ))
+                        new_reg_courses += 1
+                        pending_demo_count += 1
 
         section.enrolled_count = min(section.capacity, len(cohort))
 
     await session.commit()
-    if new_sections or new_regs:
+    if new_sections or new_regs or new_reg_courses:
         print(
             f"✅ Seeded standing demo cohort: {new_sections} sections, "
-            f"{new_regs} registrations into '{history_term.term_name}'."
+            f"{new_regs} registrations, {new_reg_courses} expected-"
+            f"course rows ({pending_demo_count} deliberately ungraded "
+            f"to demo the pending-grades gate) "
+            f"into '{history_term.term_name}'."
         )
     else:
         print(
@@ -2180,7 +2263,7 @@ async def seed() -> None:
         )
 
         await _seed_grades(session, terms, courses_by_code)
-        await _seed_standing_demo_cohort(session, terms)
+        await _seed_standing_demo_cohort(session, terms, courses_by_code)
 
         # Track B PR 1 demo — skipped so the open 2026/27 phase 1 term
         # starts with no sections or schedule slots, letting Department

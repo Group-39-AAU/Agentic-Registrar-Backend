@@ -237,7 +237,7 @@ async def compute_term_standing(
     """
     svc = StandingService(db)
     try:
-        rows, computed, skipped = await svc.compute_term_standing(
+        rows, computed, skipped, pending_rows = await svc.compute_term_standing(
             user_id=current_user.id,
             term_id=term_id,
             department=payload.department,
@@ -254,8 +254,10 @@ async def compute_term_standing(
         term_id=term_id,
         computed_count=computed,
         skipped_count=skipped,
+        pending_grades_count=len(pending_rows),
         counts_by_status=counts,
         rows=rows,
+        pending_grades_rows=pending_rows,
     )
 
 

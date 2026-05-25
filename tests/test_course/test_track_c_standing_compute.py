@@ -196,7 +196,7 @@ async def test_compute_creates_one_standing_per_student(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, computed, skipped = await svc.compute_term_standing(
+    rows, computed, skipped, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     assert computed == 3
@@ -211,7 +211,7 @@ async def test_compute_emits_proposed_status_per_rules(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     by_name = {
@@ -268,7 +268,7 @@ async def test_compute_scope_filter_by_section(
 ):
     """An out-of-scope section_id yields zero computed rows."""
     svc = StandingService(async_session)
-    rows, computed, _ = await svc.compute_term_standing(
+    rows, computed, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
         section_id=uuid.uuid4(),
     )
@@ -294,7 +294,7 @@ async def test_compute_skips_already_authorised(
         user_id=dh_user.id, standing_id=alice_standing.id,
     )
 
-    rows, computed, skipped = await svc.compute_term_standing(
+    rows, computed, skipped, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     # 2 students still pending, 1 already authorised → skipped.
@@ -320,7 +320,7 @@ async def test_authorise_rejects_non_dh_officer(
     async_session, dh_user, registrar_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     standing_id = rows[0].standing.id
@@ -336,7 +336,7 @@ async def test_admin_can_authorise(async_session, compute_scenario):
     await async_session.flush()
 
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=admin.id, term_id=compute_scenario["term"].id,
     )
     standing = await svc.authorise(
@@ -352,7 +352,7 @@ async def test_authorise_sets_final_status_to_proposed(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     standing_id = rows[0].standing.id
@@ -368,7 +368,7 @@ async def test_authorise_writes_history(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     standing_id = rows[0].standing.id
@@ -387,7 +387,7 @@ async def test_authorise_is_idempotent(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     standing_id = rows[0].standing.id
@@ -426,7 +426,7 @@ async def test_authorise_held_for_review_requires_reason(
     await async_session.flush()
 
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     bob_row = next(
@@ -455,7 +455,7 @@ async def test_override_sets_new_status(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     # Carol was DISMISSED — override to WARNING with a written reason.
@@ -477,7 +477,7 @@ async def test_override_rejects_missing_reason(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     standing_id = rows[0].standing.id
@@ -493,7 +493,7 @@ async def test_override_writes_history(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     standing_id = rows[0].standing.id
@@ -533,7 +533,7 @@ async def test_list_queue_excludes_authorised(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     await svc.authorise(
@@ -549,7 +549,7 @@ async def test_list_queue_includes_authorised_when_only_pending_false(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     await svc.authorise(
@@ -569,7 +569,7 @@ async def test_get_standing_returns_row(
     async_session, dh_user, compute_scenario,
 ):
     svc = StandingService(async_session)
-    rows, _, _ = await svc.compute_term_standing(
+    rows, _, _, _ = await svc.compute_term_standing(
         user_id=dh_user.id, term_id=compute_scenario["term"].id,
     )
     standing = await svc.get_standing(

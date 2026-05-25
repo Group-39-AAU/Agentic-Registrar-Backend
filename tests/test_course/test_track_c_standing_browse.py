@@ -10,9 +10,10 @@ three-dropdown UX (term → department → section → students):
   StandingService.get_section_roster
 
 The roster test is the heart of the PR — it verifies that SGPA and
-CGPA are computed live from authorised grades, that add/drop context
-flags surface, and that Article-91 evaluation context (F-counts,
-first-semester / first-year flags, I/NG holds) is captured.
+CGPA are sourced from the AcademicStanding snapshot (null until
+compute has run), that add/drop context flags surface, and that
+Article-91 evaluation context (F-counts, first-semester /
+first-year flags, I/NG holds) is captured.
 """
 from __future__ import annotations
 
@@ -373,6 +374,12 @@ async def test_list_sections_filters_by_term_and_department(
 async def test_get_section_roster_returns_cohort_with_grades(
     async_session, officer_user, standing_scenario,
 ):
+    """
+    Before compute runs, the roster shows every graded course per
+    student but SGPA / CGPA come from the AcademicStanding snapshot
+    — and no snapshot exists yet, so they're None. The grade rows
+    themselves still surface so the DH can review what was entered.
+    """
     svc = StandingService(async_session)
     result = await svc.get_section_roster(
         user_id=officer_user.id,
@@ -386,26 +393,29 @@ async def test_get_section_roster_returns_cohort_with_grades(
     # Sorted by student_id ascending (Alice=01, Bob=02, Carol=03).
     by_name = {s.full_name: s for s in result.students}
 
-    # Alice — A+ A+ A → 4.00 SGPA = (12+12+16)/10 = 4.00
+    # SGPA / CGPA are snapshot-sourced — null until compute writes
+    # an AcademicStanding row.
+    for stu in result.students:
+        assert stu.sgpa is None
+        assert stu.cgpa is None
+        assert stu.term_credit_hours == 0
+        assert stu.f_count_term == 0
+        assert stu.f_credit_total_term == 0
+
+    # Per-course rows still surface for review.
     alice = by_name["Alice"]
-    assert alice.sgpa == pytest.approx(4.00)
-    assert alice.cgpa == pytest.approx(4.00)
-    assert alice.term_credit_hours == 10
-    assert alice.f_count_term == 0
-    assert alice.f_credit_total_term == 0
-    assert alice.has_incomplete_marks is False
     assert len(alice.grades_this_term) == 3
+    alice_letters = {r.letter_grade for r in alice.grades_this_term}
+    assert GradeLetter.A_PLUS in alice_letters
 
-    # Bob — B(3.0×3=9) C+(2.5×3=7.5) C(2.0×4=8) → 24.5/10 = 2.45
     bob = by_name["Bob"]
-    assert bob.sgpa == pytest.approx(2.45)
-    assert bob.f_count_term == 0
+    assert len(bob.grades_this_term) == 3
 
-    # Carol — F(0×3=0) F(0×3=0) D(1.0×4=4) → 4/10 = 0.40
     carol = by_name["Carol"]
-    assert carol.sgpa == pytest.approx(0.40)
-    assert carol.f_count_term == 2
-    assert carol.f_credit_total_term == 6
+    assert len(carol.grades_this_term) == 3
+    # has_incomplete_marks is derived from the displayed grades, so
+    # it still works pre-compute.
+    assert carol.has_incomplete_marks is False
 
 
 async def test_get_section_roster_first_semester_flag_set(
@@ -510,7 +520,12 @@ async def test_get_section_roster_has_incomplete_marks_for_i_or_ng(
 async def test_get_section_roster_excludes_i_and_ng_from_sgpa(
     async_session, officer_user, standing_scenario,
 ):
-    """Incomplete marks must not count toward SGPA per Art 90.7.4."""
+    """
+    Incomplete marks must not count toward SGPA per Art 90.7.4.
+    The roster surfaces the I-letter row and flags the student as
+    having incomplete marks; SGPA itself is null pre-compute (the
+    snapshot does the I/NG exclusion math when compute runs).
+    """
     bob = standing_scenario["students"][1]
     cs101 = standing_scenario["cs101"]
     from sqlalchemy import update
@@ -532,10 +547,15 @@ async def test_get_section_roster_excludes_i_and_ng_from_sgpa(
         section_id=standing_scenario["se_section"].id,
     )
     bob_row = next(s for s in result.students if s.full_name == "Bob")
-    # Without CS101 (now I): C+(2.5×3=7.5) + C(2.0×4=8) = 15.5 over 7 credits
-    # SGPA = 15.5 / 7 = 2.214...
-    assert bob_row.sgpa == pytest.approx(15.5 / 7, rel=1e-3)
-    assert bob_row.term_credit_hours == 7  # I-credit excluded
+    assert bob_row.has_incomplete_marks is True
+    # The I row surfaces in the per-course list.
+    cs101_row = next(
+        r for r in bob_row.grades_this_term
+        if r.course_code == "CS101"
+    )
+    assert cs101_row.letter_grade == GradeLetter.I
+    # SGPA is snapshot-sourced and null until compute runs.
+    assert bob_row.sgpa is None
 
 
 async def test_get_section_roster_empty_for_cohort_with_no_registrations(

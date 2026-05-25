@@ -49,10 +49,10 @@ from app.modules.course.standing.rules import (
 )
 from app.modules.course.standing.schemas import (
     AcademicStandingResponse, BatchAuthoriseOutcome, BatchAuthoriseResponse,
-    ExistingStandingSummary, StandingComputeRow, StandingDepartmentResponse,
-    StandingQueueEntry, StandingRosterResponse, StandingSectionResponse,
-    StandingTermResponse, StudentStandingPreview, StudentStandingResponse,
-    StudentStandingTranscriptResponse, StudentTermGrade,
+    ExistingStandingSummary, PendingGradesRow, StandingComputeRow,
+    StandingDepartmentResponse, StandingQueueEntry, StandingRosterResponse,
+    StandingSectionResponse, StandingTermResponse, StudentStandingPreview,
+    StudentStandingResponse, StudentStandingTranscriptResponse, StudentTermGrade,
 )
 from app.shared.email.schemas import EmailMessage
 from app.shared.email.service import EmailService
@@ -153,6 +153,34 @@ class StandingService:
             )
         return user
 
+    async def _caller_dh_department(
+        self, user_id: uuid.UUID,
+    ) -> Optional[str]:
+        """
+        For a DEPARTMENT_HEAD caller, return the department recorded
+        on their ``CourseManagementOfficer`` row. Returns ``None`` for
+        ADMIN, REGISTRAR_OFFICER, or any caller without a DH profile —
+        used to auto-scope read endpoints so a DH only ever sees their
+        own department's standings, mirroring the section-allocation
+        and scheduling pattern.
+        """
+        user = (await self.db.execute(
+            select(User).where(User.id == user_id)
+        )).scalar_one_or_none()
+        if user is None or user.role == UserRole.ADMIN:
+            return None
+        if user.role != UserRole.REGISTRAR_OFFICER:
+            return None
+        officer = (await self.db.execute(
+            select(CourseManagementOfficer).where(
+                CourseManagementOfficer.user_id == user_id,
+                CourseManagementOfficer.is_deleted == False,  # noqa: E712
+            )
+        )).scalar_one_or_none()
+        if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
+            return None
+        return officer.department
+
     async def _resolve_dh_or_403(self, user_id: uuid.UUID) -> User:
         """
         Write gate — only DEPARTMENT_HEAD (via CourseManagementOfficer
@@ -238,20 +266,24 @@ class StandingService:
         """
         await self._resolve_officer_or_403(user_id)
         await self._resolve_term_or_404(term_id)
+        caller_dept = await self._caller_dh_department(user_id)
 
         # Section count per department.
-        section_rows = (await self.db.execute(
+        section_stmt = (
             select(Section.department, func.count(Section.id))
             .where(
                 Section.term_id == term_id,
                 Section.is_deleted == False,  # noqa: E712
             )
             .group_by(Section.department)
-        )).all()
+        )
+        if caller_dept is not None:
+            section_stmt = section_stmt.where(Section.department == caller_dept)
+        section_rows = (await self.db.execute(section_stmt)).all()
         sections_per_dept = {row[0]: row[1] for row in section_rows}
 
         # Student count per department (across all sections in term).
-        student_rows = (await self.db.execute(
+        student_stmt = (
             select(Section.department, func.count(Registration.id))
             .join(Section, Section.id == Registration.section_id)
             .where(
@@ -261,7 +293,10 @@ class StandingService:
                 Section.is_deleted == False,  # noqa: E712
             )
             .group_by(Section.department)
-        )).all()
+        )
+        if caller_dept is not None:
+            student_stmt = student_stmt.where(Section.department == caller_dept)
+        student_rows = (await self.db.execute(student_stmt)).all()
         students_per_dept = {row[0]: row[1] for row in student_rows}
 
         out = [
@@ -287,6 +322,10 @@ class StandingService:
         """
         await self._resolve_officer_or_403(user_id)
         await self._resolve_term_or_404(term_id)
+        caller_dept = await self._caller_dh_department(user_id)
+        # A DH never sees sections outside their own department.
+        if caller_dept is not None and caller_dept != department:
+            return []
 
         sections = (await self.db.execute(
             select(Section)
@@ -355,15 +394,6 @@ class StandingService:
             )
         )).scalars().all()
 
-        # Hydrate course metadata in one batch query.
-        course_ids = list({g.course_id for g in grades})
-        courses_by_id: dict[uuid.UUID, Course] = {}
-        if course_ids:
-            course_rows = (await self.db.execute(
-                select(Course).where(Course.id.in_(course_ids))
-            )).scalars().all()
-            courses_by_id = {c.id: c for c in course_rows}
-
         # RegistrationCourse.is_dropped lookup per (registration, course).
         reg_ids = [r.id for r, _s in cohort_rows]
         rc_rows: list[RegistrationCourse] = []
@@ -393,9 +423,24 @@ class StandingService:
             for r_id, c_id in add_rows:
                 added_by_reg.setdefault(r_id, set()).add(c_id)
 
-        # Existing standing rows (if PR C2 already computed for these
-        # students). One query for the whole cohort.
-        standings_by_student: dict[uuid.UUID, AcademicStanding] = {}
+        # Hydrate course metadata for every course we might display:
+        # graded ones (from the Grade ledger) + registered/added ones
+        # (from RegistrationCourse + StudentScheduleAddition) so the
+        # ungraded-course rows can render the catalog code/title.
+        all_course_ids: set[uuid.UUID] = {g.course_id for g in grades}
+        for cs in original_by_reg.values():
+            all_course_ids.update(cs)
+        for cs in added_by_reg.values():
+            all_course_ids.update(cs)
+        courses_by_id: dict[uuid.UUID, Course] = {}
+        if all_course_ids:
+            course_rows = (await self.db.execute(
+                select(Course).where(Course.id.in_(all_course_ids))
+            )).scalars().all()
+            courses_by_id = {c.id: c for c in course_rows}
+
+        # Existing standing rows for the target term (if PR C2 already
+        # computed). One query for the whole cohort.
         existing_rows = (await self.db.execute(
             select(AcademicStanding)
             .where(
@@ -404,7 +449,34 @@ class StandingService:
                 AcademicStanding.is_deleted == False,  # noqa: E712
             )
         )).scalars().all()
-        standings_by_student = {s.student_id: s for s in existing_rows}
+        standings_by_student: dict[uuid.UUID, AcademicStanding] = {
+            s.student_id: s for s in existing_rows
+        }
+
+        # Prior standings (any term before the target) — used to
+        # surface the "incoming CGPA from last term" snapshot so the
+        # UI has a CGPA carry-over even before the current term is
+        # computed. Picks the most recent prior row by the term's
+        # start_date so terms are ordered chronologically, not by
+        # whichever DH happened to compute first.
+        prior_rows = (await self.db.execute(
+            select(AcademicStanding, AcademicTerm)
+            .join(AcademicTerm, AcademicTerm.id == AcademicStanding.term_id)
+            .where(
+                AcademicStanding.student_id.in_(student_ids),
+                AcademicStanding.term_id != term_id,
+                AcademicTerm.start_date < term.start_date,
+                AcademicStanding.is_deleted == False,  # noqa: E712
+            )
+            .order_by(AcademicTerm.start_date.asc())
+        )).all()
+        prior_by_student: dict[
+            uuid.UUID, tuple[AcademicStanding, AcademicTerm],
+        ] = {}
+        for standing, t in prior_rows:
+            # Last write wins → because ordered ASC, the final
+            # write is the most recent prior term per student.
+            prior_by_student[standing.student_id] = (standing, t)
 
         # Compose one preview per student.
         students: list[StudentStandingPreview] = []
@@ -425,6 +497,7 @@ class StandingService:
                     registration_by_student[stu.id].id, set(),
                 ),
                 existing_standing=standings_by_student.get(stu.id),
+                prior_standing=prior_by_student.get(stu.id),
             ))
 
         return StandingRosterResponse(
@@ -451,95 +524,111 @@ class StandingService:
         dropped_courses: set[uuid.UUID],
         added_courses: set[uuid.UUID],
         existing_standing: Optional[AcademicStanding],
+        prior_standing: Optional[tuple[AcademicStanding, AcademicTerm]],
     ) -> StudentStandingPreview:
         """
         Compose one student's roster row from pre-loaded data. No
         DB access from here — every query happens upstream so
         per-student composition is in-memory.
+
+        SGPA / CGPA come from the AcademicStanding snapshot for this
+        term (or ``None`` until compute has run). Prior-term carry-
+        over CGPA comes from the most recent prior snapshot. The
+        roster never re-derives GPA from the Grade ledger — the
+        snapshot is the authoritative answer per the standing-
+        workflow design.
         """
         _ = registration_id  # reserved for richer add/drop UX later
 
-        # Partition the student's grades by term.
         term_grades = [g for g in all_grades if g.term_id == term_id]
         prior_grades = [g for g in all_grades if g.term_id != term_id]
 
-        # Build the per-course rows for the target term.
-        term_rows: list[StudentTermGrade] = []
-        for g in term_grades:
-            course = courses_by_id.get(g.course_id)
-            if course is None:
-                continue
-            term_rows.append(StudentTermGrade(
-                course_id=course.id,
-                course_code=course.code,
-                course_title=course.title,
-                credit_hours=g.credit_hours,
-                letter_grade=g.letter_grade,
-                numeric_score=g.numeric_score,
-                grade_points=g.grade_points,
-                is_dropped=(course.id in dropped_courses),
-                is_added_via_drop=(course.id in added_courses),
-            ))
+        # ── Build the expected-vs-graded picture of the term ──
+        # Expected = registered (non-dropped) ∪ added-via-drop. Drops
+        # are surfaced separately for audit context but don't count
+        # toward "expected" because they're no longer the student's
+        # responsibility.
+        expected_courses = (original_courses - dropped_courses) | added_courses
+        graded_by_course: dict[uuid.UUID, Grade] = {
+            g.course_id: g for g in term_grades
+        }
 
-        # Surface dropped courses that have no Grade row yet (the
-        # student dropped before the instructor entered grades) — the
-        # officer needs to see "they had this on the registration".
-        graded_course_ids = {r.course_id for r in term_rows}
-        for course_id in dropped_courses - graded_course_ids:
+        # The display list is the union of expected + graded + dropped
+        # so a graded course always surfaces even if registration data
+        # is incomplete (legacy seeds, manual data entry). Each course
+        # gets exactly one row; its classification picks the most
+        # specific applicable flag (dropped > graded > ungraded).
+        display_course_ids = (
+            expected_courses
+            | set(graded_by_course.keys())
+            | dropped_courses
+        )
+
+        term_rows: list[StudentTermGrade] = []
+        for course_id in display_course_ids:
             course = courses_by_id.get(course_id)
             if course is None:
-                # Hydrate from the course catalog only if we don't
-                # already have it from the grades-load path.
                 continue
+            grade = graded_by_course.get(course_id)
+            is_dropped = course_id in dropped_courses
+            is_added = course_id in added_courses
+            # A course is "ungraded" only if the student is expected to
+            # take it (registered or added, not dropped) and no grade
+            # exists yet. Dropped courses are never ungraded; they're
+            # done from the student's perspective.
+            is_ungraded = (
+                not is_dropped
+                and grade is None
+                and course_id in expected_courses
+            )
             term_rows.append(StudentTermGrade(
                 course_id=course.id,
                 course_code=course.code,
                 course_title=course.title,
-                credit_hours=course.credit_hours,
-                letter_grade=None,
-                numeric_score=None,
-                grade_points=None,
-                is_dropped=True,
-                is_added_via_drop=False,
+                credit_hours=grade.credit_hours if grade else course.credit_hours,
+                letter_grade=grade.letter_grade if grade else None,
+                numeric_score=grade.numeric_score if grade else None,
+                grade_points=grade.grade_points if grade else None,
+                is_dropped=is_dropped,
+                is_added_via_drop=is_added,
+                is_ungraded=is_ungraded,
             ))
 
         term_rows.sort(key=lambda r: r.course_code)
 
-        # ── SGPA math ── credit-weighted over grades counting toward
-        # CGPA (excludes I, NG, W, DO, P per Senate Art 90.7).
-        sgpa_grades = [g for g in term_grades if counts_toward_cgpa(g.letter_grade)]
-        term_credit = sum(g.credit_hours for g in sgpa_grades)
-        sgpa_points = sum(
-            (g.grade_points if g.grade_points is not None
-             else (points_for(g.letter_grade) or 0.0) * g.credit_hours)
-            for g in sgpa_grades
-        )
-        sgpa = round(sgpa_points / term_credit, 4) if term_credit > 0 else None
+        expected_count = len(expected_courses)
+        ungraded_count = sum(1 for r in term_rows if r.is_ungraded)
+        has_ungraded = ungraded_count > 0
 
-        # ── CGPA math ── across every authorised term-counting grade.
-        cgpa_grades = [
-            g for g in all_grades if counts_toward_cgpa(g.letter_grade)
-        ]
-        cumulative_credit = sum(g.credit_hours for g in cgpa_grades)
-        cgpa_points = sum(
-            (g.grade_points if g.grade_points is not None
-             else (points_for(g.letter_grade) or 0.0) * g.credit_hours)
-            for g in cgpa_grades
-        )
-        cgpa = (
-            round(cgpa_points / cumulative_credit, 4)
-            if cumulative_credit > 0 else None
-        )
+        # ── SGPA / CGPA from snapshots only ──
+        if existing_standing is not None:
+            sgpa = existing_standing.sgpa
+            cgpa = existing_standing.cgpa
+            term_credit = existing_standing.term_credit_hours
+            cumulative_credit = existing_standing.cumulative_credit_hours
+            f_count = existing_standing.f_count_term
+            f_credit = existing_standing.f_credit_total_term
+        else:
+            sgpa = None
+            cgpa = None
+            term_credit = 0
+            cumulative_credit = 0
+            f_count = 0
+            f_credit = 0
 
-        # ── Article-91 evaluation context ──
-        f_count = sum(
-            1 for g in term_grades if g.letter_grade == GradeLetter.F
-        )
-        f_credit = sum(
-            g.credit_hours for g in term_grades
-            if g.letter_grade == GradeLetter.F
-        )
+        prior_cgpa: Optional[float] = None
+        prior_cumulative_credit: Optional[int] = None
+        prior_term_name: Optional[str] = None
+        if prior_standing is not None:
+            prior, prior_term = prior_standing
+            prior_cgpa = prior.cgpa
+            prior_cumulative_credit = prior.cumulative_credit_hours
+            prior_term_name = prior_term.term_name
+            # Carry-over only flows into the dedicated prior_* fields.
+            # ``cgpa`` stays null until compute runs for this term —
+            # the snapshot is the only legitimate source.
 
+        # ── Article-91 evaluation context (cheap to derive live) ──
         # is_first_semester / is_first_year derive from how many
         # distinct *prior* terms the student has authorised grades in.
         prior_term_count = len({g.term_id for g in prior_grades})
@@ -569,9 +658,15 @@ class StandingService:
             cumulative_credit_hours=cumulative_credit,
             f_count_term=f_count,
             f_credit_total_term=f_credit,
+            prior_cgpa=prior_cgpa,
+            prior_cumulative_credit_hours=prior_cumulative_credit,
+            prior_term_name=prior_term_name,
             is_first_semester=is_first_semester,
             is_first_year=is_first_year,
             has_incomplete_marks=has_incomplete,
+            expected_course_count=expected_count,
+            ungraded_count=ungraded_count,
+            has_ungraded_courses=has_ungraded,
             existing_standing=existing_summary,
         )
 
@@ -612,7 +707,7 @@ class StandingService:
         term_id: uuid.UUID,
         department: Optional[str] = None,
         section_id: Optional[uuid.UUID] = None,
-    ) -> tuple[list[StandingComputeRow], int, int]:
+    ) -> tuple[list[StandingComputeRow], int, int, list["PendingGradesRow"]]:
         """
         Run the Article-91 rules engine over every cohort member in
         scope and upsert the proposal into ``academic_standings``.
@@ -627,7 +722,14 @@ class StandingService:
         are SKIPPED unless the officer explicitly resets them — the
         agent never overwrites an authorised decision.
 
-        Returns (rows, computed_count, skipped_count).
+        All-graded gate: a student whose registered (or added-via-
+        drop) course set is not fully covered by AUTHORISED Grade
+        rows for the term is SKIPPED and reported in the returned
+        pending list. No AcademicStanding row is written for these
+        students — the DH must wait for grading to complete and
+        re-run.
+
+        Returns (rows, computed_count, skipped_count, pending_rows).
         """
         await self._resolve_dh_or_403(user_id)
         term = await self._resolve_term_or_404(term_id)
@@ -655,7 +757,40 @@ class StandingService:
         cohort = (await self.db.execute(stmt.order_by(Student.student_id.asc()))).all()
 
         if not cohort:
-            return [], 0, 0
+            return [], 0, 0, []
+
+        # Expected-course set per registration: registered (non-dropped)
+        # ∪ added-via-drop. Used by the all-graded gate below.
+        reg_ids = [r.id for r, _s in cohort]
+        rc_rows = (await self.db.execute(
+            select(RegistrationCourse)
+            .where(RegistrationCourse.registration_id.in_(reg_ids))
+        )).scalars().all()
+        original_by_reg: dict[uuid.UUID, set[uuid.UUID]] = {}
+        dropped_by_reg: dict[uuid.UUID, set[uuid.UUID]] = {}
+        for rc in rc_rows:
+            original_by_reg.setdefault(rc.registration_id, set()).add(rc.course_id)
+            if rc.is_dropped:
+                dropped_by_reg.setdefault(rc.registration_id, set()).add(rc.course_id)
+        add_rows = (await self.db.execute(
+            select(
+                StudentScheduleAddition.registration_id,
+                StudentScheduleAddition.course_id,
+            )
+            .where(StudentScheduleAddition.registration_id.in_(reg_ids))
+            .distinct()
+        )).all()
+        added_by_reg: dict[uuid.UUID, set[uuid.UUID]] = {}
+        for r_id, c_id in add_rows:
+            added_by_reg.setdefault(r_id, set()).add(c_id)
+        expected_by_reg: dict[uuid.UUID, set[uuid.UUID]] = {
+            r_id: (original_by_reg.get(r_id, set())
+                   - dropped_by_reg.get(r_id, set()))
+                  | added_by_reg.get(r_id, set())
+            for r_id, _s in (
+                (r.id, s) for r, s in cohort
+            )
+        }
 
         student_ids = [s.id for _r, s in cohort]
         grades = (await self.db.execute(
@@ -687,11 +822,16 @@ class StandingService:
             if term_start_by_id.get(g.term_id, cutoff) <= cutoff
         ]
 
-        course_ids = list({g.course_id for g in grades})
+        # Course catalog covers graded courses AND the expected
+        # courses, so the pending-grades report can show codes for
+        # ungraded courses (which by definition have no Grade row).
+        all_course_ids: set[uuid.UUID] = {g.course_id for g in grades}
+        for cs in expected_by_reg.values():
+            all_course_ids.update(cs)
         courses_by_id: dict[uuid.UUID, Course] = {}
-        if course_ids:
+        if all_course_ids:
             course_rows = (await self.db.execute(
-                select(Course).where(Course.id.in_(course_ids))
+                select(Course).where(Course.id.in_(all_course_ids))
             )).scalars().all()
             courses_by_id = {c.id: c for c in course_rows}
 
@@ -724,9 +864,10 @@ class StandingService:
 
         agent = self._resolve_agent()
         rows: list[StandingComputeRow] = []
+        pending_rows: list[PendingGradesRow] = []
         computed_count = 0
         skipped_count = 0
-        for _reg, stu in cohort:
+        for reg, stu in cohort:
             existing = existing_by_student.get(stu.id)
             if existing is not None and existing.final_status is not None:
                 # Already authorised — agent does not overwrite.
@@ -736,6 +877,34 @@ class StandingService:
                     reasons=["Already authorised; agent skipped."],
                     rule_citations=[],
                     narrative=None,
+                ))
+                continue
+
+            # ── All-graded gate ──
+            # The student is skipped (no AcademicStanding row written)
+            # when any expected course lacks an AUTHORISED grade for
+            # the term. Surfaces in the pending bucket so the DH sees
+            # who is still waiting on grading.
+            expected = expected_by_reg.get(reg.id, set())
+            graded_course_ids = {
+                g.course_id for g in grades
+                if g.student_id == stu.id and g.term_id == term_id
+            }
+            ungraded = expected - graded_course_ids
+            if expected and ungraded:
+                ungraded_codes = sorted(
+                    courses_by_id[cid].code
+                    for cid in ungraded
+                    if cid in courses_by_id
+                )
+                pending_rows.append(PendingGradesRow(
+                    student_id=stu.id,
+                    student_number=stu.student_id,
+                    full_name=stu.full_name,
+                    department=stu.department,
+                    expected_course_count=len(expected),
+                    graded_course_count=len(expected & graded_course_ids),
+                    ungraded_course_codes=ungraded_codes,
                 ))
                 continue
 
@@ -772,7 +941,7 @@ class StandingService:
             ))
 
         await self.db.commit()
-        return rows, computed_count, skipped_count
+        return rows, computed_count, skipped_count, pending_rows
 
     async def authorise(
         self,
@@ -907,6 +1076,10 @@ class StandingService:
         chronological view.
         """
         await self._resolve_officer_or_403(user_id)
+        caller_dept = await self._caller_dh_department(user_id)
+        # A DH is always scoped to their department, regardless of
+        # what the request asked for.
+        effective_department = caller_dept or department
 
         stmt = (
             select(AcademicStanding, Student, AcademicTerm)
@@ -919,8 +1092,10 @@ class StandingService:
             stmt = stmt.where(AcademicStanding.final_status.is_(None))
         if term_id is not None:
             stmt = stmt.where(AcademicStanding.term_id == term_id)
-        if department is not None:
-            stmt = stmt.where(AcademicStanding.department == department)
+        if effective_department is not None:
+            stmt = stmt.where(
+                AcademicStanding.department == effective_department,
+            )
         if student_id is not None:
             stmt = stmt.where(AcademicStanding.student_id == student_id)
         if requires_review is not None:
