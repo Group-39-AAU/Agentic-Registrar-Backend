@@ -53,12 +53,14 @@ def reg_service(async_session, isolated_pay_mock):
 
 @pytest_asyncio.fixture
 async def cs_chain(async_session) -> dict[str, Course]:
+    """Credits sized so 2-course registrations (12 ECTS) clear the
+    credit-load floor."""
     cs101 = Course(
-        code="CS101", title="Intro", credit_hours=4, semester=1,
+        code="CS101", title="Intro", credit_hours=12, semester=1,
         department="Computer Science",
     )
     cs201 = Course(
-        code="CS201", title="Data Structures", credit_hours=4, semester=2,
+        code="CS201", title="Data Structures", credit_hours=12, semester=2,
         department="Computer Science",
     )
     async_session.add_all([cs101, cs201])

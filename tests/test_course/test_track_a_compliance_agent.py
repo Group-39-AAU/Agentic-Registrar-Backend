@@ -19,6 +19,7 @@ from app.modules.course.agents import (
     ComplianceCheckResult,
     CurriculumComplianceAgent,
     MAX_CREDIT_LOAD_ECTS,
+    MIN_CREDIT_LOAD_ECTS,
 )
 from app.modules.course.models import (
     Course, CoursePrerequisite, Registration, RegistrationCourse,
@@ -156,16 +157,20 @@ async def test_verify_prereqs_fails_with_missing_course_codes(
     assert "CS101" in result.details["missing_course_codes"]
 
 
-# ── validate_registration (22 ECTS ceiling) ─────────────────────
+# ── validate_registration ([12, 22] ECTS window) ─────────────────
 
 
-async def test_validate_registration_passes_under_ceiling(
+async def test_validate_registration_passes_inside_window(
     async_session, compliance_agent, cs_chain, registration_factory,
 ):
-    reg = await registration_factory([cs_chain["CS101"], cs_chain["CS201"]])
+    """Three 4-credit courses -> 12 ECTS, on the floor, inside the window."""
+    reg = await registration_factory([
+        cs_chain["CS101"], cs_chain["CS201"], cs_chain["CS301"],
+    ])
     result = await compliance_agent.validate_registration(async_session, reg)
     assert result.passed
-    assert result.details["total_credits"] == 8
+    assert result.details["total_credits"] == 12
+    assert result.details["floor"] == MIN_CREDIT_LOAD_ECTS
     assert result.details["ceiling"] == MAX_CREDIT_LOAD_ECTS
 
 
@@ -191,6 +196,18 @@ async def test_validate_registration_fails_over_ceiling(
     assert any("22" in r for r in result.reasons)
 
 
+async def test_validate_registration_fails_under_floor(
+    async_session, compliance_agent, cs_chain, registration_factory,
+):
+    """Two 4-credit courses -> 8 ECTS, below the 12 ECTS floor."""
+    reg = await registration_factory([cs_chain["CS101"], cs_chain["CS201"]])
+    result = await compliance_agent.validate_registration(async_session, reg)
+
+    assert result.passed is False
+    assert result.details["total_credits"] == 8
+    assert any("12" in r for r in result.reasons)
+
+
 async def test_validate_registration_fails_on_empty(
     async_session, compliance_agent, registration_factory,
 ):
@@ -201,16 +218,26 @@ async def test_validate_registration_fails_on_empty(
 
 
 async def test_validate_registration_excludes_dropped_courses(
-    async_session, compliance_agent, cs_chain, registration_factory,
+    async_session, compliance_agent, registration_factory,
 ):
-    reg = await registration_factory([cs_chain["CS101"], cs_chain["CS201"]])
-    # Drop one course
+    """Four 4-credit courses (16 ECTS), drop one -> 12 ECTS, inside window."""
+    courses = []
+    for i in range(4):
+        c = Course(
+            code=f"DROP{i:03d}", title=f"Droppable course {i}",
+            credit_hours=4, semester=1, department="Test",
+        )
+        async_session.add(c)
+        courses.append(c)
+    await async_session.flush()
+
+    reg = await registration_factory(courses)
     reg.courses[0].is_dropped = True
     await async_session.flush()
 
     result = await compliance_agent.validate_registration(async_session, reg)
     assert result.passed
-    assert result.details["total_credits"] == 4   # only the non-dropped course
+    assert result.details["total_credits"] == 12   # 16 minus the dropped 4
 
 
 # ── check_payment_status ────────────────────────────────────────
@@ -256,15 +283,19 @@ async def test_process_task_aggregates_to_pass_when_everything_clean(
     registration_factory,
     seeded_student,
 ):
-    reg = await registration_factory([cs_chain["CS201"]])
-    isolated_pay_mock.set_payment_status(
-        seeded_student.id, cs_chain["CS201"].id, paid=True,
-    )
+    """Three 4-credit courses (12 ECTS) so the credit-load floor clears."""
+    reg = await registration_factory([
+        cs_chain["CS101"], cs_chain["CS201"], cs_chain["CS301"],
+    ])
+    for course in cs_chain.values():
+        isolated_pay_mock.set_payment_status(
+            seeded_student.id, course.id, paid=True,
+        )
 
     out = await compliance_agent.process_task({
         "session": async_session,
         "registration": reg,
-        "completed_course_ids": {cs_chain["CS101"].id},
+        "completed_course_ids": {cs_chain["CS101"].id, cs_chain["CS201"].id},
     })
 
     assert out["overall_passed"] is True
