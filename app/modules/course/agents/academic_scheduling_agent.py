@@ -28,10 +28,19 @@ The agent runs in two phases (the service composes them via
        out ClassScheduleSlot rows. Each course gets exactly
        ``course.credit_hours`` hours of slots per week.
      - Slots are placed in 1-hour blocks in the standard university
-       teaching window (08:30–17:30 MON–FRI). The placement is
-       conflict-aware: a slot is rejected if either the section's
-       room or the chosen instructor is already booked at that time
-       across the whole term.
+       teaching window (08:30–12:30, lunch 12:30–13:30, 13:30–16:30
+       MON–FRI). Placement is **balanced best-fit**, not left-to-
+       right greedy: for each weekly hour of a course we pick the
+       free (day, block) that minimises (a) re-using a day this
+       course already meets on, (b) the section's total hours
+       booked on that day, (c) the block-index — so courses spread
+       across the week, daily loads stay even, and mornings fill
+       first. Up to two hours of a single course may share a day,
+       and when they do the second hour must be adjacent to the
+       first (one contiguous session). The placement is conflict-
+       aware: a slot is rejected if either the section's room or
+       the chosen instructor is already booked at that time across
+       the whole term.
      - Anything that cannot be placed in the available window is
        recorded as a :class:`ScheduleConflict` row for the officer.
 
@@ -85,9 +94,9 @@ class ScheduleArtefact:
 # ── Agent ────────────────────────────────────────────────────────
 
 
-# A teaching day is split into nine 1-hour blocks: 08:30–17:30 with a
-# lunch break implicitly available because we only place classes when
-# a course's credit_hours requires that many filled hours.
+# Standard teaching window: four morning blocks 08:30–12:30, lunch
+# 12:30–13:30 (no classes), three afternoon blocks 13:30–16:30 —
+# seven 1-hour blocks per day, MON–FRI, 35 slots/week per cohort.
 _DAYS = ("MON", "TUE", "WED", "THU", "FRI")
 _HOUR_BLOCKS: list[tuple[time, time]] = [
     (time(8, 30),  time(9, 30)),
@@ -97,8 +106,12 @@ _HOUR_BLOCKS: list[tuple[time, time]] = [
     (time(13, 30), time(14, 30)),
     (time(14, 30), time(15, 30)),
     (time(15, 30), time(16, 30)),
-    (time(16, 30), time(17, 30)),
 ]
+# A single course may meet at most this many 1-hour blocks on the
+# same day. The extra block(s) must be contiguous with the first —
+# the cohort gets a single multi-hour session, never two disjoint
+# stubs on the same day.
+_MAX_HOURS_PER_DAY_PER_COURSE = 2
 
 
 class AcademicSchedulingAgent(CourseBaseAgent):
@@ -449,61 +462,103 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                 )
 
                 placed_count = 0
-                for day in _DAYS:
-                    if placed_count == course.credit_hours:
+                # Which block-indices on each day are already held by
+                # THIS course in THIS section — used both to enforce
+                # _MAX_HOURS_PER_DAY_PER_COURSE and to require any
+                # second hour to be adjacent (contiguous session).
+                course_blocks_by_day: dict[str, set[int]] = defaultdict(set)
+
+                while placed_count < course.credit_hours:
+                    best: Optional[tuple[str, int, time, time, str]] = None
+                    best_score: Optional[tuple[int, int, int]] = None
+
+                    for day in _DAYS:
+                        held = course_blocks_by_day[day]
+                        # Don't stack more than the per-day cap of this
+                        # course on a single day.
+                        if len(held) >= _MAX_HOURS_PER_DAY_PER_COURSE:
+                            continue
+                        # Section's total hours already booked on this
+                        # day — used to balance the cohort's daily load.
+                        day_load = sum(
+                            1 for (d, _) in section_busy[sec.id] if d == day
+                        )
+
+                        for idx, (start, end) in enumerate(_HOUR_BLOCKS):
+                            # Cohort collision: this section already has
+                            # another course at the same (day, start).
+                            if (day, start) in section_busy[sec.id]:
+                                continue
+                            # Instructor collision: same instructor
+                            # already teaching another section/course
+                            # at this slot.
+                            if (
+                                instructor_id
+                                and instructor_id in instructor_busy[(day, start)]
+                            ):
+                                continue
+                            # If the course already meets on this day,
+                            # the new block must abut an existing one
+                            # so the cohort gets one contiguous session.
+                            if held and not any(abs(idx - h) == 1 for h in held):
+                                continue
+                            # Pick the smallest free classroom that
+                            # fits this cohort at this (day, start).
+                            slot_room = _pick_free_room_at_slot(
+                                rooms,
+                                demand=sec.enrolled_count,
+                                busy=room_busy[(day, start)],
+                            )
+                            if slot_room is None:
+                                continue
+                            # Lower score wins. Tiebreakers, in order:
+                            #   1. Prefer days where this course has
+                            #      not met yet — spread across the week.
+                            #   2. Prefer the day with the lighter
+                            #      section load — balance the cohort's
+                            #      total hours per day.
+                            #   3. Prefer earlier blocks — mornings
+                            #      fill first, per the stated policy.
+                            score = (1 if held else 0, day_load, idx)
+                            if best_score is None or score < best_score:
+                                best = (day, idx, start, end, slot_room)
+                                best_score = score
+
+                    if best is None:
+                        # No (day, block) anywhere in the week can host
+                        # the next hour of this course — fall through
+                        # to the conflict record below.
                         break
-                    for start, end in _HOUR_BLOCKS:
-                        if placed_count == course.credit_hours:
-                            break
-                        # Cohort collision: this section already has
-                        # another course at the same (day, start).
-                        if (day, start) in section_busy[sec.id]:
-                            continue
-                        # Instructor collision: same instructor already
-                        # teaching another section/course at this slot.
-                        if (
-                            instructor_id
-                            and instructor_id in instructor_busy[(day, start)]
-                        ):
-                            continue
-                        # Pick a free classroom that fits this cohort at
-                        # this (day, start). If none fits-and-is-free,
-                        # the slot is unplaceable now — try the next
-                        # block.
-                        slot_room = _pick_free_room_at_slot(
-                            rooms,
-                            demand=sec.enrolled_count,
-                            busy=room_busy[(day, start)],
-                        )
-                        if slot_room is None:
-                            continue
-                        slot = ClassScheduleSlot(
-                            section_id=sec.id,
-                            course_id=course.id,
-                            instructor_id=instructor_id,
-                            day_of_week=day,
-                            start_time=start,
-                            end_time=end,
-                            room=slot_room,
-                        )
-                        session.add(slot)
-                        sec_slots.append({
-                            "course_code": course.code,
-                            "course_title": course.title,
-                            "day_of_week": day,
-                            "start_time": start.isoformat(timespec="minutes"),
-                            "end_time": end.isoformat(timespec="minutes"),
-                            "instructor_id": (
-                                str(instructor_id) if instructor_id else None
-                            ),
-                            "room": slot_room,
-                        })
-                        room_busy[(day, start)].add(slot_room)
-                        section_busy[sec.id].add((day, start))
-                        if instructor_id:
-                            instructor_busy[(day, start)].add(instructor_id)
-                        placed_count += 1
-                        artefact.slots_created += 1
+
+                    day, idx, start, end, slot_room = best
+                    slot = ClassScheduleSlot(
+                        section_id=sec.id,
+                        course_id=course.id,
+                        instructor_id=instructor_id,
+                        day_of_week=day,
+                        start_time=start,
+                        end_time=end,
+                        room=slot_room,
+                    )
+                    session.add(slot)
+                    sec_slots.append({
+                        "course_code": course.code,
+                        "course_title": course.title,
+                        "day_of_week": day,
+                        "start_time": start.isoformat(timespec="minutes"),
+                        "end_time": end.isoformat(timespec="minutes"),
+                        "instructor_id": (
+                            str(instructor_id) if instructor_id else None
+                        ),
+                        "room": slot_room,
+                    })
+                    room_busy[(day, start)].add(slot_room)
+                    section_busy[sec.id].add((day, start))
+                    if instructor_id:
+                        instructor_busy[(day, start)].add(instructor_id)
+                    course_blocks_by_day[day].add(idx)
+                    placed_count += 1
+                    artefact.slots_created += 1
 
                 if placed_count < course.credit_hours:
                     conflict = ScheduleConflict(
