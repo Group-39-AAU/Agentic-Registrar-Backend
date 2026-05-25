@@ -583,6 +583,8 @@ class ScheduleSlotSummary(BaseModel):
     end_time: str
     room: Optional[str] = None
     instructor_id: Optional[uuid.UUID] = None
+    instructor_name: Optional[str] = None
+    instructor_staff_id: Optional[str] = None
 
 
 class ScheduleConflictDetail(BaseModel):

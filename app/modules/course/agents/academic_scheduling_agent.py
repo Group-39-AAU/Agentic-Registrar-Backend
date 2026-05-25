@@ -60,9 +60,10 @@ from typing import Any, Optional
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.auth.models import User as _AuthUser
 from app.modules.course.agents.course_base_agent import CourseBaseAgent
 from app.modules.course.models import (
-    ClassScheduleSlot, Classroom, Course, InstructorAssignment,
+    ClassScheduleSlot, Classroom, Course, Instructor, InstructorAssignment,
     Registration, RegistrationCourse, ScheduleConflict, Section, Student,
     StudentScheduleAddition,
 )
@@ -670,7 +671,10 @@ class AcademicSchedulingAgent(CourseBaseAgent):
             )
         ).scalars().all()
 
-        options: list[dict[str, Any]] = []
+        # Collect every slot we'll surface (candidate + already-on-
+        # schedule) and prefetch the instructors in one query, so the
+        # per-slot summaries can carry `instructor_name` without N+1.
+        candidate_section_slots: dict[uuid.UUID, list[ClassScheduleSlot]] = {}
         for section in candidate_sections:
             slot_rows = (
                 await session.execute(
@@ -683,6 +687,24 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                     )
                 )
             ).scalars().all()
+            candidate_section_slots[section.id] = list(slot_rows)
+
+        instructor_ids: set[uuid.UUID] = set()
+        for slots in candidate_section_slots.values():
+            for s in slots:
+                if s.instructor_id is not None:
+                    instructor_ids.add(s.instructor_id)
+        for entry in current_slots:
+            iid = entry["slot"].instructor_id
+            if iid is not None:
+                instructor_ids.add(iid)
+        instructor_lookup = await self._build_instructor_lookup(
+            session, instructor_ids,
+        )
+
+        options: list[dict[str, Any]] = []
+        for section in candidate_sections:
+            slot_rows = candidate_section_slots.get(section.id, [])
             if not slot_rows:
                 continue
 
@@ -700,9 +722,12 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                     existing_slot = existing["slot"]
                     if _slots_collide(cand, existing_slot):
                         conflicts.append({
-                            "candidate": _slot_summary(cand, course.code),
+                            "candidate": _slot_summary(
+                                cand, course.code, instructor_lookup,
+                            ),
                             "collides_with": _slot_summary(
                                 existing_slot, existing["course_code"],
+                                instructor_lookup,
                             ),
                         })
 
@@ -712,7 +737,8 @@ class AcademicSchedulingAgent(CourseBaseAgent):
                 "department": section.department,
                 "semester": section.semester,
                 "slots": [
-                    _slot_summary(s, course.code) for s in slot_rows
+                    _slot_summary(s, course.code, instructor_lookup)
+                    for s in slot_rows
                 ],
                 "conflicts": conflicts,
                 "is_viable": not conflicts,
@@ -774,6 +800,32 @@ class AcademicSchedulingAgent(CourseBaseAgent):
             session.add(row)
             created.append(row)
         return created
+
+    async def _build_instructor_lookup(
+        self,
+        session: AsyncSession,
+        instructor_ids: set[uuid.UUID],
+    ) -> dict[uuid.UUID, tuple[str, Optional[str]]]:
+        """
+        Single-query lookup from ``instructor_id`` to
+        ``(full_name, staff_id)``. Lets slot summaries carry a
+        human-readable instructor without N+1 round-trips. Returns
+        an empty map when the input set is empty.
+        """
+        if not instructor_ids:
+            return {}
+        rows = (
+            await session.execute(
+                select(Instructor, _AuthUser).join(
+                    _AuthUser, _AuthUser.id == Instructor.user_id,
+                ).where(Instructor.id.in_(instructor_ids))
+            )
+        ).all()
+        out: dict[uuid.UUID, tuple[str, Optional[str]]] = {}
+        for instructor, user in rows:
+            full_name = f"{user.first_name} {user.last_name}".strip()
+            out[instructor.id] = (full_name, instructor.instructor_id)
+        return out
 
     async def _effective_slots(
         self,
@@ -909,8 +961,26 @@ def _slots_collide(a: ClassScheduleSlot, b: ClassScheduleSlot) -> bool:
     return a.start_time < b.end_time and b.start_time < a.end_time
 
 
-def _slot_summary(slot: ClassScheduleSlot, course_code: str) -> dict[str, Any]:
-    """One-line dict describing a slot for the option/conflict payloads."""
+def _slot_summary(
+    slot: ClassScheduleSlot,
+    course_code: str,
+    instructor_lookup: Optional[
+        dict[uuid.UUID, tuple[str, Optional[str]]]
+    ] = None,
+) -> dict[str, Any]:
+    """
+    One-line dict describing a slot for the option/conflict payloads.
+
+    ``instructor_lookup`` is an ``{instructor_id: (full_name, staff_id)}``
+    map the caller prebuilt so we don't issue per-slot DB queries.
+    Omitted ⇒ name/staff_id are left ``None``.
+    """
+    lookup = instructor_lookup or {}
+    name, staff_id = (
+        lookup.get(slot.instructor_id, (None, None))
+        if slot.instructor_id is not None
+        else (None, None)
+    )
     return {
         "slot_id": str(slot.id),
         "course_code": course_code,
@@ -921,6 +991,8 @@ def _slot_summary(slot: ClassScheduleSlot, course_code: str) -> dict[str, Any]:
         "instructor_id": (
             str(slot.instructor_id) if slot.instructor_id else None
         ),
+        "instructor_name": name,
+        "instructor_staff_id": staff_id,
     }
 
 
