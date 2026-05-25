@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.logging import get_logger, write_audit_log
+from app.modules.auth.models import User
 from app.modules.course.agents import (
     AcademicAdvisoryAgent, AcademicSchedulingAgent, Advice, BatchResult,
     ConsultationResult, CurriculumComplianceAgent, EnrollmentAdjustmentAgent,
@@ -1985,13 +1986,20 @@ class SchedulingService:
         if section is None:
             raise EntityNotFoundError("Section", str(section_id))
 
+        # Instructor + User are LEFT-JOINed so a slot whose instructor
+        # has never been assigned (instructor_id NULL) still comes
+        # back — it just has nulls in the name/staff_id columns and
+        # the UI renders "TBA".
         slot_rows = (
             await self.db.execute(
-                select(ClassScheduleSlot, Course).join(
-                    Course, Course.id == ClassScheduleSlot.course_id,
-                ).where(
-                    ClassScheduleSlot.section_id == section_id,
-                ).order_by(
+                select(ClassScheduleSlot, Course, Instructor, User)
+                .join(Course, Course.id == ClassScheduleSlot.course_id)
+                .outerjoin(
+                    Instructor, Instructor.id == ClassScheduleSlot.instructor_id,
+                )
+                .outerjoin(User, User.id == Instructor.user_id)
+                .where(ClassScheduleSlot.section_id == section_id)
+                .order_by(
                     ClassScheduleSlot.day_of_week.asc(),
                     ClassScheduleSlot.start_time.asc(),
                 )
@@ -2019,9 +2027,16 @@ class SchedulingService:
                     "instructor_id": (
                         str(slot.instructor_id) if slot.instructor_id else None
                     ),
+                    "instructor_name": (
+                        f"{user.first_name} {user.last_name}".strip()
+                        if user is not None else None
+                    ),
+                    "instructor_staff_id": (
+                        instructor.instructor_id if instructor is not None else None
+                    ),
                     "room": slot.room,
                 }
-                for slot, course in slot_rows
+                for slot, course, instructor, user in slot_rows
             ],
         }
 

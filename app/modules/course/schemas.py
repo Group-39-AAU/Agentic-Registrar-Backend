@@ -351,6 +351,12 @@ class ClassScheduleSlotRead(BaseModel):
     start_time: str
     end_time: str
     instructor_id: Optional[uuid.UUID] = None
+    # Human-readable instructor identity, joined in by the service
+    # layer so the timetable can show "Alemayehu Bekele · STAFF/0001/10"
+    # without the client doing a second round-trip. Both are nullable
+    # because a slot can be placed before an instructor is assigned.
+    instructor_name: Optional[str] = None
+    instructor_staff_id: Optional[str] = None
     room: Optional[str] = None
     # New fields surfaced by /me/schedule once the add/drop schedule
     # delta path lands. Optional so cohort-only consumers
