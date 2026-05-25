@@ -117,6 +117,18 @@ class DepartmentHeadGradingService:
         ``InstructorService._require_dh_or_admin`` in Track A so the
         permission model is consistent across modules.
         """
+        user, _ = await self._resolve_dh_with_department(user_id)
+        return user
+
+    async def _resolve_dh_with_department(
+        self, user_id: uuid.UUID,
+    ) -> tuple[User, Optional[str]]:
+        """
+        Same auth as :meth:`_resolve_dh_or_403` but also returns the
+        caller's department when they are a Department Head. Admins
+        get ``None`` so callers can decide whether to scope to a
+        department or leave it open.
+        """
         user = (
             await self.db.execute(
                 select(User).where(User.id == user_id)
@@ -125,7 +137,7 @@ class DepartmentHeadGradingService:
         if user is None:
             raise DepartmentHeadRoleRequiredError()
         if user.role == UserRole.ADMIN:
-            return user
+            return user, None
         officer = (
             await self.db.execute(
                 select(CourseManagementOfficer).where(
@@ -136,7 +148,7 @@ class DepartmentHeadGradingService:
         ).scalar_one_or_none()
         if officer is None or officer.role != OfficerRole.DEPARTMENT_HEAD:
             raise DepartmentHeadRoleRequiredError()
-        return user
+        return user, officer.department
 
     # ── Queue filter options ────────────────────────────────────
 
@@ -191,17 +203,38 @@ class DepartmentHeadGradingService:
         user_id: uuid.UUID,
         term_id: Optional[uuid.UUID] = None,
         department: Optional[str] = None,
+        statuses: Optional[set[GradeSubmissionStatus]] = None,
     ) -> list[DepartmentHeadQueueEntry]:
         """
-        Every SUBMITTED or FLAGGED batch, sorted by ``submitted_at``
-        ascending (oldest first). Optional filters narrow the queue
-        by term or department.
+        Batches in the requested statuses, sorted by ``submitted_at``.
 
-        Convenience fields: ``latest_agent_verdict`` and
-        ``flag_count`` from the most recent agent review, plus
-        ``roster_total`` so the DH can size up the batch at a glance.
+        Status defaults to ``{SUBMITTED, FLAGGED}`` (the DH's pending
+        queue). Pass ``{AUTHORISED}`` or ``{REJECTED}`` to surface
+        history. The sort flips to most-recent-first whenever the
+        request includes a terminal status so closed batches read in
+        reverse-chronological order.
+
+        Department auto-scopes to the caller's
+        ``CourseManagementOfficer.department`` when they are a DH
+        and ``department`` is not passed. Admins see every department
+        by default; they can still pass ``department`` to filter.
         """
-        await self._resolve_dh_or_403(user_id)
+        _user, caller_department = await self._resolve_dh_with_department(
+            user_id,
+        )
+        effective_statuses = statuses or {
+            GradeSubmissionStatus.SUBMITTED,
+            GradeSubmissionStatus.FLAGGED,
+        }
+        terminal_statuses = {
+            GradeSubmissionStatus.AUTHORISED,
+            GradeSubmissionStatus.REJECTED,
+        }
+        order_clause = (
+            GradeBatch.submitted_at.desc()
+            if effective_statuses & terminal_statuses
+            else GradeBatch.submitted_at.asc()
+        )
 
         stmt = (
             select(GradeBatch, Section, Course, AcademicTerm, Instructor, User)
@@ -211,18 +244,16 @@ class DepartmentHeadGradingService:
             .join(Instructor, Instructor.id == GradeBatch.instructor_id)
             .join(User, User.id == Instructor.user_id)
             .where(
-                GradeBatch.status.in_({
-                    GradeSubmissionStatus.SUBMITTED,
-                    GradeSubmissionStatus.FLAGGED,
-                }),
+                GradeBatch.status.in_(effective_statuses),
                 GradeBatch.is_deleted == False,  # noqa: E712
             )
-            .order_by(GradeBatch.submitted_at.asc())
+            .order_by(order_clause)
         )
         if term_id is not None:
             stmt = stmt.where(GradeBatch.term_id == term_id)
-        if department is not None:
-            stmt = stmt.where(Section.department == department)
+        scoped_department = department or caller_department
+        if scoped_department is not None:
+            stmt = stmt.where(Section.department == scoped_department)
         rows = (await self.db.execute(stmt)).all()
 
         entries: list[DepartmentHeadQueueEntry] = []

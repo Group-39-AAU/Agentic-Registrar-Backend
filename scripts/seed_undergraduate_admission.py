@@ -87,7 +87,7 @@ PROGRAMS = [
 
 MOE_RECORDS = [
     {
-        "admission_number": "2955397", "full_name": "Abebe Kebede", "exam_year": 2024, "stream": StreamType.NATURAL,
+        "admission_number": "2955397", "full_name": "Abenezer Seifu", "exam_year": 2024, "stream": StreamType.NATURAL,
         "subjects": {"Mathematics": 92, "Physics": 85, "Chemistry": 78, "Biology": 80, "English": 75, "Aptitude": 88},
         "total_score": 498.0,
     },

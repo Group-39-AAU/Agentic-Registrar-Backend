@@ -2157,8 +2157,12 @@ async def seed() -> None:
         await _seed_grades(session, terms, courses_by_code)
         await _seed_standing_demo_cohort(session, terms)
 
-        # Track B PR 1 demo — fully self-contained scenario in its own term.
-        await _seed_track_b_roster(session)
+        # Track B PR 1 demo — skipped so the open 2026/27 phase 1 term
+        # starts with no sections or schedule slots, letting Department
+        # Heads exercise the allocate / generate-schedule flow from a
+        # clean state. Re-enable when add/drop demos need pre-seeded
+        # sections.
+        # await _seed_track_b_roster(session)
 
         # Final summary so it's obvious which terms ended up in the DB.
         await _print_term_state(session)
@@ -2166,7 +2170,7 @@ async def seed() -> None:
     await engine.dispose()
     print(
         "\n🎉 Course Management seed complete "
-        "(Phase 0 + Track A samples + Track B roster + extras)."
+        "(Phase 0 + Track A samples + extras)."
     )
 
 
