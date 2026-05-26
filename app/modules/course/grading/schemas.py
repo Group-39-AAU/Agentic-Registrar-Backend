@@ -483,20 +483,29 @@ class TranscriptCourseEntry(BaseModel):
 
 class TranscriptTermEntry(BaseModel):
     """
-    All AUTHORISED grades for one term, plus the per-term GPA.
+    All AUTHORISED grades for one curriculum semester, plus the per-
+    semester GPA.
+
+    The transcript groups grades by ``Course.semester`` (1–10), not
+    by the underlying ``term_id`` they were recorded against, because
+    a student's grade report is meant to read chronologically as
+    "Year I Sem One … Year V Sem One". ``term_id`` here is a
+    synthetic UUID derived from (student, curriculum semester) so the
+    UI has a stable React key.
 
     Track C (academic standing) bolt-on: when the Department Head has
-    authorised an :class:`AcademicStanding` row for this (student,
-    term), the term entry surfaces the official status the student
-    received. Both fields are ``None`` for terms whose standing
-    hasn't been computed/authorised yet — additive, so legacy
-    callers ignoring the new fields keep working.
+    authorised an :class:`AcademicStanding` row for the underlying
+    actual term, the entry surfaces the official status. Both fields
+    are ``None`` until that authorisation lands.
     """
     term_id: uuid.UUID
     term_name: str
     term_phase: str
     term_start_date: date
     term_end_date: date
+    # Curriculum sem 1–10 → Year I–V (ceil(sem/2)). Lets the UI render
+    # "Year V, Semester : One" headers without re-deriving the math.
+    year_in_program: int
     courses: list[TranscriptCourseEntry]
     term_gpa: Optional[float]   # weighted average of grade_points / credit_hours
     total_credit_hours: int

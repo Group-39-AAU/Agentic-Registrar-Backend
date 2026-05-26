@@ -264,6 +264,17 @@ class StudentTranscriptService:
             if total_credit > 0 else None
         )
 
+        # Year-in-program (I–V) derived from the highest curriculum
+        # semester represented in this term. After the seed split each
+        # term holds exactly one curriculum semester so max == min, but
+        # using max keeps the label sensible for legacy data that
+        # bundled multiple semesters into a single ``history_term``.
+        curriculum_semesters = [c.semester for c in courses]
+        year_in_program = (
+            (max(curriculum_semesters) + 1) // 2
+            if curriculum_semesters else 0
+        )
+
         standing = (
             standings_by_term.get(term.id) if standings_by_term else None
         )
@@ -273,6 +284,7 @@ class StudentTranscriptService:
             term_phase=term.phase.value,
             term_start_date=term.start_date,
             term_end_date=term.end_date,
+            year_in_program=year_in_program,
             courses=course_entries,
             term_gpa=term_gpa,
             total_credit_hours=total_credit,
