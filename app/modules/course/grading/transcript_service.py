@@ -81,6 +81,32 @@ class StudentTranscriptService:
         grades = await self._load_authorised_grades(student.id)
         return await self._compose_transcript(student, grades)
 
+    async def get_transcript_by_student_id(
+        self,
+        *,
+        student_id: uuid.UUID,
+    ) -> TranscriptResponse:
+        """
+        Same transcript composition as :meth:`get_transcript`, but
+        resolves the target by the ``Student.id`` directly instead of
+        the caller's ``user_id``. Used by officer-facing endpoints
+        (DH add/drop review, registrar lookup) where the caller is
+        looking at another user's transcript — the auth check lives
+        in the caller, not here.
+        """
+        student = (
+            await self.db.execute(
+                select(Student).where(
+                    Student.id == student_id,
+                    Student.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if student is None:
+            raise EntityNotFoundError("Student", str(student_id))
+        grades = await self._load_authorised_grades(student.id)
+        return await self._compose_transcript(student, grades)
+
     # ── Per-term grades ─────────────────────────────────────────
 
     async def get_term_grades(

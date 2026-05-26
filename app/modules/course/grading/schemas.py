@@ -523,3 +523,27 @@ class TranscriptResponse(BaseModel):
     cgpa: Optional[float]
     total_credit_hours_completed: int
 
+
+# ══════════════════════════════════════════════════════════════
+#  PR 4 — Officer add/drop review context
+# ══════════════════════════════════════════════════════════════
+# Bundled payload the DH add/drop detail page uses to render the
+# student's history + current registration alongside the batch
+# items. Lives here (not in course/schemas.py) so it can ride on
+# TranscriptResponse without forcing the course module to import the
+# grading subpackage.
+
+from app.modules.course.schemas import RegistrationResponse  # noqa: E402
+
+
+class AddDropBatchStudentContextResponse(BaseModel):
+    """
+    Per-batch student context the DH detail page renders next to the
+    batch items. Combines the student's complete AUTHORISED
+    transcript (grouped per curriculum semester) with their current
+    registration for the batch's term, so the reviewer has the
+    "why this matters" picture without two extra round trips.
+    """
+    transcript: TranscriptResponse
+    current_registration: Optional[RegistrationResponse] = None
+

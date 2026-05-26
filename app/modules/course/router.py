@@ -80,6 +80,12 @@ from app.modules.course.service import (
     AddDropService, AdvisoryService, InstructorService, OnboardingService,
     RegistrationService, SchedulingService, TermService,
 )
+from app.modules.course.grading.schemas import (
+    AddDropBatchStudentContextResponse,
+)
+from app.modules.course.grading.transcript_service import (
+    StudentTranscriptService,
+)
 from app.shared.email.service import EmailService
 from app.shared.enums import AddDropBatchStatus, OfficerRole, UserRole
 
@@ -1237,6 +1243,61 @@ async def officer_override_add_drop_batch(
         raise HTTPException(status.HTTP_409_CONFLICT, exc.detail)
     except EntityNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+
+@router.get(
+    "/officer/add-drop/batches/{batch_id}/student-context",
+    response_model=AddDropBatchStudentContextResponse,
+    summary="Transcript + current registration for an add/drop batch's student",
+)
+async def get_officer_add_drop_batch_student_context(
+    batch_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Department-head context payload for the add/drop review page —
+    bundles the student's complete AUTHORISED transcript (grouped by
+    curriculum semester) with the registration the batch is acting
+    on. One round trip so the DH detail page can render the student's
+    history and current courses alongside the batch items without two
+    extra fetches.
+
+    Auth: department-head (scoped to the batch's student department)
+    or admin. 403 otherwise.
+    """
+    svc = AddDropService(db)
+    try:
+        batch, registration = await svc.get_batch_student_context(
+            batch_id, user_id=current_user.id,
+        )
+    except UnauthorizedActorError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, exc.detail)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+    transcript_svc = StudentTranscriptService(db)
+    try:
+        transcript = await transcript_svc.get_transcript_by_student_id(
+            student_id=batch.student_id,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+
+    reg_response: Optional[RegistrationResponse] = None
+    if registration is not None:
+        reg_response = RegistrationResponse.model_validate(
+            registration, from_attributes=True,
+        )
+        if registration.term is not None:
+            reg_response = reg_response.model_copy(
+                update={"term_name": registration.term.term_name},
+            )
+
+    return AddDropBatchStudentContextResponse(
+        transcript=transcript,
+        current_registration=reg_response,
+    )
 
 
 @router.post(
