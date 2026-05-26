@@ -57,6 +57,7 @@ Usage:
 import asyncio
 import uuid
 from datetime import date, time, datetime, timezone
+from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -113,6 +114,64 @@ def _uid_tb(*parts: str) -> uuid.UUID:
 # registration portal is testable out of the box. The other three stay
 # closed and officers can flip the windows freely.
 TERMS = [
+    # Historic terms — backfill the calendar so each student's prior
+    # semesters can land in a real per-semester AcademicTerm, not a
+    # single bundled "history_term". The oldest year accommodates the
+    # /15 batch's first semester (Sep 2022).
+    {
+        "id": _uid("term", "2022-2023-phase-1"),
+        "term_name": "2022/2023",
+        "phase": AcademicPhase.ONE,
+        "start_date": date(2022, 9, 1),
+        "end_date": date(2023, 1, 31),
+        "is_open": False,
+        "description": "Phase One of the 2022/2023 academic year (Sep–Jan).",
+    },
+    {
+        "id": _uid("term", "2022-2023-phase-2"),
+        "term_name": "2022/2023",
+        "phase": AcademicPhase.TWO,
+        "start_date": date(2023, 2, 1),
+        "end_date": date(2023, 6, 30),
+        "is_open": False,
+        "description": "Phase Two of the 2022/2023 academic year (Feb–Jun).",
+    },
+    {
+        "id": _uid("term", "2023-2024-phase-1"),
+        "term_name": "2023/2024",
+        "phase": AcademicPhase.ONE,
+        "start_date": date(2023, 9, 1),
+        "end_date": date(2024, 1, 31),
+        "is_open": False,
+        "description": "Phase One of the 2023/2024 academic year (Sep–Jan).",
+    },
+    {
+        "id": _uid("term", "2023-2024-phase-2"),
+        "term_name": "2023/2024",
+        "phase": AcademicPhase.TWO,
+        "start_date": date(2024, 2, 1),
+        "end_date": date(2024, 6, 30),
+        "is_open": False,
+        "description": "Phase Two of the 2023/2024 academic year (Feb–Jun).",
+    },
+    {
+        "id": _uid("term", "2024-2025-phase-1"),
+        "term_name": "2024/2025",
+        "phase": AcademicPhase.ONE,
+        "start_date": date(2024, 9, 1),
+        "end_date": date(2025, 1, 31),
+        "is_open": False,
+        "description": "Phase One of the 2024/2025 academic year (Sep–Jan).",
+    },
+    {
+        "id": _uid("term", "2024-2025-phase-2"),
+        "term_name": "2024/2025",
+        "phase": AcademicPhase.TWO,
+        "start_date": date(2025, 2, 1),
+        "end_date": date(2025, 6, 30),
+        "is_open": False,
+        "description": "Phase Two of the 2024/2025 academic year (Feb–Jun).",
+    },
     {
         "id": _uid("term", "2025-2026-phase-1"),
         "term_name": "2025/2026",
@@ -1435,6 +1494,35 @@ def _seeded_letter_for(
     return _SEED_GRADE_CYCLE[bucket]
 
 
+def _term_for_student_semester(
+    *,
+    student: Student,
+    curriculum_semester: int,
+    terms_by_key: dict[tuple[str, AcademicPhase], AcademicTerm],
+) -> Optional[AcademicTerm]:
+    """
+    Resolve the academic term the student took ``curriculum_semester``
+    in. Uses the trailing batch suffix on ``student.student_id``
+    (e.g. ``"UGR/0005/15"`` → /15, started Sep 2022) and the parity
+    of the semester (odd = phase ONE, even = phase TWO).
+
+    Returns None when the batch suffix can't be parsed or the
+    corresponding (term_name, phase) isn't seeded — caller decides
+    whether to skip or fall back.
+    """
+    try:
+        batch_year = int(student.student_id.rsplit("/", 1)[-1])
+    except (ValueError, IndexError):
+        return None
+    gregorian_start = 2007 + batch_year  # /19 → 2026
+    term_year = gregorian_start + (curriculum_semester - 1) // 2
+    phase = (
+        AcademicPhase.ONE if curriculum_semester % 2 == 1
+        else AcademicPhase.TWO
+    )
+    return terms_by_key.get((f"{term_year}/{term_year + 1}", phase))
+
+
 async def _seed_grades(
     session: AsyncSession,
     terms: list[AcademicTerm],
@@ -1442,8 +1530,11 @@ async def _seed_grades(
 ) -> None:
     """
     Seed AUTHORISED grades for every seeded student's completed
-    semesters. Each row is keyed by ``_uid("grade", student_id,
-    course_code)`` so the seed is idempotent.
+    semesters. Each grade lands in the *actual* academic term the
+    student took that semester in, derived from the batch year on the
+    student number (e.g. /15 sem 1 = 2022/23 phase ONE, /15 sem 8 =
+    2025/26 phase TWO). Each row is keyed by ``_uid("grade",
+    student_id, course_code)`` so the seed is idempotent.
     """
     students = (await session.execute(select(Student))).scalars().all()
     instructors = (await session.execute(select(Instructor))).scalars().all()
@@ -1456,24 +1547,35 @@ async def _seed_grades(
 
     instructor_user_id = instructors[0].user_id
     officer_user_id = officers[0].user_id
-    history_term = min(terms, key=lambda t: t.start_date)
+    fallback_term = min(terms, key=lambda t: t.start_date)
+    terms_by_key = {(t.term_name, t.phase): t for t in terms}
 
     existing = (await session.execute(select(Grade))).scalars().all()
     existing_pairs = {(g.student_id, g.course_id, g.term_id) for g in existing}
 
     new_count = 0
+    missing_terms: set[str] = set()
     for student in students:
         if student.current_semester <= 1:
             continue
         if not student.department:
             continue
         for sem in range(1, student.current_semester):
+            sem_term = _term_for_student_semester(
+                student=student,
+                curriculum_semester=sem,
+                terms_by_key=terms_by_key,
+            ) or fallback_term
+            if sem_term is fallback_term:
+                missing_terms.add(
+                    f"{student.student_id} sem {sem}"
+                )
             for slot in range(1, 5):
                 code = _course_code(student.department, sem, slot)
                 course = courses_by_code.get(code)
                 if course is None:
                     continue
-                key = (student.id, course.id, history_term.id)
+                key = (student.id, course.id, sem_term.id)
                 if key in existing_pairs:
                     continue
 
@@ -1500,7 +1602,7 @@ async def _seed_grades(
                     id=_uid("grade", student.student_id, code),
                     student_id=student.id,
                     course_id=course.id,
-                    term_id=history_term.id,
+                    term_id=sem_term.id,
                     letter_grade=letter,
                     numeric_score=numeric,
                     credit_hours=course.credit_hours,
@@ -1522,6 +1624,12 @@ async def _seed_grades(
         )
     else:
         print("⚠️  All backfill grades already present — skipping.")
+    if missing_terms:
+        print(
+            f"⚠️  {len(missing_terms)} (student, sem) backfill rows "
+            f"fell back to '{fallback_term.term_name}' because no real "
+            f"term matched the derived year/phase."
+        )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1535,22 +1643,25 @@ async def _seed_standing_demo_cohort(
     courses_by_code: dict[str, Course],
 ) -> None:
     """
-    Make ``history_term`` browsable in the Track C standing flow.
+    Make the Track C standing flow browsable across the real per-
+    semester calendar. Now that each student's grades live in their
+    *actual* sem-1 term (derived from their batch year), the demo
+    cohort's registrations + RegistrationCourse rows have to follow
+    the same per-student term — otherwise the all-graded gate sees
+    zero matching grades and the student is skipped.
 
-    For every demo student, also seed ``RegistrationCourse`` rows so
-    the all-graded gate on standing compute can evaluate the student's
-    expected vs. graded course set:
-
-      * Rows are added for each course the student has an authorised
-        grade for in ``history_term`` → expected set matches graded
-        set → the student passes the gate and is computed.
-      * The *last* student of each department additionally gets one
-        ``RegistrationCourse`` for an un-graded "next semester" course
-        → demonstrates the pending-grades skip path so the seeded
-        demo shows the new feature working (compute returns the
-        student in ``pending_grades_rows`` instead of writing a row).
+    For every demo student we:
+      * Resolve their sem-1 AcademicTerm via the batch year.
+      * Create (or reuse) one (dept, sem-1-term) Section so the
+        cohort shares a section per academic year.
+      * Mirror their authorised grades *for that sem-1 term* as
+        RegistrationCourse rows so expected == graded → gate passes.
+      * For the last student of each (dept, sem-1-term) cohort, add
+        one un-graded "next semester" RegistrationCourse to keep the
+        pending-grades skip path demoable.
     """
-    history_term = min(terms, key=lambda t: t.start_date)
+    fallback_term = min(terms, key=lambda t: t.start_date)
+    terms_by_key = {(t.term_name, t.phase): t for t in terms}
 
     students = (
         await session.execute(
@@ -1565,23 +1676,35 @@ async def _seed_standing_demo_cohort(
         print("⚠️  Skipping standing demo cohort — no eligible students.")
         return
 
-    by_dept: dict[str, list[Student]] = {}
+    # Group by (department, sem-1 term) so each cohort shares a
+    # single section per academic year. Students in the same batch
+    # naturally fall into the same group.
+    by_cohort: dict[tuple[str, uuid.UUID], list[Student]] = {}
+    sem1_term_by_cohort: dict[tuple[str, uuid.UUID], AcademicTerm] = {}
     for stu in students:
-        by_dept.setdefault(stu.department, []).append(stu)
-    for dept_list in by_dept.values():
-        dept_list.sort(key=lambda s: s.student_id)
+        sem1_term = _term_for_student_semester(
+            student=stu,
+            curriculum_semester=1,
+            terms_by_key=terms_by_key,
+        ) or fallback_term
+        key = (stu.department, sem1_term.id)
+        by_cohort.setdefault(key, []).append(stu)
+        sem1_term_by_cohort[key] = sem1_term
+    for stu_list in by_cohort.values():
+        stu_list.sort(key=lambda s: s.student_id)
 
     new_sections = 0
     new_regs = 0
     new_reg_courses = 0
     pending_demo_count = 0
-    for dept, dept_students in by_dept.items():
-        cohort = dept_students[:5]
+    for (dept, sem1_term_id), cohort_students in by_cohort.items():
+        cohort = cohort_students[:5]
         if not cohort:
             continue
+        sem1_term = sem1_term_by_cohort[(dept, sem1_term_id)]
 
         section_id = _uid(
-            "standing-demo-section", str(history_term.id), dept,
+            "standing-demo-section", str(sem1_term.id), dept,
         )
         section = (await session.execute(
             select(Section).where(Section.id == section_id)
@@ -1590,7 +1713,7 @@ async def _seed_standing_demo_cohort(
         if section is None:
             section = Section(
                 id=section_id,
-                term_id=history_term.id,
+                term_id=sem1_term.id,
                 department=dept,
                 semester=1,
                 section_code="A",
@@ -1605,17 +1728,17 @@ async def _seed_standing_demo_cohort(
             existing = (await session.execute(
                 select(Registration).where(
                     Registration.student_id == stu.id,
-                    Registration.term_id == history_term.id,
+                    Registration.term_id == sem1_term.id,
                 )
             )).scalar_one_or_none()
             if existing is None:
                 reg = Registration(
                     id=_uid(
                         "standing-demo-reg",
-                        str(stu.id), str(history_term.id),
+                        str(stu.id), str(sem1_term.id),
                     ),
                     student_id=stu.id,
-                    term_id=history_term.id,
+                    term_id=sem1_term.id,
                     status=RegistrationStatus.REGISTERED,
                     sponsorship_type=(
                         stu.sponsorship_type or SponsorshipType.GOVERNMENT
@@ -1633,12 +1756,12 @@ async def _seed_standing_demo_cohort(
                     reg.status = RegistrationStatus.REGISTERED
 
             # ── Expected courses for the all-graded gate ──
-            # Mirror the student's authorised grades for this term so
-            # expected == graded → gate passes.
+            # Mirror the student's authorised grades *for sem-1 term*
+            # so expected == graded → gate passes.
             grade_course_ids = (await session.execute(
                 select(Grade.course_id).where(
                     Grade.student_id == stu.id,
-                    Grade.term_id == history_term.id,
+                    Grade.term_id == sem1_term.id,
                     Grade.status == GradeSubmissionStatus.AUTHORISED,
                     Grade.is_deleted == False,  # noqa: E712
                 )
@@ -1699,13 +1822,12 @@ async def _seed_standing_demo_cohort(
             f"✅ Seeded standing demo cohort: {new_sections} sections, "
             f"{new_regs} registrations, {new_reg_courses} expected-"
             f"course rows ({pending_demo_count} deliberately ungraded "
-            f"to demo the pending-grades gate) "
-            f"into '{history_term.term_name}'."
+            f"to demo the pending-grades gate) across "
+            f"{len(by_cohort)} per-batch (dept, sem-1) cohorts."
         )
     else:
         print(
-            f"⚠️  Standing demo cohort already present in "
-            f"'{history_term.term_name}' — skipping."
+            "⚠️  Standing demo cohort already present — skipping."
         )
 
 

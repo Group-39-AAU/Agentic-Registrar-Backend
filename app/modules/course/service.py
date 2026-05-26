@@ -3111,6 +3111,39 @@ class AddDropService:
             ).scalars().all()
         )
 
+    async def get_batch_student_context(
+        self, batch_id: uuid.UUID, *, user_id: uuid.UUID,
+    ) -> tuple[AddDropBatch, Optional[Registration]]:
+        """
+        DH/admin-only fetch of (batch, registration) used by the
+        add/drop review page to render the student's full registration
+        alongside the batch items. Returns the batch and the
+        registration for the batch's term — same shape ``get_batch``
+        returns, but eager-loads the registration's courses + course
+        so :class:`RegistrationResponse` can serialise without a
+        MissingGreenlet lazy-load. The accompanying transcript is
+        composed separately in the router via
+        :class:`StudentTranscriptService`.
+        """
+        _user, dh_dept = await self._resolve_dh_or_403(user_id)
+        batch = await self._get_batch_or_404(batch_id)
+        await self._authorize_batch_for_department(batch, dh_dept)
+        registration = (
+            await self.db.execute(
+                select(Registration)
+                .where(
+                    Registration.id == batch.registration_id,
+                    Registration.is_deleted == False,  # noqa: E712
+                )
+                .options(
+                    selectinload(Registration.courses)
+                    .selectinload(RegistrationCourse.course),
+                    selectinload(Registration.term),
+                )
+            )
+        ).scalar_one_or_none()
+        return batch, registration
+
     async def list_pending_batches(
         self,
         *,

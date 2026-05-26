@@ -483,20 +483,29 @@ class TranscriptCourseEntry(BaseModel):
 
 class TranscriptTermEntry(BaseModel):
     """
-    All AUTHORISED grades for one term, plus the per-term GPA.
+    All AUTHORISED grades for one curriculum semester, plus the per-
+    semester GPA.
+
+    The transcript groups grades by ``Course.semester`` (1–10), not
+    by the underlying ``term_id`` they were recorded against, because
+    a student's grade report is meant to read chronologically as
+    "Year I Sem One … Year V Sem One". ``term_id`` here is a
+    synthetic UUID derived from (student, curriculum semester) so the
+    UI has a stable React key.
 
     Track C (academic standing) bolt-on: when the Department Head has
-    authorised an :class:`AcademicStanding` row for this (student,
-    term), the term entry surfaces the official status the student
-    received. Both fields are ``None`` for terms whose standing
-    hasn't been computed/authorised yet — additive, so legacy
-    callers ignoring the new fields keep working.
+    authorised an :class:`AcademicStanding` row for the underlying
+    actual term, the entry surfaces the official status. Both fields
+    are ``None`` until that authorisation lands.
     """
     term_id: uuid.UUID
     term_name: str
     term_phase: str
     term_start_date: date
     term_end_date: date
+    # Curriculum sem 1–10 → Year I–V (ceil(sem/2)). Lets the UI render
+    # "Year V, Semester : One" headers without re-deriving the math.
+    year_in_program: int
     courses: list[TranscriptCourseEntry]
     term_gpa: Optional[float]   # weighted average of grade_points / credit_hours
     total_credit_hours: int
@@ -513,4 +522,28 @@ class TranscriptResponse(BaseModel):
     terms: list[TranscriptTermEntry]
     cgpa: Optional[float]
     total_credit_hours_completed: int
+
+
+# ══════════════════════════════════════════════════════════════
+#  PR 4 — Officer add/drop review context
+# ══════════════════════════════════════════════════════════════
+# Bundled payload the DH add/drop detail page uses to render the
+# student's history + current registration alongside the batch
+# items. Lives here (not in course/schemas.py) so it can ride on
+# TranscriptResponse without forcing the course module to import the
+# grading subpackage.
+
+from app.modules.course.schemas import RegistrationResponse  # noqa: E402
+
+
+class AddDropBatchStudentContextResponse(BaseModel):
+    """
+    Per-batch student context the DH detail page renders next to the
+    batch items. Combines the student's complete AUTHORISED
+    transcript (grouped per curriculum semester) with their current
+    registration for the batch's term, so the reviewer has the
+    "why this matters" picture without two extra round trips.
+    """
+    transcript: TranscriptResponse
+    current_registration: Optional[RegistrationResponse] = None
 
