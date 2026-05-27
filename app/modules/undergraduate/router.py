@@ -30,6 +30,7 @@ from app.modules.undergraduate.schemas import (
     ApplicationListResponse,
     ApplicationResponse,
     ApplicationStatusUpdate,
+    CorrectionContextResponse,
     CorrectionUpdateRequest,
     DecisionCreate,
     DecisionResponse,
@@ -447,6 +448,35 @@ async def get_flag_context(
     try:
         return await svc.get_flag_context(application_id)
     except EntityNotFoundError as e:
+        _handle_domain_error(e)
+
+
+@router.get(
+    "/applications/{application_id}/correction-context",
+    response_model=CorrectionContextResponse,
+)
+async def get_correction_context(
+    application_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Student-facing reasoning bundle for an application in
+    CHANGES_REQUESTED. Returns the officer's plain-language note,
+    the agent's natural-language summary, and humanized reasoning
+    steps. Empty fields when status is not CHANGES_REQUESTED.
+
+    Access: the applicant who owns the application, or an officer /
+    admin. Returns 403 otherwise.
+    """
+    svc = ApplicationService(db)
+    try:
+        return await svc.get_correction_context(
+            application_id,
+            actor_id=current_user.id,
+            actor_role=current_user.role,
+        )
+    except (EntityNotFoundError, UnauthorizedApplicationAccessError) as e:
         _handle_domain_error(e)
 
 

@@ -106,6 +106,25 @@ class FlagContextResponse(BaseModel):
     traces: list[dict[str, str]] = Field(default_factory=list)
 
 
+class CorrectionReasoningStep(BaseModel):
+    """One human-readable step from the agent's reasoning trace."""
+    label: str
+    detail: str
+
+
+class CorrectionContextResponse(BaseModel):
+    """
+    Student-facing reasoning bundle for an application sitting in
+    CHANGES_REQUESTED. Contains only natural-language fields — no
+    internal step names, decision enums, or confidence scores — so
+    the student can read it directly and understand what to fix.
+    """
+
+    officer_note: Optional[str] = None
+    agent_summary: Optional[str] = None
+    reasoning_steps: list[CorrectionReasoningStep] = Field(default_factory=list)
+
+
 class ReRunChecksResponse(BaseModel):
     """Response: status after re-running post-payment checks."""
 
