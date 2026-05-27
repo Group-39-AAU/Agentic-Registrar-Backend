@@ -144,6 +144,7 @@ def test_decide_appends_trace():
 
 @pytest.mark.asyncio
 async def test_pipeline_pass_for_valid_government_application():
+    # LangGraph invoke() returns a dict when the state is a dataclass.
     result = await run_intake_validation(
         application_id=uuid.uuid4(),
         sponsorship_type=SponsorshipType.GOVERNMENT.value,
@@ -155,8 +156,8 @@ async def test_pipeline_pass_for_valid_government_application():
         payment_status=PaymentStatus.COMPLETED.value,
         current_status="PAYMENT_VERIFIED",
     )
-    assert result.overall_result == "PASS"
-    assert not result.checks_failed
+    assert result["overall_result"] == "PASS"
+    assert not result["checks_failed"]
 
 
 @pytest.mark.asyncio
@@ -172,8 +173,8 @@ async def test_pipeline_flags_self_sponsored_without_program_choices():
         payment_status=PaymentStatus.COMPLETED.value,
         current_status="PAYMENT_VERIFIED",
     )
-    assert result.overall_result == "FLAG_FOR_REVIEW"
-    assert "profile_completeness" in result.checks_failed
+    assert result["overall_result"] == "FLAG_FOR_REVIEW"
+    assert "profile_completeness" in result["checks_failed"]
 
 
 @pytest.mark.asyncio
@@ -189,8 +190,8 @@ async def test_pipeline_flags_unpaid_application():
         payment_status=PaymentStatus.PENDING.value,
         current_status="SUBMITTED",
     )
-    assert result.overall_result == "FLAG_FOR_REVIEW"
-    assert "payment_verified" in result.checks_failed
+    assert result["overall_result"] == "FLAG_FOR_REVIEW"
+    assert "payment_verified" in result["checks_failed"]
 
 
 @pytest.mark.asyncio
@@ -206,5 +207,5 @@ async def test_pipeline_result_always_contains_traces():
         payment_status=PaymentStatus.COMPLETED.value,
         current_status="PAYMENT_VERIFIED",
     )
-    step_names = {t["step_name"] for t in result.traces}
+    step_names = {t["step_name"] for t in result["traces"]}
     assert {"check_profile_complete", "check_payment_verified", "decide"} <= step_names
