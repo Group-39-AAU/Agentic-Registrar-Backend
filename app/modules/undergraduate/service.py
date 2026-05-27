@@ -9,6 +9,7 @@ Services own all business logic:
     - Transaction boundary control (commit once).
 """
 
+import re
 import uuid
 from datetime import datetime
 import random
@@ -60,6 +61,8 @@ from app.modules.undergraduate.schemas import (
     AdmissionTermResponse,
     ApplicationResponse,
     ApplicationStatusUpdate,
+    CorrectionContextResponse,
+    CorrectionReasoningStep,
     CorrectionUpdateRequest,
     DecisionCreate,
     DocumentCreate,
@@ -671,6 +674,191 @@ class ApplicationService:
             latest_ai_confidence=latest_eval.confidence_score if latest_eval else None,
             latest_ai_summary=latest_eval.summary_reasoning if latest_eval else None,
             traces=traces,
+        )
+
+    # Step-name → student-friendly label. Internal step ids are never
+    # shown to the student; this map rewrites them so the reasoning
+    # card reads as plain English. Steps absent from the map are
+    # dropped rather than leaked.
+    _STUDENT_STEP_LABELS = {
+        "moe_lookup": "Checking Ministry of Education records",
+        "name_cross_check": "Comparing your name to the official record",
+        "stream_cross_check": "Comparing your stream to the official record",
+    }
+
+    # Per-(step, status) safe detail message. We NEVER show the agent's
+    # raw ``reasoning_log`` to the student because the live credential
+    # lookup agent embeds the official MoE value inside its FAIL
+    # strings (e.g. ``"FAIL: 'X' does not match 'Y'"``), which would
+    # let a student impersonate the matched record. Officer-facing
+    # views remain unaffected; ``/flag-context`` still returns the
+    # raw logs.
+    #
+    # Status is the first whitespace-delimited token of the reasoning
+    # log (``OK`` / ``FAIL`` / ``SKIP`` / ``WARNING``). ``None`` drops
+    # the step — currently we drop OK/SKIP so the student sees only
+    # what they need to act on.
+    _STUDENT_STEP_DETAILS: dict[tuple[str, str], Optional[str]] = {
+        ("moe_lookup", "OK"): None,
+        ("moe_lookup", "FAIL"): (
+            "We could not find an official record matching your "
+            "admission number. Double-check the admission number "
+            "exactly as it appears on your certificate."
+        ),
+        ("name_cross_check", "OK"): None,
+        ("name_cross_check", "FAIL"): (
+            "Your name does not match the official record. Re-check "
+            "the spelling and order of your first and last names."
+        ),
+        ("stream_cross_check", "OK"): None,
+        ("stream_cross_check", "FAIL"): (
+            "The stream you selected does not match your official "
+            "record. Re-check whether you should be in Natural or "
+            "Social."
+        ),
+        ("stream_cross_check", "SKIP"): None,
+    }
+
+    # Drops every "but/vs MoE has '<value>'" suffix from a free-text
+    # string so the student keeps their own value (already in the
+    # leading clause) but never sees the matched official value.
+    _MOE_VALUE_LEAK_RE = re.compile(
+        r"\s*(?:but|vs)\s+MoE(?:\s+\w+)?\s*[:]?\s*['\"][^'\"]*['\"]",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _redact_moe_values(cls, text: Optional[str]) -> Optional[str]:
+        if not text:
+            return text
+        cleaned = cls._MOE_VALUE_LEAK_RE.sub("", text)
+        # Clean up any stranded punctuation the regex left behind.
+        cleaned = re.sub(r"\s+([;.,])", r"\1", cleaned)
+        return cleaned.strip() or None
+
+    async def get_correction_context(
+        self,
+        application_id: uuid.UUID,
+        *,
+        actor_id: uuid.UUID,
+        actor_role: UserRole,
+    ) -> CorrectionContextResponse:
+        """
+        Student-facing reasoning bundle for an application sitting in
+        CHANGES_REQUESTED. Returns the officer's plain-language note,
+        the agent's natural-language summary, and a humanized list of
+        reasoning steps — no decision enums, no confidence scores, no
+        internal step ids.
+
+        Access: the applicant who owns the application, or an officer
+        / admin. Raises ``UnauthorizedApplicationAccessError`` otherwise.
+        Returns empty fields when status is not CHANGES_REQUESTED so
+        the frontend can collapse the card silently.
+        """
+        application = await self._app_repo.get_by_id(application_id)
+        if application is None:
+            raise EntityNotFoundError("UndergraduateApplication", str(application_id))
+
+        is_owner = application.applicant_id == actor_id
+        is_staff = actor_role in {UserRole.ADMIN, UserRole.REGISTRAR_OFFICER}
+        if not (is_owner or is_staff):
+            raise UnauthorizedApplicationAccessError(
+                "You can only view correction context for your own application"
+            )
+
+        if application.current_status != ApplicationStatus.CHANGES_REQUESTED:
+            return CorrectionContextResponse()
+
+        # Officer's resolution note — the most recent CHANGES_REQUESTED
+        # transition's trigger_reason. The service stores it as
+        # ``"ACTION: free text"``; strip the action prefix for the
+        # student-facing view.
+        history_result = await self._db.execute(
+            select(ApplicationStatusHistory)
+            .where(
+                ApplicationStatusHistory.application_id == application_id,
+                ApplicationStatusHistory.new_status
+                == ApplicationStatus.CHANGES_REQUESTED,
+            )
+            .order_by(ApplicationStatusHistory.created_at.desc())
+            .limit(1)
+        )
+        latest_change_entry = history_result.scalar_one_or_none()
+        officer_note: Optional[str] = None
+        if latest_change_entry and latest_change_entry.trigger_reason:
+            raw = latest_change_entry.trigger_reason.strip()
+            # Strip the leading "ACTION_TOKEN: " prefix the service
+            # writes (e.g. "REQUEST_STUDENT_CORRECTION: <note>").
+            if ":" in raw:
+                _prefix, _, rest = raw.partition(":")
+                rest = rest.strip()
+                officer_note = rest or raw
+            else:
+                officer_note = raw
+
+        # Agent reasoning — the latest FLAG_FOR_REVIEW evaluation's
+        # summary plus its execution traces. Same lookup order as
+        # ``get_flag_context`` so the two views stay consistent.
+        flag_result = await self._db.execute(
+            select(AIEvaluation)
+            .where(
+                AIEvaluation.application_id == application_id,
+                AIEvaluation.recommended_decision == DecisionType.FLAG_FOR_REVIEW,
+            )
+            .order_by(AIEvaluation.created_at.desc())
+            .limit(1)
+        )
+        latest_eval = flag_result.scalar_one_or_none()
+        if latest_eval is None:
+            fallback = await self._db.execute(
+                select(AIEvaluation)
+                .where(AIEvaluation.application_id == application_id)
+                .order_by(AIEvaluation.created_at.desc())
+                .limit(1)
+            )
+            latest_eval = fallback.scalar_one_or_none()
+
+        steps: list[CorrectionReasoningStep] = []
+        if latest_eval is not None:
+            trace_result = await self._db.execute(
+                select(AIExecutionTrace)
+                .where(AIExecutionTrace.evaluation_id == latest_eval.id)
+                .order_by(AIExecutionTrace.created_at.asc())
+            )
+            for trace in trace_result.scalars().all():
+                label = self._STUDENT_STEP_LABELS.get(trace.step_name)
+                if label is None:
+                    # Unknown / internal-only step — skip rather than
+                    # leak the raw id to the student.
+                    continue
+                raw_log = (trace.reasoning_log or "").strip()
+                if not raw_log:
+                    continue
+                # First whitespace-delimited token (strip trailing ":").
+                status = raw_log.split(None, 1)[0].rstrip(":").upper()
+                if (trace.step_name, status) not in self._STUDENT_STEP_DETAILS:
+                    # Unknown status for a known step — safer to drop
+                    # than leak the raw log.
+                    continue
+                detail = self._STUDENT_STEP_DETAILS[(trace.step_name, status)]
+                if detail is None:
+                    # Step passed / was skipped — nothing for the
+                    # student to act on, omit from the card.
+                    continue
+                steps.append(CorrectionReasoningStep(
+                    label=label, detail=detail,
+                ))
+
+        return CorrectionContextResponse(
+            officer_note=officer_note,
+            # ``summary_reasoning`` from credential_lookup_agent is
+            # constructed as ``"Credential issues: <issue>; <issue>"``
+            # where each issue embeds the official MoE value verbatim.
+            # Redact those before showing the student.
+            agent_summary=self._redact_moe_values(
+                latest_eval.summary_reasoning if latest_eval else None
+            ),
+            reasoning_steps=steps,
         )
 
     async def resolve_flagged_application(

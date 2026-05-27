@@ -134,6 +134,7 @@ Each transition is enforced by the state machine in `service.py` and logged in `
 | `GET` | `/students/{id}` | Officer/Admin | Detailed review card (scores, preferences, AI recommendation) |
 | `POST` | `/decide/{id}` | Officer/Admin | Make single admission decision (ADMIT/REJECT/WAITLIST) |
 | `POST` | `/decide/batch` | Officer/Admin | Batch admission decisions |
+| `POST` | `/decide/batch/all` | Officer/Admin | Same decision for all `PENDING_REVIEW` in one sponsorship queue |
 
 ### Enrollment (`/api/v1/undergraduate/enrollment/...`)
 

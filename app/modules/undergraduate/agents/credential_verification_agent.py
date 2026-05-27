@@ -1,5 +1,8 @@
 """
+OUTDATED AGENT: This file contains the original implementation of the 
 Academic Credential Verification Agent — LangGraph StateGraph.
+
+NOLONGER IN ACTIVE USE
 
 The second AI agent in the Agentic Registrar pipeline. Triggered when an
 application is in UNDER_VERIFICATION status. It:

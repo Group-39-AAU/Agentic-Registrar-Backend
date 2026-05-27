@@ -22,6 +22,7 @@ from app.modules.undergraduate.ranking.models import RankingResult
 from app.modules.undergraduate.ranking.schemas import (
     BatchDecisionRequest,
     BatchDecisionResponse,
+    DecideAllPendingRequest,
     StudentReviewCard,
     StudentReviewListResponse,
 )
@@ -315,6 +316,68 @@ async def get_student_review_detail(
 #  POST /review/decide/batch — Batch decisions
 # ══════════════════════════════════════════════════════════════
 
+async def _process_officer_decision(
+    *,
+    application_id: uuid.UUID,
+    human_decision: str,
+    justification_remarks: str,
+    current_user: User,
+    db: AsyncSession,
+    svc: ApplicationService,
+) -> dict:
+    """Record one officer decision; raises on validation failure."""
+    decision_type = DecisionType(human_decision)
+    if decision_type not in {DecisionType.ADMIT, DecisionType.REJECT, DecisionType.WAITLIST}:
+        raise ValueError("Decision must be ADMIT, REJECT, or WAITLIST")
+
+    app = (await db.execute(
+        select(UndergraduateApplication).where(
+            UndergraduateApplication.id == application_id,
+            UndergraduateApplication.is_deleted == False,  # noqa: E712
+        )
+    )).scalar_one_or_none()
+
+    if not app:
+        raise ValueError("Application not found")
+
+    if app.current_status != ApplicationStatus.PENDING_REVIEW:
+        raise ValueError(f"Not in PENDING_REVIEW (currently: {app.current_status.value})")
+
+    existing = (await db.execute(
+        select(RegistrarDecision).where(
+            RegistrarDecision.application_id == application_id
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        raise ValueError("Decision already exists")
+
+    decision = RegistrarDecision(
+        application_id=application_id,
+        reviewer_id=current_user.id,
+        human_decision=decision_type,
+        justification_remarks=justification_remarks,
+    )
+    db.add(decision)
+    app.final_decision = decision_type.value
+
+    await svc.change_status(
+        application_id,
+        ApplicationStatusUpdate(
+            new_status=ApplicationStatus.DECIDED,
+            trigger_reason=f"Batch decision: {decision_type.value}",
+        ),
+        actor_id=current_user.id,
+        actor_role=current_user.role,
+    )
+
+    return {
+        "application_id": str(application_id),
+        "status": "OK",
+        "decision": decision_type.value,
+    }
+
+
 @router.post("/decide/batch", response_model=BatchDecisionResponse)
 async def decide_batch(
     data: BatchDecisionRequest,
@@ -336,69 +399,79 @@ async def decide_batch(
 
     for item in data.decisions:
         try:
-            # Validate decision type
-            decision_type = DecisionType(item.human_decision)
-            if decision_type not in {DecisionType.ADMIT, DecisionType.REJECT, DecisionType.WAITLIST}:
-                raise ValueError("Decision must be ADMIT, REJECT, or WAITLIST")
-
-            # Fetch application
-            app = (await db.execute(
-                select(UndergraduateApplication).where(
-                    UndergraduateApplication.id == item.application_id,
-                    UndergraduateApplication.is_deleted == False,  # noqa: E712
-                )
-            )).scalar_one_or_none()
-
-            if not app:
-                raise ValueError("Application not found")
-
-            if app.current_status != ApplicationStatus.PENDING_REVIEW:
-                raise ValueError(f"Not in PENDING_REVIEW (currently: {app.current_status.value})")
-
-            # Check existing decision
-            existing = (await db.execute(
-                select(RegistrarDecision).where(
-                    RegistrarDecision.application_id == item.application_id
-                )
-            )).scalar_one_or_none()
-
-            if existing:
-                raise ValueError("Decision already exists")
-
-            # Create decision
-            decision = RegistrarDecision(
+            result = await _process_officer_decision(
                 application_id=item.application_id,
-                reviewer_id=current_user.id,
-                human_decision=decision_type,
+                human_decision=item.human_decision,
                 justification_remarks=item.justification_remarks,
+                current_user=current_user,
+                db=db,
+                svc=svc,
             )
-            db.add(decision)
-
-            # Update final_decision
-            app.final_decision = decision_type.value
-
-            # Transition
-            await svc.change_status(
-                item.application_id,
-                ApplicationStatusUpdate(
-                    new_status=ApplicationStatus.DECIDED,
-                    trigger_reason=f"Batch decision: {decision_type.value}",
-                ),
-                actor_id=current_user.id,
-                actor_role=current_user.role,
-            )
-
             processed += 1
-            results.append({
-                "application_id": str(item.application_id),
-                "status": "OK",
-                "decision": decision_type.value,
-            })
+            results.append(result)
 
         except Exception as e:
             failed += 1
             results.append({
                 "application_id": str(item.application_id),
+                "status": "FAILED",
+                "error": str(e),
+            })
+
+    await db.commit()
+
+    return BatchDecisionResponse(
+        processed=processed,
+        failed=failed,
+        results=results,
+    )
+
+
+@router.post("/decide/batch/all", response_model=BatchDecisionResponse)
+async def decide_all_pending(
+    data: DecideAllPendingRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Record the same admission decision for every PENDING_REVIEW application
+    in the given sponsorship queue (not only the current page).
+    """
+    _role_gate(current_user)
+
+    pending_filters = [
+        UndergraduateApplication.current_status == ApplicationStatus.PENDING_REVIEW,
+        UndergraduateApplication.is_deleted == False,  # noqa: E712
+        UndergraduateApplication.sponsorship_type == data.sponsorship_type,
+    ]
+
+    pending_ids = (
+        await db.execute(
+            select(UndergraduateApplication.id).where(*pending_filters)
+        )
+    ).scalars().all()
+
+    svc = ApplicationService(db)
+    processed = 0
+    failed = 0
+    results = []
+
+    for application_id in pending_ids:
+        try:
+            result = await _process_officer_decision(
+                application_id=application_id,
+                human_decision=data.human_decision,
+                justification_remarks=data.justification_remarks,
+                current_user=current_user,
+                db=db,
+                svc=svc,
+            )
+            processed += 1
+            results.append(result)
+        except Exception as e:
+            failed += 1
+            results.append({
+                "application_id": str(application_id),
                 "status": "FAILED",
                 "error": str(e),
             })

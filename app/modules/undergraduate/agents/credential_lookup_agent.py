@@ -8,6 +8,16 @@ from app.shared.enums import DecisionType
 AGENT_VERSION = "credential-verification-v3.0"
 
 
+def _normalize_name(name: str) -> str:
+    """Collapse whitespace and uppercase for stable comparison."""
+    return " ".join(name.split()).upper()
+
+
+def _names_match(student_name: str, moe_full_name: str) -> bool:
+    """Return True only when applicant and MoE names are the same after normalization."""
+    return _normalize_name(student_name) == _normalize_name(moe_full_name)
+
+
 @dataclass
 class CredentialLookupResult:
     """Normalized output produced by the credential lookup agent."""
@@ -59,7 +69,7 @@ def run_credential_lookup(
             }
         )
 
-        if student_name in moe_full_name or moe_full_name in student_name:
+        if _names_match(student_name, moe_full_name):
             traces.append(
                 {
                     "step_name": "name_cross_check",

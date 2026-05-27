@@ -395,8 +395,10 @@ async def submit_batch(
       - FLAG     → batch transitions to FLAGGED. Instructor calls
                    POST ``/justify`` (with a written reason) or POST
                    ``/reopen`` (to edit scores) to iterate.
-      - PENDING  → LLM was unavailable. Batch stays SUBMITTED; the
-                   DH workflow (PR 4) will re-trigger the agent.
+      - PENDING  → LLM was unavailable / errored / returned malformed
+                   output. Batch transitions to AI_UNAVAILABLE; the
+                   instructor (or DH) re-triggers the agent via
+                   POST ``/batches/{bid}/rerun-agent``.
 
     409 if the batch isn't in DRAFT.
     """
@@ -478,6 +480,37 @@ async def reopen_batch(
     svc = InstructorGradingService(db)
     try:
         return await svc.reopen_batch(
+            user_id=current_user.id, batch_id=batch_id,
+        )
+    except Exception as exc:
+        _raise_grading_errors(exc)
+        raise
+
+
+@router.post(
+    "/batches/{batch_id}/rerun-agent",
+    response_model=AgentRerunResponse,
+    summary="Re-invoke the GradingMonitorAgent on an AI_UNAVAILABLE batch",
+)
+async def instructor_rerun_agent(
+    batch_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Recovery path when the agent's prior run could not produce a
+    verdict (LLM unreachable, timeout, quota, or malformed output) and
+    the batch landed in ``AI_UNAVAILABLE``. The owning instructor
+    triggers a fresh run; the new verdict transitions the batch to
+    SUBMITTED (APPROVE) or FLAGGED (FLAG), or leaves it at
+    AI_UNAVAILABLE if the LLM is still down.
+
+    409 if the batch isn't in AI_UNAVAILABLE.
+    """
+    _require_instructor(current_user)
+    svc = InstructorGradingService(db)
+    try:
+        return await svc.rerun_agent(
             user_id=current_user.id, batch_id=batch_id,
         )
     except Exception as exc:
@@ -573,10 +606,11 @@ async def list_dh_queue(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Pending batches by default (``SUBMITTED`` + ``FLAGGED``), sorted
-    oldest-first. Pass ``status`` as a comma-separated list (e.g.
-    ``AUTHORISED`` or ``AUTHORISED,REJECTED``) to fetch terminal
-    history — terminal lists sort most-recent-first.
+    Pending batches by default (``SUBMITTED`` + ``FLAGGED`` +
+    ``AI_UNAVAILABLE``), sorted oldest-first. Pass ``status`` as a
+    comma-separated list (e.g. ``AUTHORISED`` or
+    ``AUTHORISED,REJECTED``) to fetch terminal history — terminal
+    lists sort most-recent-first.
 
     Department auto-scopes to the calling Department Head's own
     department; admins see every department unless they pass

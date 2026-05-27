@@ -8,7 +8,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
 
-from app.shared.enums import StreamType
+from app.shared.enums import SponsorshipType, StreamType
 
 
 # ── Ranking Result ──
@@ -166,4 +166,12 @@ class BatchDecisionResponse(BaseModel):
     processed: int
     failed: int
     results: list[dict]
+
+
+class DecideAllPendingRequest(BaseModel):
+    """Apply one decision to every PENDING_REVIEW application in a sponsorship queue."""
+
+    human_decision: str  # ADMIT, REJECT, or WAITLIST
+    justification_remarks: str
+    sponsorship_type: SponsorshipType
 
