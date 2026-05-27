@@ -73,9 +73,11 @@ from app.modules.course.models import (
     RegistrationStatusHistory, Section, Student, StudentScheduleAddition,
 )
 from app.modules.course.grade_points import points_for
+from app.modules.course.standing.models import AcademicStanding
 from app.shared.enums import (
-    AcademicPhase, EnrollmentStatus, GradeLetter, GradeSubmissionStatus,
-    OfficerRole, RegistrationStatus, RiskStatus, SponsorshipType, UserRole,
+    AcademicPhase, AcademicStatusType, EnrollmentStatus, GradeLetter,
+    GradeSubmissionStatus, OfficerRole, RegistrationStatus, RiskStatus,
+    SponsorshipType, UserRole,
 )
 
 
@@ -1632,6 +1634,159 @@ async def _seed_grades(
         )
 
 
+async def _seed_authorised_standings(
+    session: AsyncSession,
+    terms: list[AcademicTerm],
+) -> None:
+    """
+    Create an AUTHORISED ``AcademicStanding`` row for every
+    (student, term) pair that has AUTHORISED grades from
+    :func:`_seed_grades`. Without these rows the student grade-report
+    UI shows "—" for SGPA / CGPA / Academic Status because it gates on
+    ``AcademicStanding.authorised_at`` per
+    ``TranscriptTermEntry.academic_status_authorised_at``.
+
+    Computes:
+      * ``sgpa`` = Σ(grade_points) / Σ(credit_hours) for the term
+      * ``cgpa`` = running ratio across every term up to and including
+        this one, walked chronologically
+      * ``final_status`` mapped from ``cgpa`` per SDS Table 74:
+        DISTINCTION when cgpa > 3.5, WARNING when cgpa < 2.0,
+        otherwise PROMOTED.
+
+    Idempotent: keyed by ``_uid("standing", student_id, term_id)`` and
+    skipped when a row already exists.
+    """
+    officers = (
+        await session.execute(select(CourseManagementOfficer))
+    ).scalars().all()
+    if not officers:
+        print("⚠️  Skipping standings seed — no officer to authorise.")
+        return
+    officer_user_id = officers[0].user_id
+
+    grades = (await session.execute(
+        select(Grade).where(
+            Grade.status == GradeSubmissionStatus.AUTHORISED,
+            Grade.is_deleted == False,  # noqa: E712
+        )
+    )).scalars().all()
+    if not grades:
+        print("⚠️  No authorised grades — skipping standings seed.")
+        return
+
+    students_by_id = {
+        s.id: s
+        for s in (
+            await session.execute(select(Student))
+        ).scalars().all()
+    }
+    term_by_id = {t.id: t for t in terms}
+
+    # Walk grades chronologically by term start_date so the running
+    # CGPA snapshotted on each standing row reflects history-to-date.
+    per_student_terms: dict[uuid.UUID, dict[uuid.UUID, list[Grade]]] = {}
+    for g in grades:
+        per_student_terms.setdefault(g.student_id, {}).setdefault(
+            g.term_id, [],
+        ).append(g)
+
+    existing_keys = {
+        (s.student_id, s.term_id)
+        for s in (
+            await session.execute(select(AcademicStanding))
+        ).scalars().all()
+    }
+
+    new_count = 0
+    skipped_existing = 0
+    now = datetime.now(timezone.utc)
+    for student_id, term_grades in per_student_terms.items():
+        student = students_by_id.get(student_id)
+        if student is None or not student.department:
+            continue
+        # Chronological walk for a stable running CGPA.
+        ordered_term_ids = sorted(
+            term_grades.keys(),
+            key=lambda tid: term_by_id[tid].start_date if tid in term_by_id else date.min,
+        )
+        cum_points = 0.0
+        cum_credits = 0
+        prior_status: Optional[AcademicStatusType] = None
+        for term_id in ordered_term_ids:
+            term = term_by_id.get(term_id)
+            if term is None:
+                continue
+            term_rows = [
+                g for g in term_grades[term_id]
+                if g.grade_points is not None
+            ]
+            if not term_rows:
+                continue
+            term_points = sum(g.grade_points or 0.0 for g in term_rows)
+            term_credits = sum(g.credit_hours for g in term_rows)
+            cum_points += term_points
+            cum_credits += term_credits
+            sgpa = term_points / term_credits if term_credits else None
+            cgpa = cum_points / cum_credits if cum_credits else None
+            if cgpa is None:
+                final_status = AcademicStatusType.INCOMPLETE
+            elif cgpa < 2.0:
+                final_status = AcademicStatusType.WARNING
+            elif cgpa > 3.5:
+                final_status = AcademicStatusType.DISTINCTION
+            else:
+                final_status = AcademicStatusType.PROMOTED
+
+            f_rows = [g for g in term_rows if g.letter_grade == GradeLetter.F]
+            f_count_term = len(f_rows)
+            f_credit_total_term = sum(g.credit_hours for g in f_rows)
+
+            if (student.id, term.id) in existing_keys:
+                skipped_existing += 1
+                prior_status = final_status
+                continue
+
+            session.add(AcademicStanding(
+                id=_uid("standing", str(student.id), str(term.id)),
+                student_id=student.id,
+                term_id=term.id,
+                department=student.department,
+                sgpa=round(sgpa, 4) if sgpa is not None else None,
+                cgpa=round(cgpa, 4) if cgpa is not None else None,
+                term_credit_hours=term_credits,
+                cumulative_credit_hours=cum_credits,
+                f_count_term=f_count_term,
+                f_credit_total_term=f_credit_total_term,
+                is_first_semester=(cum_credits == term_credits),
+                is_first_year=(cum_credits <= term_credits * 2),
+                prior_status=prior_status,
+                consecutive_warning_count=0,
+                proposed_status=final_status,
+                final_status=final_status,
+                requires_review=False,
+                computed_at=now,
+                computed_by_agent_id="seed-authorised-standings",
+                authorised_by_id=officer_user_id,
+                authorised_at=now,
+            ))
+            new_count += 1
+            prior_status = final_status
+
+    await session.commit()
+    if new_count:
+        print(
+            f"✅ Seeded {new_count} AUTHORISED AcademicStanding rows "
+            f"({skipped_existing} reused). Grade-report SGPA / CGPA / "
+            "Academic Status will now populate for backfilled terms."
+        )
+    else:
+        print(
+            f"⚠️  All standings already present ({skipped_existing} reused) "
+            "— skipping."
+        )
+
+
 # ══════════════════════════════════════════════════════════════
 #  Track C — Standing demo cohort
 # ══════════════════════════════════════════════════════════════
@@ -2843,6 +2998,13 @@ async def seed() -> None:
         # generated timetable and visible add candidates with both a
         # schedule conflict and a clean fit.
         await _seed_addrop_demo_scenario(session, open_term, courses_by_code)
+
+        # Authorise an AcademicStanding for every (student, term) that
+        # has authorised grades, so the student grade-report UI shows
+        # SGPA / CGPA / Academic Status instead of "—". Runs AFTER the
+        # add/drop demo so Yonatan's SE303 → F overwrite is reflected
+        # in his year-2 standing.
+        await _seed_authorised_standings(session, terms)
 
         # Track B PR 1 demo — skipped so the open 2026/27 phase 1 term
         # starts with no sections or schedule slots, letting Department

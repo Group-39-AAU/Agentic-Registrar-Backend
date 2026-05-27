@@ -73,9 +73,6 @@ def build_welcome_email(to_email: EmailStr, first_name: str) -> EmailMessage:
             <li style="margin:0 0 6px;">Receive official notifications from the Registrar's office.</li>
           </ul>
         </td></tr>
-        <tr><td style="padding:0 32px 32px;text-align:center;">
-          <a href="{portal_url}" style="display:inline-block;padding:14px 32px;background:#1d4ed8;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;border-radius:999px;">Open the applicant portal</a>
-        </td></tr>
         <tr><td style="padding:16px 32px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;line-height:1.5;text-align:center;">
           You are receiving this message because an account was created with this email address at {_UNIVERSITY_NAME}.<br>
           If this wasn't you, please contact the Registrar's office.
@@ -142,9 +139,6 @@ def build_portal_credentials_email(
           <p style="margin:0 0 12px;font-weight:600;color:#0f172a;">Temporary PIN</p>
           <p style="margin:0 0 20px;padding:12px 16px;background:#fef3c7;border:1px solid #fde68a;border-radius:8px;font-family:ui-monospace,monospace;font-size:24px;color:#92400e;letter-spacing:0.2em;text-align:center;"><strong>{temporary_pin}</strong></p>
           <p style="margin:0 0 16px;color:#475569;">Use the student ID above as your username and the PIN as your password. <strong>You will be prompted to set a new password on your first login</strong> — the PIN cannot be reused.</p>
-        </td></tr>
-        <tr><td style="padding:0 32px 32px;text-align:center;">
-          <a href="{portal_url}" style="display:inline-block;padding:14px 32px;background:#1d4ed8;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;border-radius:999px;">Open the portal</a>
         </td></tr>
         <tr><td style="padding:16px 32px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;line-height:1.5;text-align:center;">
           If you did not expect this message, contact the registrar's office immediately.
@@ -222,13 +216,8 @@ def build_changes_requested_email(
             <li style="margin:0 0 6px;">Open the application referenced below and review the officer's message.</li>
             <li style="margin:0 0 6px;">Update the requested fields and resubmit. Your application will be re-verified automatically.</li>
           </ol>
-          <p style="margin:0 0 12px;font-weight:600;color:#0f172a;">Application reference</p>
-          <p style="margin:0 0 20px;padding:12px 16px;background:#f1f5f9;border-radius:8px;font-family:ui-monospace,monospace;font-size:14px;color:#1d4ed8;">{application_id}</p>
         </td></tr>
-        <tr><td style="padding:0 32px 32px;text-align:center;">
-          <a href="{correction_url}" style="display:inline-block;padding:14px 32px;background:#b45309;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;border-radius:999px;">Update my application</a>
-          <p style="margin:16px 0 0;font-size:12px;color:#94a3b8;">If the button does not work, copy this link into your browser:<br><span style="word-break:break-all;color:#64748b;">{correction_url}</span></p>
-        </td></tr>
+      
         <tr><td style="padding:16px 32px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;line-height:1.5;text-align:center;">
           Your application will remain paused until you submit the requested changes. If you have questions, contact the admissions office.
         </td></tr>
