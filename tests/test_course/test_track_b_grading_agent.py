@@ -291,7 +291,7 @@ async def test_submit_with_llm_flag_transitions_to_flagged(
 async def test_submit_with_llm_failure_yields_pending(
     async_session, grading_scenario,
 ):
-    """LLM down → verdict PENDING, batch stays SUBMITTED (not stuck)."""
+    """LLM down → verdict PENDING, batch transitions to AI_UNAVAILABLE."""
     w = grading_scenario
     fake = FakeLLMClient(raise_exc=LLMUnavailableError("Gemini timeout"))
     agent = GradingMonitorAgent(llm_client=fake)
@@ -304,8 +304,8 @@ async def test_submit_with_llm_failure_yields_pending(
         user_id=w["instr_user"].id, batch_id=batch.id,
     )
     assert result.agent_verdict == "PENDING"
-    # Batch is SUBMITTED — not deadlocked, DH workflow can re-trigger.
-    assert result.status is GradeSubmissionStatus.SUBMITTED
+    # Batch lands in AI_UNAVAILABLE — instructor (or DH) reruns the agent.
+    assert result.status is GradeSubmissionStatus.AI_UNAVAILABLE
     # The review row still landed, even without an LLM verdict —
     # tool findings are preserved so the DH can see them.
     reviews = (await async_session.execute(
@@ -332,7 +332,7 @@ async def test_submit_with_no_llm_client_yields_pending(
         user_id=w["instr_user"].id, batch_id=batch.id,
     )
     assert result.agent_verdict == "PENDING"
-    assert result.status is GradeSubmissionStatus.SUBMITTED
+    assert result.status is GradeSubmissionStatus.AI_UNAVAILABLE
 
 
 async def test_submit_with_malformed_llm_output_yields_pending(

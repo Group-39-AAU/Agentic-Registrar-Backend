@@ -180,6 +180,7 @@ class DepartmentHeadGradingService:
                 GradeBatch.status.in_({
                     GradeSubmissionStatus.SUBMITTED,
                     GradeSubmissionStatus.FLAGGED,
+                    GradeSubmissionStatus.AI_UNAVAILABLE,
                 }),
                 GradeBatch.is_deleted == False,  # noqa: E712
             )
@@ -225,6 +226,7 @@ class DepartmentHeadGradingService:
         effective_statuses = statuses or {
             GradeSubmissionStatus.SUBMITTED,
             GradeSubmissionStatus.FLAGGED,
+            GradeSubmissionStatus.AI_UNAVAILABLE,
         }
         terminal_statuses = {
             GradeSubmissionStatus.AUTHORISED,
@@ -526,15 +528,16 @@ class DepartmentHeadGradingService:
         batch_id: uuid.UUID,
     ) -> AgentRerunResponse:
         """
-        Re-invoke the GradingMonitorAgent on a batch — typically used
-        when the previous run landed PENDING because the LLM was
-        unavailable. Writes a fresh ``grade_agent_reviews`` row and
-        transitions the batch:
+        Re-invoke the GradingMonitorAgent on a batch — used when the
+        DH wants a fresh verdict (e.g. the previous run landed in
+        AI_UNAVAILABLE because the LLM was unreachable, or to second-
+        guess an existing verdict before deciding). Writes a fresh
+        ``grade_agent_reviews`` row and transitions the batch:
 
-          - APPROVE → status SUBMITTED (if currently FLAGGED, flips
-                       back; if SUBMITTED-with-PENDING, stays).
+          - APPROVE → status SUBMITTED.
           - FLAG    → status FLAGGED.
-          - PENDING → status unchanged.
+          - PENDING → status AI_UNAVAILABLE (or unchanged if the
+                       batch was already in AI_UNAVAILABLE).
 
         No DH decision row is written by this method — that comes
         from authorise / reject explicitly.
@@ -544,6 +547,7 @@ class DepartmentHeadGradingService:
         if batch.status not in {
             GradeSubmissionStatus.SUBMITTED,
             GradeSubmissionStatus.FLAGGED,
+            GradeSubmissionStatus.AI_UNAVAILABLE,
         }:
             raise GradeBatchNotReviewableError(batch.status.value)
 
@@ -562,7 +566,8 @@ class DepartmentHeadGradingService:
             batch.status = GradeSubmissionStatus.SUBMITTED
         elif review.verdict == "FLAG":
             batch.status = GradeSubmissionStatus.FLAGGED
-        # PENDING → leave status as-is.
+        else:  # PENDING
+            batch.status = GradeSubmissionStatus.AI_UNAVAILABLE
 
         await self.db.flush()
         await self.db.commit()

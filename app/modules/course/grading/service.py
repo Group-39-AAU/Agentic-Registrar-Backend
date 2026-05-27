@@ -43,8 +43,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.llm_client import LLMClient
 from app.modules.course.exceptions import (
     BreakdownLockedError, EntityNotFoundError, GradeBatchNotEditableError,
-    IncompleteGradeSubmissionError, InvalidBreakdownError,
-    UnauthorizedActorError,
+    GradeBatchNotReviewableError, IncompleteGradeSubmissionError,
+    InvalidBreakdownError, UnauthorizedActorError,
 )
 from app.modules.course.grade_points import points_for
 from app.modules.auth.models import User as _AuthUser
@@ -63,9 +63,9 @@ from app.modules.course.grading.roster import (
     RosterMember, derive_section_course_roster, section_exists,
 )
 from app.modules.course.grading.schemas import (
-    AssessmentBreakdownCreate, AssessmentBreakdownResponse,
-    AssessmentComponentResponse, BulkScoreWrite, GradeAgentReviewResponse,
-    GradeBatchResponse, GradeBatchSubmitResponse,
+    AgentRerunResponse, AssessmentBreakdownCreate,
+    AssessmentBreakdownResponse, AssessmentComponentResponse, BulkScoreWrite,
+    GradeAgentReviewResponse, GradeBatchResponse, GradeBatchSubmitResponse,
     InstructorSectionAssignmentResponse,
     RosterStudentResponse, SectionCourseRosterResponse,
     StudentBatchRowResponse, StudentScoreCellResponse, SubmittedGradeRow,
@@ -970,10 +970,10 @@ class InstructorGradingService:
             batch.status = GradeSubmissionStatus.SUBMITTED
         elif review.verdict == "FLAG":
             batch.status = GradeSubmissionStatus.FLAGGED
-        else:  # PENDING
-            # Stay at SUBMITTED — the DH re-trigger path (PR 4) will
-            # produce a real verdict later.
-            batch.status = GradeSubmissionStatus.SUBMITTED
+        else:  # PENDING — LLM unavailable, errored, or malformed output.
+            # Distinct state so the instructor (or DH) can rerun the
+            # agent without it being confused with an APPROVED batch.
+            batch.status = GradeSubmissionStatus.AI_UNAVAILABLE
         await self.db.flush()
         await self.db.commit()
 
@@ -1178,8 +1178,12 @@ class InstructorGradingService:
 
         if review.verdict == "APPROVE":
             batch.status = GradeSubmissionStatus.SUBMITTED
-        # FLAG / PENDING → leave status as FLAGGED. The DH workflow
-        # (PR 4) is what moves a FLAGGED batch out either way.
+        elif review.verdict == "PENDING":
+            # LLM didn't produce a verdict — surface that distinctly
+            # so the instructor (or DH) can rerun the agent.
+            batch.status = GradeSubmissionStatus.AI_UNAVAILABLE
+        # FLAG → leave status as FLAGGED. The DH workflow (PR 4) is
+        # what moves a FLAGGED batch out either way.
 
         await self.db.flush()
         await self.db.commit()
@@ -1296,6 +1300,71 @@ class InstructorGradingService:
         ).scalar_one()
         return await self._build_batch_response(
             batch=batch, breakdown=breakdown, section=section, course=course,
+        )
+
+    # ── Instructor agent rerun (AI_UNAVAILABLE recovery) ────────
+
+    async def rerun_agent(
+        self,
+        *,
+        user_id: uuid.UUID,
+        batch_id: uuid.UUID,
+    ) -> AgentRerunResponse:
+        """
+        Re-invoke the GradingMonitorAgent on a batch whose prior run
+        could not produce a verdict (status AI_UNAVAILABLE). Restricted
+        to the assigned instructor for the section — the DH has its
+        own rerun path that also covers SUBMITTED/FLAGGED.
+
+        Writes a fresh ``grade_agent_reviews`` row and transitions the
+        batch on the new verdict:
+
+          - APPROVE → SUBMITTED
+          - FLAG    → FLAGGED
+          - PENDING → stays AI_UNAVAILABLE (try again later)
+
+        409 if the batch isn't in AI_UNAVAILABLE.
+        """
+        batch = (
+            await self.db.execute(
+                select(GradeBatch).where(
+                    GradeBatch.id == batch_id,
+                    GradeBatch.is_deleted == False,  # noqa: E712
+                )
+            )
+        ).scalar_one_or_none()
+        if batch is None:
+            raise EntityNotFoundError("GradeBatch", str(batch_id))
+        if batch.status != GradeSubmissionStatus.AI_UNAVAILABLE:
+            raise GradeBatchNotReviewableError(batch.status.value)
+
+        await self._resolve_owned_pair_or_403(
+            user_id=user_id,
+            section_id=batch.section_id, course_id=batch.course_id,
+        )
+
+        agent = self._resolve_agent()
+        review = await agent.review_batch(db=self.db, batch_id=batch.id)
+        await self._persist_agent_review(
+            batch=batch, review=review, agent=agent,
+        )
+
+        if review.verdict == "APPROVE":
+            batch.status = GradeSubmissionStatus.SUBMITTED
+        elif review.verdict == "FLAG":
+            batch.status = GradeSubmissionStatus.FLAGGED
+        # PENDING → leave at AI_UNAVAILABLE for another try.
+
+        await self.db.flush()
+        await self.db.commit()
+
+        return AgentRerunResponse(
+            batch_id=batch.id,
+            new_status=batch.status,
+            iteration=batch.iteration_count,
+            agent_verdict=review.verdict,
+            agent_flags=review.flags,
+            agent_reasoning=review.reasoning,
         )
 
     # ── PR 3 — agent-review history read ────────────────────────

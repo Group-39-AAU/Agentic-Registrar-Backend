@@ -221,6 +221,7 @@ class GradeSubmissionStatus(str, Enum):
     DRAFT = "DRAFT"
     SUBMITTED = "SUBMITTED"
     FLAGGED = "FLAGGED"
+    AI_UNAVAILABLE = "AI_UNAVAILABLE"
     AUTHORISED = "AUTHORISED"
     REJECTED = "REJECTED"
 
