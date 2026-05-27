@@ -3722,6 +3722,9 @@ class OnboardingService:
         enrollment_id: uuid.UUID,
         officer_role: UserRole,
         officer_id: uuid.UUID,
+        *,
+        precomputed_credentials: tuple[str, str] | None = None,
+        pending_emails: list | None = None,
     ) -> Student:
         if officer_role not in {UserRole.REGISTRAR_OFFICER, UserRole.ADMIN}:
             raise UnauthorizedActorError(
@@ -3770,8 +3773,14 @@ class OnboardingService:
         # in this scope — we hash it for storage, hand it to the email
         # template, then let it fall out of scope.
         from app.core.security import generate_temporary_pin, hash_password
-        temporary_pin = generate_temporary_pin(digits=4)
-        user.hashed_password = hash_password(temporary_pin)
+        if precomputed_credentials is not None:
+            # Batch callers (e.g. enrollment run) pre-compute PIN + hash
+            # in parallel to keep bcrypt off the per-iteration hot path.
+            temporary_pin, hashed = precomputed_credentials
+        else:
+            temporary_pin = generate_temporary_pin(digits=4)
+            hashed = hash_password(temporary_pin)
+        user.hashed_password = hashed
         user.must_change_password = True
 
         student = Student(
@@ -3809,20 +3818,24 @@ class OnboardingService:
         # if the email never arrives.
         if self._email_service is not None:
             from app.shared.email import build_portal_credentials_email
-            try:
-                await self._email_service.send(
-                    build_portal_credentials_email(
-                        to_email=user.email,
-                        first_name=user.first_name,
-                        student_id=student.student_id,
-                        temporary_pin=temporary_pin,
+            message = build_portal_credentials_email(
+                to_email=user.email,
+                first_name=user.first_name,
+                student_id=student.student_id,
+                temporary_pin=temporary_pin,
+            )
+            if pending_emails is not None:
+                # Batch callers collect messages and fan them out with
+                # asyncio.gather once the DB loop is done.
+                pending_emails.append(message)
+            else:
+                try:
+                    await self._email_service.send(message)
+                except Exception:
+                    logger.exception(
+                        "Portal-credentials email delivery failed for %s",
+                        user.email,
                     )
-                )
-            except Exception:
-                logger.exception(
-                    "Portal-credentials email delivery failed for %s",
-                    user.email,
-                )
 
         return student
 

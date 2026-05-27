@@ -5,6 +5,7 @@ Provides endpoints for triggering enrollment, viewing enrollment
 details, and listing enrolled students.
 """
 
+import asyncio
 import uuid
 from datetime import datetime
 
@@ -218,7 +219,23 @@ async def run_enrollment(
     onboarding_outcomes: list[OnboardingOutcome] = []
     onboarded_count = 0
 
-    for s in final_state["students"]:
+    # Pre-generate PINs and hash them in parallel. bcrypt at 12 rounds
+    # is ~150-400 ms per hash; the DB loop awaits sequentially on a
+    # single AsyncSession, so doing the hashes up-front via a thread
+    # pool keeps the per-iteration hot path off the CPU.
+    from app.core.security import generate_temporary_pin, hash_password
+    pins = [generate_temporary_pin(digits=4) for _ in final_state["students"]]
+    hashes = await asyncio.gather(
+        *(asyncio.to_thread(hash_password, p) for p in pins)
+    )
+    precomputed_credentials = list(zip(pins, hashes))
+
+    # Emails are best-effort. Collect them here and fan them out with
+    # asyncio.gather after the DB loop so we pay max(send_time) instead
+    # of sum(send_time) on the external Brevo HTTPS round-trips.
+    pending_emails: list = []
+
+    for s, creds in zip(final_state["students"], precomputed_credentials):
         enrollment = Enrollment(
             application_id=s.application_id,
             applicant_id=s.applicant_id,
@@ -263,6 +280,8 @@ async def run_enrollment(
                 enrollment_id=enrollment.id,
                 officer_role=current_user.role,
                 officer_id=current_user.id,
+                precomputed_credentials=creds,
+                pending_emails=pending_emails,
             )
             onboarded_count += 1
             onboarding_outcomes.append(OnboardingOutcome(
@@ -300,6 +319,22 @@ async def run_enrollment(
             ))
 
     await db.commit()
+
+    if pending_emails and email_service is not None:
+        # return_exceptions mirrors the original best-effort semantics:
+        # a Brevo failure for one student logs but doesn't fail others
+        # or the request.
+        results = await asyncio.gather(
+            *(email_service.send(msg) for msg in pending_emails),
+            return_exceptions=True,
+        )
+        for msg, result in zip(pending_emails, results):
+            if isinstance(result, Exception):
+                log.exception(
+                    "Portal-credentials email delivery failed for %s",
+                    msg.to_email,
+                    exc_info=result,
+                )
 
     # Re-fetch to get created_at timestamps
     fresh_result = await db.execute(
